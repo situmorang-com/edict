@@ -94,7 +94,7 @@ public final class DictationController {
 
     /// Edict's own bundle id. Injecting into ourselves would type the transcript into the history
     /// search field.
-    private static let ownBundleID = Bundle.main.bundleIdentifier ?? "com.srkk.edict"
+    private static let ownBundleID = Bundle.main.bundleIdentifier ?? "com.edict.app"
 
     // MARK: Init
 

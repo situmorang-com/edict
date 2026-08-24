@@ -7,7 +7,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Edict"
-BUNDLE_ID="com.srkk.edict"
+BUNDLE_ID="com.edict.app"
 SHORT_VERSION="0.1.0"
 BUILD_VERSION="$(date +%Y%m%d%H%M)"
 MIN_OS="26.0"
@@ -71,7 +71,7 @@ ensure_not_running
 
 # ---------------------------------------------------------- signing identity
 # A stable local certificate is the whole point: with it the designated requirement is
-#   identifier "com.srkk.edict" and certificate root = H"<sha1>"
+#   identifier "com.edict.app" and certificate root = H"<sha1>"
 # so TCC (Accessibility / Input Monitoring) grants survive every rebuild.
 # Ad-hoc (--sign -) would pin the DR to the cdhash and lose them on every rebuild.
 ensure_identity() {

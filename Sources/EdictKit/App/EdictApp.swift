@@ -43,7 +43,7 @@ public struct EdictApp: App {
         }
         // A remembered size beats a nominal one, and SwiftUI restores the frame per scene id;
         // `defaultSize` only applies to the very first launch. Measured on a clean launch (with
-        // `defaults delete com.srkk.edict "NSWindow Frame edict.main-AppWindow-1"`) by logging
+        // `defaults delete com.edict.app "NSWindow Frame edict.main-AppWindow-1"`) by logging
         // `window.frame` from `viewDidMoveToWindow`: the window really is created at 1180x760.
         .defaultSize(width: Self.windowIdeal.width, height: Self.windowIdeal.height)
         // Spelled out rather than left `.automatic`, which resolves to exactly this for a

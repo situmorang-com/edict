@@ -91,7 +91,7 @@
 >     which for a dictation tool reads as "always listening". Offer pre-warm as an explicit opt-in mode.
 > 23. **Sign with a stable self-signed certificate from day one, not ad-hoc.** Ad-hoc's designated requirement is a
 >     bare `cdhash`, so TCC drops Accessibility and Input Monitoring on **every rebuild**. A self-signed cert yields
->     `identifier "com.srkk.edict" and certificate root = H"…"`, verified stable across clean rebuilds and source
+>     `identifier "com.edict.app" and certificate root = H"…"`, verified stable across clean rebuilds and source
 >     mutation. Creating it needs **no sudo and no admin password**, but `security set-key-partition-list` is
 >     mandatory or `codesign` hangs forever on an invisible GUI prompt. Ignore `find-identity -v` reporting
 >     "0 valid identities" — that is the cert being untrusted, and trust is unnecessary. Do **not** run
