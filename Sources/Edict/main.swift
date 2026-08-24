@@ -1,0 +1,3 @@
+import EdictKit
+
+EdictApp.main()
