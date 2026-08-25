@@ -3,6 +3,129 @@ import Observation
 
 // MARK: - Shared value types
 
+/// Where a transcript's audio came from. Dictated ones are injected at the cursor; imported ones are
+/// transcribed from a file the user dropped on the window and only ever land in history.
+///
+/// Hand-rolled `Codable` rather than the synthesised associated-value form (`{"imported":{"filename":…}}`)
+/// for two reasons: the tagged object reads sanely to a human inspecting `history.json`, and an unknown
+/// future `kind` degrades to `.dictated` instead of failing the whole file's decode.
+public enum TranscriptSource: Codable, Hashable, Sendable {
+    /// Spoken live and injected at the cursor.
+    case dictated
+    /// Transcribed from a file. `filename` is the last path component only — never a full path, because
+    /// history is shown in the UI and a home directory is nobody's business.
+    case imported(filename: String)
+
+    public var isImported: Bool {
+        if case .imported = self { return true }
+        return false
+    }
+
+    /// The source file's name, or `nil` for a live dictation.
+    public var importedFilename: String? {
+        if case .imported(let filename) = self { return filename }
+        return nil
+    }
+
+    public var displayName: String {
+        switch self {
+        case .dictated: "Dictated"
+        case .imported(let filename): filename.isEmpty ? "Imported" : filename
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey { case kind, filename }
+    private enum Kind: String, Codable { case dictated, imported }
+
+    public init(from decoder: any Decoder) throws {
+        // A bare string is accepted too, so a hand-edited `"source": "dictated"` still loads.
+        if let single = try? decoder.singleValueContainer(), let raw = try? single.decode(String.self) {
+            self = (raw == Kind.imported.rawValue) ? .imported(filename: "") : .dictated
+            return
+        }
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch (try? c.decode(Kind.self, forKey: .kind)) ?? .dictated {
+        case .dictated:
+            self = .dictated
+        case .imported:
+            self = .imported(filename: (try? c.decode(String.self, forKey: .filename)) ?? "")
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .dictated:
+            try c.encode(Kind.dictated, forKey: .kind)
+        case .imported(let filename):
+            try c.encode(Kind.imported, forKey: .kind)
+            try c.encode(filename, forKey: .filename)
+        }
+    }
+}
+
+/// One timed piece of a transcript, as the engine reported it. File transcription produces these;
+/// live dictation does not, because there is nothing to seek back to.
+///
+/// The engine hands back per-word ranges, so these are usually single words — `TranscriptExport`
+/// merges them into readable subtitle cues rather than emitting one cue per word.
+public struct TranscriptSegment: Codable, Hashable, Sendable, Identifiable {
+    public var id: UUID
+    /// Seconds from the beginning of the audio.
+    public var start: TimeInterval
+    public var end: TimeInterval
+    public var text: String
+    /// `transcriptionConfidence` where the engine supplied one. RECON: below ~0.5 is strongly
+    /// indicative of a mishearing.
+    public var confidence: Double?
+
+    public init(
+        id: UUID = UUID(),
+        start: TimeInterval,
+        end: TimeInterval,
+        text: String,
+        confidence: Double? = nil
+    ) {
+        self.id = id
+        self.start = start
+        self.end = end
+        self.text = text
+        self.confidence = confidence
+    }
+
+    public var duration: TimeInterval { max(0, end - start) }
+
+    /// `id` is deliberately **not** written.
+    ///
+    /// It exists for `Identifiable` inside one render pass and is referenced by nothing that
+    /// outlives the process — unlike `CorrectionHit.entryID`, which points at a dictionary entry and
+    /// must persist. Writing it cost 45 of the ~100 bytes a segment occupies, and segments are the
+    /// bulk of an imported transcript: a 377 s file produces 1007 of them, which measured at 130 KB
+    /// per entry with ids and 72 KB without. `init(from:)` mints a fresh one on load.
+    // Spelled out because supplying `encode(to:)` suppresses the synthesised `CodingKeys`.
+    // `id` stays in the enum so `init(from:)` can still read a file written by an older build.
+    enum CodingKeys: String, CodingKey { case id, start, end, text, confidence }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(start, forKey: .start)
+        try c.encode(end, forKey: .end)
+        try c.encode(text, forKey: .text)
+        try c.encodeIfPresent(confidence, forKey: .confidence)
+    }
+
+    // Lenient for the same reason as `Transcript`: a segment missing its id or confidence is worth
+    // keeping, not worth losing the surrounding history file over.
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        start = try c.decodeIfPresent(TimeInterval.self, forKey: .start) ?? 0
+        end = try c.decodeIfPresent(TimeInterval.self, forKey: .end) ?? start
+        text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
+        confidence = try c.decodeIfPresent(Double.self, forKey: .confidence)
+    }
+}
+
 /// One completed dictation. `rawText` and `text` are both kept so the history pane can show the
 /// raw-vs-corrected diff — without that, the user has no way to tell whether the dictionary did
 /// anything at all.
@@ -32,9 +155,21 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
     /// become one-click "add a correction" suggestions in the history pane.
     public var lowConfidenceWords: [String]
 
+    /// Live dictation or a transcribed file. Absent from pre-import history files, where `.dictated`
+    /// is the only thing it could have been.
+    public var source: TranscriptSource
+    /// Timed segments, ascending by `start`. Empty for dictated transcripts; populated for imported
+    /// ones so they can be exported as subtitles.
+    public var segments: [TranscriptSegment]
+
     /// The engine identifier written into new transcripts. RECON §1: `DictationTranscriber`, not
     /// `SpeechTranscriber` — contextual-string biasing is a measured no-op on the latter.
     public static let currentEngine = "apple.dictationtranscriber"
+
+    /// The engine identifier written into imported transcripts that used `SpeechTranscriber`.
+    /// Measured on this machine over a 377 s script: 4.2 % word error and 66x realtime, against
+    /// 10.1 % and 15x for `DictationTranscriber` on the same audio. See `SpeechEngine.build(module:locale:)`.
+    public static let generalEngine = "apple.speechtranscriber"
 
     public init(
         id: UUID = UUID(),
@@ -50,7 +185,9 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         targetAppName: String? = nil,
         injection: InjectionOutcome = .notAttempted,
         droppedBuffers: Int = 0,
-        lowConfidenceWords: [String] = []
+        lowConfidenceWords: [String] = [],
+        source: TranscriptSource = .dictated,
+        segments: [TranscriptSegment] = []
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -66,6 +203,8 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         self.injection = injection
         self.droppedBuffers = droppedBuffers
         self.lowConfidenceWords = lowConfidenceWords
+        self.source = source
+        self.segments = segments
     }
 
     public var wordCount: Int {
@@ -78,8 +217,15 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
     /// See `droppedBuffers`.
     public var mayBeIncomplete: Bool { droppedBuffers > 0 }
 
+    /// True when this came from a file rather than the microphone.
+    public var isImported: Bool { source.isImported }
+
+    /// True when there is timing information, i.e. when subtitle export is possible.
+    public var hasSegments: Bool { !segments.isEmpty }
+
     // Lenient decoding: `droppedBuffers` and `lowConfidenceWords` were added after the first schema,
-    // and a history file is far too valuable to fail to load over two missing keys.
+    // `source` and `segments` after the second, and a history file is far too valuable to fail to
+    // load over missing keys.
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
@@ -97,6 +243,10 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         injection = try c.decodeIfPresent(InjectionOutcome.self, forKey: .injection) ?? .notAttempted
         droppedBuffers = try c.decodeIfPresent(Int.self, forKey: .droppedBuffers) ?? 0
         lowConfidenceWords = try c.decodeIfPresent([String].self, forKey: .lowConfidenceWords) ?? []
+        // `try?` rather than `decodeIfPresent` for these two: they are the newest keys, so a
+        // malformed or future-shaped value should degrade to the old behaviour, not lose the entry.
+        source = (try? c.decode(TranscriptSource.self, forKey: .source)) ?? .dictated
+        segments = (try? c.decode([TranscriptSegment].self, forKey: .segments)) ?? []
     }
 }
 

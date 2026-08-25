@@ -532,3 +532,88 @@ Built, signed, installed and LAUNCHED a real SwiftUI .app from a bare SwiftPM ex
 - `bundle--…` — scripts/make-icon.sh: Generates Resources/AppIcon.icns from nothing (no design assets). Verified: renders, converts, and the Dock shows it with the system shadow treatment.
 - `bundle--…` — scripts/build-app.sh: swift build -> signed, launchable Edict.app, plus `install` to ~/Applications. Ran end-to-end from a totally clean state (no keychain, no .build, no icon): bootstraps the signing identity, builds, generates the icon, signs, installs, verifies. Idempotent (3 consecutive runs -> identical designated requirement), no sudo, no GUI prompts.
 - `bundle--…` — ad-hoc fallback (only if you refuse the cert): If you insist on ad-hoc signing, this is the ONLY way to keep the cdhash (and therefore TCC grants) stable across clean rebuilds of identical source. Verified: 3 clean rebuilds -> identical bundle cdhash 43c1fdeb17a62a0c17791d801eb9d7a4e7042825.
+
+---
+
+## File transcription — module choice, measured (integration pass)
+
+**Verified:** True — measured on this machine during the file-import integration, with a probe that
+ran both modules over the same files through `SpeechAnalyzer(inputAudioFile:)`, and then end to end
+through the shipped `Edict.app`.
+
+### Summary
+
+**§1's "use `DictationTranscriber`, never `SpeechTranscriber`" is correct for *live dictation* and
+wrong for *file import*.** The two conclusions do not conflict, because they rest on different
+measurements: §1 measured vocabulary biasing (which only works on `DictationTranscriber`), and this
+section measures bulk accuracy and throughput on a whole file, where biasing is not the deciding
+factor and there is no speech onset to hide its setup cost behind.
+
+Same 377 s English script (`long.aiff`, `say`-generated), same explicit
+`attributeOptions: [.transcriptionConfidence, .audioTimeRange]`, word error computed by Levenshtein
+against the source script:
+
+| module                 | word error | wall  | realtime | final results |
+|------------------------|-----------:|------:|---------:|--------------:|
+| `DictationTranscriber` |     10.1 % | 25.0s |    15.1x |             7 |
+| `SpeechTranscriber`    |  **4.2 %** |  5.7s | **66.4x**|            64 |
+
+`DictationTranscriber` produced "It is a push to talk. Dictation tool for macOS" and "the text
+appears that the cursor"; `SpeechTranscriber` produced "Edict is a push to talk dictation tool for
+macOS" and "the text appears at the cursor". The ~9x higher final-result count also matters for
+subtitles, since a cue can only be cut at a result boundary.
+
+End to end through the running app (drop/`open -a`, `AVAssetReader` → the streaming
+`AsyncStream<AnalyzerInput>` path → history), `SpeechTranscriber`, en-US:
+
+| file                        | audio   | wall  | realtime | segments | note                |
+|-----------------------------|--------:|------:|---------:|---------:|---------------------|
+| `short-mono.wav` 16 kHz mono|   6.05s | 0.53s |    11.5x |       16 | first file, cold    |
+| `short.m4a`                 |   6.05s | 0.26s |    23.1x |       16 |                     |
+| `video_audio.mp4`           |   6.00s | 0.22s |    27.4x |       17 | video container     |
+| `short.mp3`                 |   6.11s | 0.36s |    17.0x |       16 |                     |
+| `long.m4a`                  | 377.46s | 5.00s |    75.5x |     1007 | 4.1 % word error    |
+| `indonesian.aiff` (id-ID)   |  18.81s | 0.59s |    31.9x |       38 | dictation fallback  |
+
+### Traps
+
+**`SpeechTranscriber` covers 45 locales against `DictationTranscriber`'s 54, and Indonesian is in
+the gap: `SpeechTranscriber.supportedLocale(equivalentTo: id-ID)` returns nil.** Refusing the file
+would be the obvious bug; silently transcribing it with the wrong locale would be the worse one.
+
+> `SpeechEngine.resolveImportModule(preferGeneral:localeIdentifier:)` falls back to
+> `DictationTranscriber`, which transcribed an 18.8 s Indonesian clip word-perfect at 31.9x realtime.
+> It also falls back when `SpeechTranscriber` supports the locale but its assets are **not
+> installed** — downloading inside an import would stall a queue the user is watching for an
+> unbounded time.
+
+**On `id_ID`, `DictationTranscriber` returns `audioTimeRange` on every attribute run and
+`transcriptionConfidence` on NONE of them.** Measured: 38 runs, 38 with a time range, 0 with a
+confidence — with both attributes asked for explicitly. Code that requires confidence in order to
+collect a run therefore drops every Indonesian word, which produces an **empty `segments` array**
+and makes subtitle export impossible for that language while nothing looks broken. This was a real
+bug in the first integration pass, caught only because the Indonesian file was actually run.
+
+> Collect a run when it carries *either* attribute. `WordConfidence.confidence` is `Double?` for
+> exactly this reason, and a run with no confidence is not offered to the dictionary as a
+> low-confidence suggestion (`(word.confidence ?? 1) < threshold`).
+
+**`SpeechTranscriber.TranscriptionOption` has exactly one case, `etiquetteReplacements` (profanity
+masking) — there is no `.punctuation`.** It punctuates and capitalises by default; measured output
+"Hold the right option key, speak, and release, and the text appears at the cursor." Do not go
+looking for the option `DictationTranscriber` has.
+
+**The named `SpeechTranscriber` presets carry the same `attributeOptions == []` problem as
+`DictationTranscriber`'s** (§7). `.timeIndexedTranscriptionWithAlternatives` exists and looks like
+the right thing, but the explicit initializer is still what the code uses, because it is the only way
+to be sure both attributes are on.
+
+### Recommendations
+
+- Live dictation stays on `DictationTranscriber` — §1 stands. Imports default to `SpeechTranscriber`
+  where the locale allows, with `Settings.importUsesGeneralModel` to put them back on the dictation
+  model for a user who would rather have the vocabulary biasing.
+- The correction pass (layer 2 of the dictionary) runs for both modules, and it is the only
+  dictionary layer an import gets when the general model is in use.
+- One module and one analyzer per file, never reused — §3 applies unchanged, and `ImportQueue` is
+  serial partly because of it.

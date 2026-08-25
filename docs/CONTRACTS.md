@@ -7,12 +7,18 @@
 > **`RECON.md` outranks this file, and both outrank your instincts about these APIs.** Several findings are
 > counter-intuitive and cost an agent hours to establish. Do not re-litigate them; do not "fix" them from memory.
 >
-> 1. **The engine is `DictationTranscriber`, NOT `SpeechTranscriber`.** This is the single most important finding.
+> 1. **The engine is `DictationTranscriber`, NOT `SpeechTranscriber`** — *for live dictation*. This is the single most important finding.
 >    `AnalysisContext.contextualStrings[.general]` is a measured, complete **no-op on `SpeechTranscriber`**
 >    (byte-identical output across 4 audio files × 4 configurations) but demonstrably **works on
 >    `DictationTranscriber`** — "Visa and soup base and anthropic" became "Vercel and Supabase and Anthropic".
 >    The whole dictionary-biasing feature depends on this. `DictationTranscriber` also exposes
 >    `TranscriptionOption.punctuation` and was independently better on proper nouns.
+>    **Amended for file import** (RECON, "File transcription — module choice"): on a whole file,
+>    biasing is not the deciding factor and `SpeechTranscriber` measured 4.2 % word error at 66x
+>    realtime against `DictationTranscriber`'s 10.1 % at 15x on the same 377 s audio. Imports
+>    therefore default to `SpeechTranscriber`, falling back to `DictationTranscriber` for the 9
+>    locales it does not cover (Indonesian among them) or when its assets are not installed. The
+>    switch is `Settings.importUsesGeneralModel`. Live dictation is unchanged.
 > 2. **Context must be passed to `SpeechAnalyzer.init(analysisContext:)`.** `setContext(_:)` mid-stream is a silent
 >    no-op. Dictionary edits therefore take effect on the *next* utterance — read the dictionary at key-down.
 > 3. **Build a fresh module + analyzer per utterance. Never reuse.** `finalize(through:)` deadlocks forever while the

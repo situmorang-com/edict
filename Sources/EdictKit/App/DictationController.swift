@@ -81,6 +81,10 @@ public final class DictationController {
 
     private var didBootstrap = false
 
+    /// Which module the *next* import will use. Resolved once per file by `resolvedImportModule()`
+    /// and memoised in `SpeechEngine`, so the format query and the transcribe call cannot disagree.
+    private var lastImportModule: TranscriptionModule = .dictation
+
     // MARK: Tuning
 
     /// Hard ceiling on one utterance.
@@ -626,6 +630,150 @@ public final class DictationController {
                 """)
         }
         return await injector.inject(text, into: unit.target)
+    }
+
+    // MARK: - File import
+
+    /// Everything `ImportQueue` needs from the engine layer.
+    ///
+    /// Handed over as closures rather than letting the queue hold `SpeechEngine`, for the reason
+    /// `ImportQueue.Environment` exists: the queue is then testable with three closures and no model,
+    /// no microphone and no disk. All three hop back through this controller so there is exactly one
+    /// owner of the engine's single-session rule.
+    public func importEnvironment() -> ImportQueue.Environment {
+        ImportQueue.Environment(
+            analyzerFormat: { [weak self] in await self?.importAnalyzerFormat() },
+            transcribe: { [weak self] stream, onUpdate in
+                guard let self else { throw CancellationError() }
+                return try await self.transcribeImport(stream: stream, onUpdate: onUpdate)
+            },
+            // Without this, cancelling a long file only closes the *reader*; the analyzer already
+            // holds every remaining chunk in its unbounded input queue and would spend its full run
+            // finalizing audio nobody wants. Measured at ~25 s for a 377 s file.
+            cancelActive: { [weak self] in await self?.engine.cancel() }
+        )
+    }
+
+    /// The format the importer must convert to. Asked per file because the answer depends on which
+    /// module will run, and that depends on the locale, which the user can change between files.
+    private func importAnalyzerFormat() async -> AVAudioFormat? {
+        let module = await resolvedImportModule()
+        return await engine.bestAudioFormat(for: module)
+    }
+
+    /// Resolve (and prepare) the module for the next import. Memoised inside `SpeechEngine`, so
+    /// calling this twice per file — once for the format, once for the transcribe — costs one
+    /// dictionary lookup the second time.
+    @discardableResult
+    private func resolvedImportModule() async -> TranscriptionModule {
+        let module = await engine.resolveImportModule(
+            preferGeneral: settings.importUsesGeneralModel,
+            localeIdentifier: settings.localeIdentifier
+        )
+        lastImportModule = module
+        return module
+    }
+
+    private func transcribeImport(
+        stream: AsyncStream<AnalyzerInput>,
+        onUpdate: @escaping @Sendable (TranscriptionUpdate) -> Void
+    ) async throws -> TranscriptionOutcome {
+        let module = await resolvedImportModule()
+        // Biasing is passed explicitly rather than staged with `setBiasing`, so a file cannot
+        // inherit — or clobber — the list a live dictation froze at key-down. It is also empty for
+        // the general module, where RECON §1 measured contextual strings as a complete no-op.
+        let biasing = module.supportsBiasing
+            ? dictionary.biasingStrings(limit: settings.effectiveBiasingLimit)
+            : []
+        // `SpeechEngineError.sessionAlreadyRunning` must escape unwrapped: `ImportQueue` retries on
+        // exactly that error while a live dictation holds the engine's one session.
+        return try await engine.transcribe(
+            input: stream,
+            module: module,
+            biasing: biasing,
+            onUpdate: onUpdate
+        )
+    }
+
+    /// One finished file becomes one history entry.
+    ///
+    /// **Nothing here injects.** That is the whole behavioural difference between an import and a
+    /// dictation: the user dropped a file on a window, there is no cursor they were aiming at, and
+    /// typing a six-minute transcript into whatever happens to be frontmost would be indefensible.
+    /// So this method runs the correction pass, writes history, records dictionary hits — and stops.
+    /// `TextInjector` is not reachable from it.
+    ///
+    /// - Returns: the id of the history entry, or `nil` when the file yielded no text (in which case
+    ///   nothing is written, so there is nothing to link a queue row to).
+    func completeImport(_ result: ImportQueue.Result) -> UUID? {
+        let raw = result.outcome.text
+        guard !raw.trimmed.isEmpty else {
+            Log.data.notice("import produced no text: \(result.info.filename, privacy: .public)")
+            return nil
+        }
+
+        let corrector = settings.correctionsEnabled
+            ? dictionary.corrector(includeTermCaseNormalisation: settings.termCaseNormalisation)
+            : Corrector(rules: [])
+        let corrected = corrector.isEmpty
+            ? CorrectionResult(text: raw, hits: [])
+            : corrector.apply(to: raw)
+
+        let transcript = Transcript(
+            rawText: raw,
+            text: corrected.text,
+            corrections: corrected.hits,
+            // The file's own duration, not the frame count the engine was fed: they agree to within
+            // a chunk, and the file's length is the number the user can check.
+            audioDuration: result.info.duration > 0 ? result.info.duration : result.outcome.audioDuration,
+            // For an import this is the whole job — open, decode, transcribe, finalize — not the
+            // end-of-speech latency a dictation reports. It is the number that makes the realtime
+            // factor legible in the history pane, which for a file is the interesting one.
+            transcribeDuration: result.wallSeconds,
+            localeIdentifier: settings.localeIdentifier,
+            engine: lastImportModule.engineIdentifier,
+            // No target and no attempt: see the note above.
+            injection: .notAttempted,
+            droppedBuffers: result.stats.dropped,
+            lowConfidenceWords: Array(result.outcome.lowConfidenceWords.prefix(Self.maxImportSuggestions)),
+            source: .imported(filename: result.info.filename),
+            segments: Self.correct(result.segments, with: corrector)
+        )
+
+        history.append(transcript)
+        if !corrected.hits.isEmpty {
+            dictionary.recordHits(corrected.hits)
+        }
+
+        Log.data.info("""
+            import saved: \(result.info.filename, privacy: .public)             \(transcript.wordCount, privacy: .public) words,             \(transcript.segments.count, privacy: .public) segments,             \(corrected.hits.count, privacy: .public) corrections,             module \(self.lastImportModule.rawValue, privacy: .public),             \(String(format: "%.1f", result.realtimeFactor), privacy: .public)x realtime\
+            \(result.incompleteReason == nil ? "" : " INCOMPLETE", privacy: .public)
+            """)
+        return transcript.id
+    }
+
+    /// A whole 377 s file can produce hundreds of sub-0.5 words, and the history pane offers three.
+    /// Storing the rest would bloat `history.json` for a list nobody reads.
+    private static let maxImportSuggestions = 12
+
+    /// Run the correction pass over the timed segments as well as over the body text.
+    ///
+    /// Segments are per-word, so this catches every single-token rule — a `.term` casing fix, or
+    /// "visa" → "Vercel". It cannot catch a multi-token rule such as "cloud code" → "Claude Code",
+    /// because the two halves live in two segments with two different timestamps and there is no
+    /// honest way to re-time a merged replacement. Those show corrected in the transcript body and
+    /// uncorrected in an exported subtitle cue. The alternative — leaving the segments entirely raw —
+    /// is strictly worse, since it loses the single-token fixes too.
+    private static func correct(
+        _ segments: [TranscriptSegment],
+        with corrector: Corrector
+    ) -> [TranscriptSegment] {
+        guard !corrector.isEmpty else { return segments }
+        return segments.map { segment in
+            var copy = segment
+            copy.text = corrector.apply(to: segment.text).text
+            return copy
+        }
     }
 
     // MARK: - Feedback

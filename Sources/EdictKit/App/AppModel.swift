@@ -113,6 +113,20 @@ public final class AppModel {
 
     @ObservationIgnored public let controller: DictationController
 
+    /// The batch queue behind file transcription. `@ObservationIgnored` because it is a `let` that
+    /// never changes and is itself `@Observable` — views bind to *its* properties directly, so
+    /// routing them through this object would only add a second invalidation source.
+    @ObservationIgnored public let importQueue: ImportQueue
+
+    // MARK: Window state
+
+    /// Which rail stop the main window is showing.
+    ///
+    /// Lives here rather than in `MainWindow`'s `@State` because two things outside the view move
+    /// it: the ⌘O menu command, which must land the user on the queue it just filled, and a dropped
+    /// file, which can arrive while any pane is showing.
+    var pane: Pane = .history
+
     // MARK: Tuning
 
     /// The coarse `level` publish rate. Deliberately two orders of magnitude below the needle so
@@ -136,17 +150,23 @@ public final class AppModel {
         self.dictionary = dictionary
         self.history = history
         self.permissions = permissions
-        self.controller = DictationController(
+        let controller = DictationController(
             settings: settings,
             dictionary: dictionary,
             history: history,
             permissions: permissions
         )
+        self.controller = controller
+        self.importQueue = ImportQueue(environment: controller.importEnvironment())
         // Two-phase on purpose: `self` is only usable once every stored property has a value, and
         // the controller must not hold a strong reference back (it would be a permanent cycle
         // through a singleton, which leak checkers rightly complain about).
         controller.attach(model: self)
         levelMeter.attach(to: controller.levelSource)
+        // `controller`, not `self`: the queue must not keep the model alive, and the controller is
+        // the only thing it needs. `AppModel → importQueue → controller` and `AppModel → controller`
+        // are both one-way, so there is no cycle to break.
+        importQueue.onFinish = { [controller] result in controller.completeImport(result) }
     }
 
     // MARK: Derived, for the views
@@ -247,6 +267,69 @@ public final class AppModel {
 
     public func cancelRecording() {
         controller.cancel()
+    }
+
+    // MARK: File import
+
+    /// Queue files for transcription and show the queue.
+    ///
+    /// The pane switch is not decoration: a file dropped while the dictionary pane is showing would
+    /// otherwise vanish into a queue the user has no reason to look for, and the one thing they need
+    /// to know — that the transcript goes to history and **not** to their cursor — is printed there.
+    public func enqueueImports(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        let added = importQueue.enqueue(urls)
+        guard !added.isEmpty else { return }
+        pane = .imports
+    }
+
+    /// Open the file picker, then queue whatever was chosen.
+    public func pickImports() {
+        enqueueImports(MediaOpenPanel.pick())
+    }
+
+    /// The queue as the pane draws it.
+    ///
+    /// The mapping lives here rather than in `ImportQueue` because a finished row carries the whole
+    /// `Transcript` — the export keys need its segments — and only the model can reach history.
+    var importRows: [ImportQueueRow] {
+        importQueue.items.map { item in
+            ImportQueueRow(
+                id: item.id,
+                filename: item.filename,
+                duration: item.info?.duration,
+                isVideo: item.info?.hasVideo ?? false,
+                state: rowState(for: item),
+                warning: item.warning
+            )
+        }
+    }
+
+    private func rowState(for item: ImportQueue.Item) -> ImportQueueRow.State {
+        switch item.state {
+        case .queued:
+            return .waiting
+        case .running(let progress):
+            // The importer's read fraction is real but useless as a bar — decoding runs at
+            // 570–4300x realtime and saturates within milliseconds — so `reading` is only ever a
+            // label, and the bar belongs to the transcription estimate. See `ImportQueue.Phase`.
+            if item.id == importQueue.runningItemID, case .reading(let fraction) = importQueue.runningPhase {
+                return .reading(fraction)
+            }
+            return .transcribing(progress)
+        case .done:
+            if let id = item.transcriptID, let transcript = history.transcripts.first(where: { $0.id == id }) {
+                return .finished(transcript)
+            }
+            // `.done` with nothing in history means the file decoded but held no speech. Reporting
+            // that as a failure is honest: there is no transcript, so there is nothing to export and
+            // nothing to open, and a row saying "Done" with dead keys would be a lie.
+            return .failed("No speech was found in this file.")
+        case .failed(let reason):
+            return .failed(reason)
+        case .cancelled:
+            return .cancelled
+        }
     }
 
     /// Clear a terminal error so the transport is usable again without relaunching.

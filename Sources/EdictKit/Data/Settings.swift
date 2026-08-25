@@ -60,6 +60,10 @@ public final class Settings {
         /// RECON §22: pre-warming costs only 14–27 ms of captured speech but keeps the orange mic
         /// indicator lit for the whole session, which for a dictation tool reads as "always listening".
         public static let prewarmMicrophone = false
+        /// Use `SpeechTranscriber` for file imports where it covers the locale. On by default
+        /// because it is measurably better at the job — 4.2 % word error against 10.1 % and 66x
+        /// realtime against 15x on the same 377 s file. See `SpeechEngine.build`.
+        public static let importUsesGeneralModel = true
         public static let historyLimit = 5000
         public static let launchAtLogin = false
     }
@@ -128,6 +132,18 @@ public final class Settings {
         didSet { write(prewarmMicrophone, .prewarmMicrophone) }
     }
 
+    /// Transcribe imported files with `SpeechTranscriber` rather than `DictationTranscriber`.
+    ///
+    /// The trade is real in both directions, which is why it is a switch and not a constant: the
+    /// general model is far more accurate and much faster on a whole file, but contextual-string
+    /// biasing is a measured no-op on it (RECON §1), so layer 1 of the dictionary does nothing for
+    /// an import that uses it. Off puts imports on the same model as live dictation, biasing and
+    /// all. Either way the correction pass still runs, and either way a locale the general model
+    /// does not cover — Indonesian — falls back automatically.
+    public var importUsesGeneralModel: Bool {
+        didSet { write(importUsesGeneralModel, .importUsesGeneralModel) }
+    }
+
     public var historyLimit: Int {
         didSet {
             let clamped = Self.historyLimitRange.clamped(to: historyLimit)
@@ -171,6 +187,7 @@ public final class Settings {
         correctionsEnabled = bool(.correctionsEnabled, Default.correctionsEnabled)
         termCaseNormalisation = bool(.termCaseNormalisation, Default.termCaseNormalisation)
         prewarmMicrophone = bool(.prewarmMicrophone, Default.prewarmMicrophone)
+        importUsesGeneralModel = bool(.importUsesGeneralModel, Default.importUsesGeneralModel)
         historyLimit = Self.historyLimitRange.clamped(to: int(.historyLimit, Default.historyLimit))
         launchAtLogin = bool(.launchAtLogin, Default.launchAtLogin)
     }
@@ -187,6 +204,7 @@ public final class Settings {
         correctionsEnabled = Default.correctionsEnabled
         termCaseNormalisation = Default.termCaseNormalisation
         prewarmMicrophone = Default.prewarmMicrophone
+        importUsesGeneralModel = Default.importUsesGeneralModel
         historyLimit = Default.historyLimit
         launchAtLogin = Default.launchAtLogin
         Log.data.info("Settings reset to defaults")
@@ -200,7 +218,7 @@ public final class Settings {
     private enum Key: String {
         case hotkey, localeIdentifier, pushToTalk, autoInject, showHUD, playSounds
         case biasingEnabled, biasingLimit, correctionsEnabled, termCaseNormalisation
-        case prewarmMicrophone, historyLimit, launchAtLogin
+        case prewarmMicrophone, importUsesGeneralModel, historyLimit, launchAtLogin
 
         var storageKey: String { "edict.\(rawValue)" }
     }

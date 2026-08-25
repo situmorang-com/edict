@@ -69,6 +69,7 @@ public struct SettingsWindow: View {
                 HotkeySection(settings: model.settings, hotkeyLive: model.hotkeyLive)
                 SpeechModelSection(model: model, preloaded: preloadedLocales)
                 BehaviourSection(settings: model.settings)
+                ImportSection(settings: model.settings)
                 DictionarySection(settings: model.settings, dictionary: model.dictionary)
                 LimitsSection(settings: model.settings, history: model.history)
                 PermissionsPane(model: model, showsHeading: false)
@@ -302,6 +303,47 @@ private struct BehaviourSection: View {
     /// `Settings` is `@Observable`, not `ObservableObject`, so there is no projected `$` binding.
     private func bind(_ path: ReferenceWritableKeyPath<Settings, Bool>) -> Binding<Bool> {
         Binding(get: { settings[keyPath: path] }, set: { settings[keyPath: path] = $0 })
+    }
+}
+
+// MARK: - Import
+
+/// The one real choice file transcription has: which of Apple's two models runs it.
+///
+/// Worth a switch rather than a constant because the trade cuts both ways, and worth *saying* rather
+/// than hiding, because the losing side of the trade is the dictionary the user has been curating.
+private struct ImportSection: View {
+
+    let settings: Settings
+
+    var body: some View {
+        PanelSurface("Import") {
+            VStack(alignment: .leading, spacing: D.space.md) {
+                RockerSwitch(
+                    "Use the transcription model for files",
+                    isOn: Binding(
+                        get: { settings.importUsesGeneralModel },
+                        set: { settings.importUsesGeneralModel = $0 }
+                    ),
+                    // `RockerSwitch` truncates its caption at two lines, so the headline number
+                    // lives there and the rest of the trade is printed below.
+                    caption: "Measured on a six-minute recording: 4% of words wrong at 66x "
+                           + "realtime, against 10% at 15x for the dictation model."
+                )
+                Text("Off puts imported files on the same model as live dictation, which is the "
+                     + "only one your dictionary can hint. Either way the replacement rules still "
+                     + "run, and a language the transcription model does not cover — Indonesian "
+                     + "among them — falls back on its own.")
+                    .typeStyle(D.type.explain)
+                    .foregroundStyle(D.color.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Edict does not identify speakers, whichever model runs. Apple's framework has "
+                     + "no way to tell one voice from another.")
+                    .typeStyle(D.type.explain)
+                    .foregroundStyle(D.color.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
 

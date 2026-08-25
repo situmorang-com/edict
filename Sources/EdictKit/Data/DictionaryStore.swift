@@ -626,7 +626,7 @@ public final class DictionaryStore {
     /// typed anything. Every term here is one RECON actually observed the engine getting wrong.
     static func starterEntries(now: Date = Date()) -> [DictionaryEntry] {
         let terms = [
-            "Claude Code", "Anthropic", "Vercel", "Supabase", "Wispr Flow",
+            "Edict", "Claude Code", "Anthropic", "Vercel", "Supabase", "Wispr Flow",
             "SwiftUI", "Xcode", "macOS", "Obsidian",
         ]
         var result = terms.enumerated().map { index, term in

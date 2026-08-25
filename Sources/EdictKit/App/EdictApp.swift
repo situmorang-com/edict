@@ -8,7 +8,7 @@ import SwiftUI
 /// Declared without `@main` so it can live in a library target (and therefore be unit-testable);
 /// `Sources/Edict/main.swift` calls `EdictApp.main()` to boot it.
 ///
-/// This is a **real app**, not a menu-bar utility: a standard resizable `WindowGroup`, a full app
+/// This is a **real app**, not a menu-bar utility: a standard resizable single `Window`, a full app
 /// menu, a `Settings` scene on `Cmd+,`, and a Dock icon. `LSUIElement` is deliberately absent from
 /// the Info.plist — RECON §25 confirmed a Dock icon, an app menu, a main window and an
 /// `NSStatusItem` all coexist without it, and an `NSStatusItem` needs no plist key. The menu-bar
@@ -31,7 +31,13 @@ public struct EdictApp: App {
     public init() {}
 
     public var body: some Scene {
-        WindowGroup(id: Self.mainWindowID) {
+        // `Window`, not `WindowGroup`. Edict has exactly one main window — it is not a document app,
+        // and every surface (history, dictionary, import queue, permissions) lives inside that one
+        // window. `WindowGroup` is a *template*: each `application(_:open:)` file-open request
+        // instantiated another copy, and SwiftUI then restored every one of them on the next launch,
+        // so the count compounded — 18 windows after a handful of test imports. `Window` makes that
+        // impossible, and a file-open is routed into the single existing window instead.
+        Window("Edict", id: Self.mainWindowID) {
             MainWindow(model: model)
                 .frame(
                     minWidth: D.size.windowMin.width, idealWidth: Self.windowIdeal.width,
@@ -97,6 +103,28 @@ public final class EdictAppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    /// Files handed over by LaunchServices: dropped on the Dock icon, opened from the Finder, or
+    /// passed to `open -a Edict <file>`.
+    ///
+    /// Declared in `CFBundleDocumentTypes` with `LSHandlerRank: Alternate`, so Edict appears in
+    /// "Open With" without taking `.m4a` away from QuickTime Player. Everything is filtered through
+    /// `ImportableMedia.accepts` first — LaunchServices will happily hand over a file whose declared
+    /// type conforms to `public.audio` but which `AVAssetReader` cannot open.
+    public func application(_ application: NSApplication, open urls: [URL]) {
+        let usable = urls.filter(ImportableMedia.accepts)
+        guard !usable.isEmpty else {
+            Log.data.notice("opened \(urls.count, privacy: .public) file(s), none of them audio or video")
+            return
+        }
+        AppModel.shared.enqueueImports(usable)
+        // The queue is in the main window, and a file opened from the Finder arrives with no window
+        // necessarily on screen.
+        NSApp.activate(ignoringOtherApps: true)
+        if let window = NSApp.windows.first(where: { $0.canBecomeMain }) {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
     /// Clicking the Dock icon with no windows open should bring the window back.
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         true
@@ -122,6 +150,18 @@ struct EdictCommands: Commands {
     let model: AppModel
 
     var body: some Commands {
+        // Replaces "New Window": Edict has one window, and the only thing a File menu here is for is
+        // getting a recording *in*. ⌘O is the platform gesture for it and is bound at the app level
+        // rather than on the IMPORT pane's key, so it works whichever pane happens to be showing —
+        // and, being a command, it is also the discoverable name for the whole import feature.
+        CommandGroup(replacing: .newItem) {
+            Button("Open Audio or Video…") {
+                model.pickImports()
+            }
+            .keyboardShortcut("o", modifiers: .command)
+            .help("Transcribe files into the log. Nothing is typed at your cursor.")
+        }
+
         CommandMenu("Dictation") {
             Button(model.isRecording ? "Stop Dictation" : "Start Dictation") {
                 model.toggleRecording()

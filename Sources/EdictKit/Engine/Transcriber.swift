@@ -41,12 +41,20 @@ public struct WordConfidence: Sendable, Hashable, Identifiable {
     public var id: Int { hashValue }
     /// The run's text, trimmed of the leading space the engine attaches to each segment.
     public var text: String
-    public var confidence: Double
+    /// `nil` when the engine reported a run with a time range but no confidence.
+    ///
+    /// **Not hypothetical, and the reason this is optional.** Measured on this machine: with
+    /// `attributeOptions: [.transcriptionConfidence, .audioTimeRange]` asked for explicitly,
+    /// `DictationTranscriber` on `id_ID` returned a time range on all 38 runs of an 18.8 s clip and
+    /// a confidence on **none** of them. Requiring confidence to collect a run therefore dropped
+    /// every Indonesian word, which silently produced an empty `segments` array and made subtitle
+    /// export impossible for that language while nothing looked broken.
+    public var confidence: Double?
     /// Offset of the run within the utterance's audio, in seconds. `nil` if the run carried no time range.
     public var startSeconds: Double?
     public var endSeconds: Double?
 
-    public init(text: String, confidence: Double, startSeconds: Double? = nil, endSeconds: Double? = nil) {
+    public init(text: String, confidence: Double?, startSeconds: Double? = nil, endSeconds: Double? = nil) {
         self.text = text
         self.confidence = confidence
         self.startSeconds = startSeconds
@@ -86,6 +94,42 @@ public struct TranscriptionOutcome: Sendable {
         self.words = words
         self.lowConfidenceWords = lowConfidenceWords
     }
+}
+
+/// Which of Apple's two transcription modules is doing the work.
+///
+/// Both are used, for measured reasons — see `SpeechEngine.build(module:locale:)`. The short version:
+/// `DictationTranscriber` is the only module where contextual-string biasing works (RECON §1) and
+/// the only one that covers Indonesian, so it owns live dictation. `SpeechTranscriber` is
+/// materially more accurate and much faster on a whole file, so it owns imports for the 45 locales
+/// it covers.
+public enum TranscriptionModule: String, Sendable, Hashable, CaseIterable, Codable {
+    /// `DictationTranscriber`. Close-mic single-speaker dictation, `TranscriptionOption.punctuation`,
+    /// working `contextualStrings` biasing, 54 locales (Indonesian among them).
+    case dictation
+    /// `SpeechTranscriber`. General transcription, 45 locales, no working vocabulary biasing.
+    case general
+
+    /// Written into `Transcript.engine`, so a history entry records which model produced it.
+    public var engineIdentifier: String {
+        switch self {
+        case .dictation: Transcript.currentEngine
+        case .general: Transcript.generalEngine
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .dictation: "Dictation model"
+        case .general: "Transcription model"
+        }
+    }
+
+    /// RECON §1: `AnalysisContext.contextualStrings[.general]` is a measured, complete no-op on
+    /// `SpeechTranscriber` — byte-identical output across 4 files × 4 configurations. Layer 1 of the
+    /// two-layer dictionary therefore only exists on the dictation module; layer 2 (the correction
+    /// pass) runs for both.
+    public var supportsBiasing: Bool { self == .dictation }
 }
 
 public enum ModelState: Sendable, Hashable {
@@ -215,16 +259,19 @@ final class TranscriptSink: @unchecked Sendable {
                 volatileTail = ""
 
                 for run in text.runs {
-                    guard let confidence =
-                        run.attributes[AttributeScopes.SpeechAttributes.ConfidenceAttribute.self]
-                    else { continue }
+                    let confidence = run.attributes[AttributeScopes.SpeechAttributes.ConfidenceAttribute.self]
                     let timeRange = run.attributes[AttributeScopes.SpeechAttributes.TimeRangeAttribute.self]
+                    // A run is worth collecting if it carries *either* attribute. Requiring
+                    // confidence is what silently emptied `segments` for Indonesian, where the
+                    // dictation module supplies time ranges and no confidences at all — see
+                    // `WordConfidence.confidence`.
+                    guard confidence != nil || timeRange != nil else { continue }
                     let raw = String(text[run.range].characters)
                     // Segment text carries its own leading space (" It runs entirely…"); keep it in the
                     // transcript but strip it from the word we surface in the dictionary UI.
                     let word = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !word.isEmpty else { continue }
-                    runConfidences.append(confidence)
+                    if let confidence { runConfidences.append(confidence) }
                     words.append(
                         WordConfidence(
                             text: word,
@@ -268,7 +315,9 @@ final class TranscriptSink: @unchecked Sendable {
         lock.withLock {
             var seen = Set<String>()
             var out: [String] = []
-            for word in words where word.confidence < lowConfidenceThreshold {
+            // A run with no confidence is not evidence of a mishearing, so it is not offered to the
+            // dictionary — see the note on `WordConfidence.confidence`.
+            for word in words where (word.confidence ?? 1) < lowConfidenceThreshold {
                 let key = word.text.lowercased()
                 if seen.insert(key).inserted { out.append(word.text) }
             }
@@ -278,8 +327,9 @@ final class TranscriptSink: @unchecked Sendable {
 
     var meanConfidence: Double? {
         lock.withLock {
-            guard !words.isEmpty else { return nil }
-            return words.reduce(0.0) { $0 + $1.confidence } / Double(words.count)
+            let scored = words.compactMap(\.confidence)
+            guard !scored.isEmpty else { return nil }
+            return scored.reduce(0, +) / Double(scored.count)
         }
     }
 

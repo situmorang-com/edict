@@ -28,6 +28,14 @@ public actor SpeechEngine: TranscriptionEngine {
     /// Cached because `bestAvailableAudioFormat` needs a throwaway module and the answer never changes for a
     /// given locale. Observed: 1 ch / 16000 Hz / Int16 / interleaved.
     private var cachedFormat: AVAudioFormat?
+    /// The `SpeechTranscriber` half of the same two facts. Resolved lazily, the first time a file
+    /// import asks for the general module — live dictation never touches it.
+    private var generalLocale: Locale?
+    private var generalFormat: AVAudioFormat?
+    /// Memoised answer to "which module serves this locale for an import". Keyed by the *requested*
+    /// identifier, because that is what the caller has; the resolved canonical form is stored in
+    /// `generalLocale`.
+    private var importModuleByLocale: [String: TranscriptionModule] = [:]
     /// Staged for the *next* utterance. RECON §2: `setContext` mid-stream is a silent no-op, so context can only
     /// be handed to `SpeechAnalyzer.init(analysisContext:)`. Read the dictionary at key-down.
     private var biasingStrings: [String] = []
@@ -90,22 +98,32 @@ public actor SpeechEngine: TranscriptionEngine {
             throw SpeechEngineError.localeUnsupported(localeIdentifier)
         }
 
+        try await reserve(canonical)
+        return canonical
+    }
+
+    /// Hold a reservation for an already-canonical locale. Split out of `reserveLocale` so the
+    /// import path can reserve a `SpeechTranscriber` locale, which resolves through a *different*
+    /// module and therefore cannot go through the dictation resolver above.
+    private func reserve(_ canonical: Locale) async throws {
         let existing = await AssetInventory.reservedLocales
         // Logged at every prepare because the probe leaked slots during exploration and a leak is invisible
         // until reservation starts failing outright.
         Log.stt.debug("reserved locales: \(existing.map(\.identifier).joined(separator: ","), privacy: .public)")
 
-        if existing.contains(where: { $0.identifier == canonical.identifier }) { return canonical }
+        if existing.contains(where: { $0.identifier == canonical.identifier }) { return }
 
         do {
             // `false` means "already reserved" and is not an error.
             _ = try await AssetInventory.reserve(locale: canonical)
         } catch {
             // SFSpeechErrorDomain Code=11 "Too many allocated locales, 5 maximum". Evict everything else and
-            // retry — Edict only ever needs one locale at a time.
+            // retry — Edict only ever needs one locale at a time. `generalLocale` is spared as well as the
+            // one being reserved, because evicting the import model's slot here would silently demote every
+            // later import back to the dictation module.
             Log.stt.warning("reserve(\(canonical.identifier, privacy: .public)) failed, evicting: \(Self.describe(error), privacy: .public)")
-            for stale in await AssetInventory.reservedLocales
-            where stale.identifier != canonical.identifier {
+            let keep = Set([canonical.identifier, canonicalLocale?.identifier, generalLocale?.identifier].compactMap { $0 })
+            for stale in await AssetInventory.reservedLocales where !keep.contains(stale.identifier) {
                 _ = await AssetInventory.release(reservedLocale: stale)
             }
             do {
@@ -114,7 +132,6 @@ public actor SpeechEngine: TranscriptionEngine {
                 throw SpeechEngineError.reservationFailed(Self.describe(error))
             }
         }
-        return canonical
     }
 
     /// Download the locale's assets if they are missing. No-op when `prepare` already reported `.ready`.
@@ -148,12 +165,31 @@ public actor SpeechEngine: TranscriptionEngine {
     /// RECON §6 found only 1 ch/16 kHz and 1 ch/8 kHz Int16 interleaved in `availableCompatibleAudioFormats`,
     /// while a live tap is typically 48 kHz Float32 non-interleaved.
     public func bestAudioFormat() async -> AVAudioFormat? {
-        if let cachedFormat { return cachedFormat }
-        guard let locale = canonicalLocale else { return nil }
-        let probe = Self.makeModule(locale: locale)
-        let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [probe])
-        cachedFormat = format
-        return format
+        await bestAudioFormat(for: .dictation)
+    }
+
+    /// The same question for a named module. The two modules are asked separately rather than
+    /// assumed identical: `availableCompatibleAudioFormats` is a property of the module, and the
+    /// import path must convert to whatever the module it is actually going to use accepts.
+    public func bestAudioFormat(for module: TranscriptionModule) async -> AVAudioFormat? {
+        switch module {
+        case .dictation:
+            if let cachedFormat { return cachedFormat }
+            guard let locale = canonicalLocale else { return nil }
+            let format = await SpeechAnalyzer.bestAvailableAudioFormat(
+                compatibleWith: [Self.build(module: .dictation, locale: locale).module]
+            )
+            cachedFormat = format
+            return format
+        case .general:
+            if let generalFormat { return generalFormat }
+            guard let locale = generalLocale else { return nil }
+            let format = await SpeechAnalyzer.bestAvailableAudioFormat(
+                compatibleWith: [Self.build(module: .general, locale: locale).module]
+            )
+            generalFormat = format
+            return format
+        }
     }
 
     // MARK: - Biasing
@@ -185,53 +221,61 @@ public actor SpeechEngine: TranscriptionEngine {
     public func begin(
         onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
     ) async throws -> any TranscriptionSession {
-        try await beginSession(onUpdate: onUpdate)
+        try await beginSession(module: .dictation, biasing: nil, onUpdate: onUpdate)
     }
 
+    /// - Parameters:
+    ///   - module: which of Apple's two modules to build. `.dictation` for live push-to-talk;
+    ///     `.general` for a file import whose locale `SpeechTranscriber` covers.
+    ///   - biasing: contextual strings for *this* session only, bypassing the staged list. The
+    ///     import path passes its own so a file cannot inherit — or clobber — the list a
+    ///     concurrent dictation staged at key-down. `nil` uses the staged list.
     private func beginSession(
+        module: TranscriptionModule,
+        biasing: [String]?,
         onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
     ) async throws -> SpeechSession {
         if activeSession != nil { throw SpeechEngineError.sessionAlreadyRunning }
-        guard let locale = canonicalLocale else { throw SpeechEngineError.notPrepared }
-        guard let format = await bestAudioFormat() else { throw SpeechEngineError.noAudioFormat }
+        guard let locale = module == .general ? generalLocale : canonicalLocale else {
+            throw SpeechEngineError.notPrepared
+        }
+        guard let format = await bestAudioFormat(for: module) else { throw SpeechEngineError.noAudioFormat }
 
-        let module = Self.makeModule(locale: locale)
+        let built = Self.build(module: module, locale: locale)
 
         // Context MUST be supplied at init; `SpeechAnalyzer.setContext(_:)` later is a silent no-op (RECON §2).
+        // Biasing is dropped entirely for `.general`: RECON §1 measured it as a byte-for-byte no-op
+        // there, so paying the ~65 ms + ~1.5 ms/term setup cost would buy literally nothing.
+        let strings = module.supportsBiasing ? (biasing ?? biasingStrings) : []
         let context = AnalysisContext()
-        if !biasingStrings.isEmpty {
-            context.contextualStrings = [.general: biasingStrings]
+        if !strings.isEmpty {
+            context.contextualStrings = [.general: strings]
         }
 
         let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
         let analyzer = SpeechAnalyzer(
             inputSequence: stream,
-            modules: [module],
+            modules: [built.module],
             options: SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .processLifetime),
             analysisContext: context
         )
         try await analyzer.prepareToAnalyze(in: format)
-        warmed = true
+        if module == .dictation { warmed = true }
 
         let sink = TranscriptSink(onUpdate: onUpdate)
-        // Hoisted out of the `Task` on purpose: capturing mutable local state inside the task closure is what
-        // Swift 6 rejects with "sending value of non-Sendable type … risks causing data races" (RECON §7).
-        // `module.results` is Sendable; the sink is lock-protected.
-        let results = module.results
-        sink.attach(
-            Task {
-                for try await result in results {
-                    sink.ingest(isFinal: result.isFinal, range: result.range, text: result.text)
-                }
-            }
-        )
+        // The results consumer is built by `build` rather than here, because the two modules have
+        // *different* `Result` types and no common protocol member carrying `text` —
+        // `SpeechModuleResult` only promises `range` and `resultsFinalizationTime`. Hoisting
+        // `module.results` out of the `Task` still happens, inside `build`: capturing mutable local
+        // state in the task closure is what Swift 6 rejects (RECON §7).
+        sink.attach(built.attach(sink))
 
         let session = SpeechSession(
             continuation: continuation,
             analyzer: analyzer,
             sink: sink,
             sampleRate: format.sampleRate,
-            biasingCount: biasingStrings.count
+            biasingCount: strings.count
         )
         activeSession = session
         return session
@@ -244,9 +288,11 @@ public actor SpeechEngine: TranscriptionEngine {
     /// caller's stream straight to `SpeechAnalyzer` would give away control of step 1.
     public func transcribe(
         input: AsyncStream<AnalyzerInput>,
+        module: TranscriptionModule = .dictation,
+        biasing: [String]? = nil,
         onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
     ) async throws -> TranscriptionOutcome {
-        let session = try await beginSession(onUpdate: onUpdate)
+        let session = try await beginSession(module: module, biasing: biasing, onUpdate: onUpdate)
         // Identity-checked so a `cancel()` followed by a fresh `begin()` — which is legal, because cancel
         // clears `activeSession` while this method is still draining the caller's stream — is not torn down
         // by this call's cleanup.
@@ -281,7 +327,7 @@ public actor SpeechEngine: TranscriptionEngine {
     public func warmUp() async {
         guard !warmed, activeSession == nil else { return }
         do {
-            let session = try await beginSession(onUpdate: { _ in })
+            let session = try await beginSession(module: .dictation, biasing: nil, onUpdate: { _ in })
             activeSession = nil
             await session.abort()
             Log.stt.info("warm-up complete")
@@ -293,19 +339,150 @@ public actor SpeechEngine: TranscriptionEngine {
 
     // MARK: - Module construction
 
-    /// The one place a `DictationTranscriber` is built.
+    /// A module plus the results consumer that belongs to it.
     ///
-    /// The explicit initializer is mandatory rather than stylistic: RECON §7 measured every *named* preset
-    /// carrying `attributeOptions == []`, which yields one attribute-free run and no confidence at all — code
-    /// looking for `ConfidenceAttribute` silently finds nothing and appears to work.
-    private static func makeModule(locale: Locale) -> DictationTranscriber {
-        DictationTranscriber(
-            locale: locale,
-            contentHints: [],
-            transcriptionOptions: [.punctuation],
-            reportingOptions: [.volatileResults],
-            attributeOptions: [.transcriptionConfidence, .audioTimeRange]
-        )
+    /// `attach` is a closure and not a generic function because the two modules' `Result` types are
+    /// unrelated: `SpeechModuleResult` promises only `range` and `resultsFinalizationTime`, so the
+    /// `text` accessor can only be reached from inside a branch that knows the concrete type.
+    private struct BuiltModule {
+        let module: any SpeechModule
+        let attach: (TranscriptSink) -> Task<Void, Error>
+    }
+
+    /// The one place either transcription module is built.
+    ///
+    /// **The explicit initializer is mandatory rather than stylistic.** RECON §7 measured every
+    /// *named* preset carrying `attributeOptions == []`, which yields one attribute-free run with no
+    /// confidence and **no time range at all** — code looking for `ConfidenceAttribute` or
+    /// `TimeRangeAttribute` silently finds nothing and appears to work. Without
+    /// `[.transcriptionConfidence, .audioTimeRange]` here there are no per-word timings, so
+    /// `TranscriptSegment` comes back empty and SRT/VTT export is worthless. Both branches ask for
+    /// both attributes; both were verified to deliver them (see the note below).
+    ///
+    /// ## Why two modules, measured on this machine
+    ///
+    /// The 377 s English script in `long.aiff`, same audio, same explicit attribute options:
+    ///
+    /// | module                 | word error | wall  | realtime | final results |
+    /// |------------------------|-----------:|------:|---------:|--------------:|
+    /// | `DictationTranscriber` |     10.1 % | 25.0s |    15.1x |             7 |
+    /// | `SpeechTranscriber`    |      4.2 % |  5.7s |    66.4x |            64 |
+    ///
+    /// `SpeechTranscriber` more than halves the error rate, runs 4.4x faster, and emits ~9x as many
+    /// final results — which matters for subtitles, because a cue can only be cut at a result
+    /// boundary. Concretely, `DictationTranscriber` produced "It is a push to talk. Dictation tool
+    /// for macOS" and "the text appears that the cursor" where `SpeechTranscriber` produced "Edict is
+    /// a push to talk dictation tool for macOS" and "the text appears at the cursor".
+    ///
+    /// So imports use `SpeechTranscriber` — **but only where it can.** It covers 45 locales against
+    /// `DictationTranscriber`'s 54, and Indonesian is in the gap:
+    /// `SpeechTranscriber.supportedLocale(equivalentTo: id-ID)` returns nil, while the dictation
+    /// module transcribed an 18.8 s Indonesian clip word-perfect at 34.5x realtime. `resolveImportModule`
+    /// therefore falls back rather than refusing the file. One measured wrinkle worth knowing: on
+    /// `id_ID` the dictation module returned time ranges on all 38 runs but confidence on **none** of
+    /// them, so the low-confidence dictionary suggestions are silently empty for Indonesian while the
+    /// subtitle export still works.
+    ///
+    /// Live dictation stays on `DictationTranscriber` regardless, for the reason RECON §1 exists:
+    /// contextual-string biasing works there and nowhere else, and that is the whole dictionary
+    /// feature. A file import has the correction pass instead, and no speech onset to hide the
+    /// biasing setup cost behind.
+    private static func build(module: TranscriptionModule, locale: Locale) -> BuiltModule {
+        switch module {
+        case .dictation:
+            let transcriber = DictationTranscriber(
+                locale: locale,
+                contentHints: [],
+                transcriptionOptions: [.punctuation],
+                reportingOptions: [.volatileResults],
+                attributeOptions: [.transcriptionConfidence, .audioTimeRange]
+            )
+            let results = transcriber.results
+            return BuiltModule(module: transcriber) { sink in
+                Task {
+                    for try await result in results {
+                        sink.ingest(isFinal: result.isFinal, range: result.range, text: result.text)
+                    }
+                }
+            }
+
+        case .general:
+            let transcriber = SpeechTranscriber(
+                locale: locale,
+                // `SpeechTranscriber.TranscriptionOption` has exactly one case,
+                // `etiquetteReplacements` (profanity masking), which is not ours to impose. It has
+                // no `.punctuation` option because it punctuates by default — measured: "Hold the
+                // right option key, speak, and release, and the text appears at the cursor."
+                transcriptionOptions: [],
+                reportingOptions: [.volatileResults],
+                attributeOptions: [.transcriptionConfidence, .audioTimeRange]
+            )
+            let results = transcriber.results
+            return BuiltModule(module: transcriber) { sink in
+                Task {
+                    for try await result in results {
+                        sink.ingest(isFinal: result.isFinal, range: result.range, text: result.text)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Kept as the dictation-only shorthand the asset paths use.
+    private static func makeModule(locale: Locale) -> any SpeechModule {
+        build(module: .dictation, locale: locale).module
+    }
+
+    // MARK: - Import module selection
+
+    /// Decide which module a file import should use, and prepare it.
+    ///
+    /// Never throws and never refuses: the worst case is falling back to `.dictation`, which
+    /// `prepare(localeIdentifier:)` has already reserved and warmed. Three things send it back to
+    /// `.dictation`:
+    ///
+    /// 1. The user turned the preference off.
+    /// 2. `SpeechTranscriber` does not support the locale (`id-ID`).
+    /// 3. `SpeechTranscriber` supports it but its assets are **not installed**. Downloading them
+    ///    inside an import would stall a queue the user is watching for an unbounded time, so the
+    ///    file is transcribed now with the model that is already on disk and the choice is logged.
+    public func resolveImportModule(
+        preferGeneral: Bool,
+        localeIdentifier: String
+    ) async -> TranscriptionModule {
+        guard preferGeneral else { return .dictation }
+        if let cached = importModuleByLocale[localeIdentifier] { return cached }
+
+        func remember(_ module: TranscriptionModule, _ why: String) -> TranscriptionModule {
+            importModuleByLocale[localeIdentifier] = module
+            Log.stt.info(
+                """
+                import module for \(localeIdentifier, privacy: .public):                 \(module.rawValue, privacy: .public) — \(why, privacy: .public)
+                """
+            )
+            return module
+        }
+
+        guard let canonical = await SpeechTranscriber.supportedLocale(
+            equivalentTo: Locale(identifier: localeIdentifier)
+        ) else {
+            return remember(.dictation, "the transcription model does not support this locale")
+        }
+
+        do {
+            let probe = Self.build(module: .general, locale: canonical).module
+            // Reserved *before* the status check, exactly as RECON §6 requires: unreserved-but-installed
+            // locales report `.supported`, so gating on status would trigger a pointless download.
+            _ = try await reserve(canonical)
+            if try await AssetInventory.assetInstallationRequest(supporting: [probe]) != nil {
+                return remember(.dictation, "the transcription model's assets are not installed")
+            }
+            generalLocale = canonical
+            generalFormat = nil
+            return remember(.general, "measured 4.2 % word error against 10.1 % on this machine")
+        } catch {
+            return remember(.dictation, "the transcription model could not be prepared: \(Self.describe(error))")
+        }
     }
 
     private static func describe(_ error: Error) -> String {

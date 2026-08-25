@@ -50,6 +50,26 @@ Three, granted once, all with a plain-language explanation in the app's Permissi
 | Input Monitoring | To see the hold-to-talk key while you are in another app |
 | Accessibility | To read the focused text field, so it can confirm the text actually landed |
 
+## Transcribing files
+
+Drop an audio or video file on the window, pick one with `Cmd+O`, or open it from Finder. Audio and video
+containers both work — m4a, mp3, wav, aiff, caf, mp4, mov — because the reader pulls the audio track out of the
+container rather than assuming an audio file. Multiple files queue and run one at a time.
+
+Imports land in **history with per-word timestamps**, exportable as **TXT, SRT or VTT**. They are never injected at
+your cursor — that is the difference between dictating and transcribing.
+
+Measured on this machine: about 9–27x realtime warm, and 75x on a six-minute file. Word error against the source
+script was 4.1% on that file.
+
+**Edict does not identify speakers.** Apple's on-device speech framework has no module that separates one voice from
+another, so a meeting or interview arrives as one block of text with no names and no turn breaks. If you need who
+said what, Edict cannot give you that, and the app says so where you would look for it.
+
+Imports use `SpeechTranscriber`, which measured 4.2% word error at 66x realtime against `DictationTranscriber`'s
+10.1% at 15x on identical audio. Live dictation keeps `DictationTranscriber`, because vocabulary biasing only works
+there — and so does Indonesian, which imports fall back to it for.
+
 ## Languages
 
 54 locales, including **Indonesian (`id_ID`)** and Malay (`ms_MY`). Pick one in Settings; the on-device model

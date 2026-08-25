@@ -192,7 +192,7 @@ private struct TranscriptDetail: View {
                 VStack(alignment: .leading, spacing: D.space.md) {
                     header
                     if transcript.mayBeIncomplete { incompleteNotice }
-                    textBlock(label: "Inserted", body: transcript.text)
+                    textBlock(label: transcript.isImported ? "Transcript" : "Inserted", body: transcript.text)
                     if transcript.didCorrect {
                         textBlock(label: "As heard", body: transcript.rawText)
                         corrections
@@ -214,26 +214,60 @@ private struct TranscriptDetail: View {
         HStack(alignment: .center, spacing: D.space.md) {
             readout("Length", .duration(transcript.audioDuration))
             readout("Words", .count(transcript.wordCount, unit: "w"))
-            readout("Latency", .count(Int((transcript.transcribeDuration * 1000).rounded()), unit: "ms"))
+            if transcript.isImported {
+                // For a file this is the whole job, not an end-of-speech latency, so it is reported
+                // as a speed: "62x" reads as "an hour of audio in a minute", which is the number a
+                // user deciding whether to import a long recording actually wants.
+                readout("Took", .duration(transcript.transcribeDuration))
+                readout("Speed", .count(Int(realtimeFactor.rounded()), unit: "x"))
+            } else {
+                readout("Latency", .count(Int((transcript.transcribeDuration * 1000).rounded()), unit: "ms"))
+            }
 
             VStack(alignment: .leading, spacing: D.space.xxs) {
-                SilkscreenLabel("Inserted into", weight: .tiny)
+                SilkscreenLabel(transcript.isImported ? "From file" : "Inserted into", weight: .tiny)
                     .silkscreenDecorative()
                 Text(target)
                     .typeStyle(D.type.caption)
-                    .foregroundStyle(transcript.injection.isSuccess ? D.color.textPrimary : D.color.alert)
+                    // An imported transcript was never *meant* to be inserted, so the alert ink
+                    // would be a false alarm — the only fault here is a failed injection.
+                    .foregroundStyle(
+                        transcript.isImported || transcript.injection.isSuccess
+                            ? D.color.textPrimary
+                            : D.color.alert
+                    )
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(target)
             }
 
             Spacer(minLength: D.space.sm)
 
+            // Export lives in the detail block, not on the row: the row is a dense table line and
+            // three more keys per row would swamp it, while the detail is already the place the user
+            // has committed to one transcript. SRT and VTT grey themselves out for a dictated
+            // transcript — there are no per-word timings to cut cues against — and say so on hover.
+            TranscriptExportKeys(transcript)
+            SeamDivider(.vertical)
+                .frame(height: D.size.buttonHeight)
             TapeButton("Copy") { ViewClipboard.put(transcript.text) }
             TapeButton("Delete", action: onDelete)
                 .help("Deletes this recording of your speech. There is no undo.")
         }
     }
 
+    /// Audio seconds per wall-clock second over the whole import.
+    private var realtimeFactor: Double {
+        guard transcript.transcribeDuration > 0 else { return 0 }
+        return transcript.audioDuration / transcript.transcribeDuration
+    }
+
     private var target: String {
+        // Imported transcripts have no target app by construction — nothing was injected, which is
+        // the whole behavioural difference from a dictation.
+        if let filename = transcript.source.importedFilename {
+            return filename.isEmpty ? "Imported file" : filename
+        }
         let app = transcript.targetAppName ?? transcript.targetBundleID
         switch (app, transcript.injection) {
         case (let app?, .notAttempted): return "\(app) — not inserted"

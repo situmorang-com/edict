@@ -10,7 +10,7 @@ import SwiftUI
 /// opens a *different window* is exactly the indirection a user in trouble cannot follow. The pane
 /// is the same view the Settings window embeds.
 enum Pane: String, CaseIterable, Identifiable, Hashable {
-    case history, dictionary, permissions
+    case history, imports, dictionary, permissions
 
     var id: String { rawValue }
 
@@ -18,6 +18,7 @@ enum Pane: String, CaseIterable, Identifiable, Hashable {
     var legend: String {
         switch self {
         case .history: "History"
+        case .imports: "Import"
         case .dictionary: "Dictionary"
         case .permissions: "Permissions"
         }
@@ -40,7 +41,6 @@ public struct MainWindow: View {
     /// shell's views seam comment says it will do.
     public init(model: AppModel = .shared) {
         self.model = model
-        self._pane = State(initialValue: .history)
         self.forcesBanner = false
         self.unbounded = false
     }
@@ -49,9 +49,11 @@ public struct MainWindow: View {
     /// on a machine where the permissions happen to be granted.
     init(model: AppModel, pane: Pane, forcesBanner: Bool = false, unbounded: Bool = false) {
         self.model = model
-        self._pane = State(initialValue: pane)
         self.forcesBanner = forcesBanner
         self.unbounded = unbounded
+        // Assigned rather than held as `@State`: the selection lives on `AppModel` now, because ⌘O
+        // and a dropped file both have to move it from outside this view.
+        model.pane = pane
     }
 
     private let forcesBanner: Bool
@@ -59,7 +61,7 @@ public struct MainWindow: View {
     /// Render-harness escape hatch, passed straight through to `PermissionsPane.unbounded`.
     private let unbounded: Bool
 
-    @State private var pane: Pane
+    private var pane: Pane { model.pane }
 
     public var body: some View {
         VStack(spacing: 0) {
@@ -70,13 +72,16 @@ public struct MainWindow: View {
             SeamDivider(.horizontal, depth: .channel, inset: D.radius.chassis)
 
             if showsBanner {
-                AttentionBanner(model: model) { pane = .permissions }
+                AttentionBanner(model: model) { model.pane = .permissions }
                 SeamDivider(.horizontal, depth: .channel, inset: D.radius.chassis)
             }
 
             HStack(spacing: 0) {
-                EquipmentRail(model: model, selection: $pane)
-                    .frame(width: D.size.railWidth)
+                EquipmentRail(
+                    model: model,
+                    selection: Binding(get: { model.pane }, set: { model.pane = $0 })
+                )
+                .frame(width: D.size.railWidth)
 
                 SeamDivider(.vertical, depth: .channel)
 
@@ -86,6 +91,10 @@ public struct MainWindow: View {
         }
         .frame(minWidth: D.size.windowMin.width, minHeight: D.size.windowMin.height)
         .background(D.surface.deckPaint)
+        // Applied to the window root, not to the import pane: a user who has just dropped a
+        // recording on a dictation app is not going to select the right rail stop first. See
+        // `DropTarget`.
+        .dropTarget { urls in model.enqueueImports(urls) }
         // The whole window animates pane changes, so the rail's latch and the content move together.
         .animation(D.motion.pane, value: pane)
         .animation(D.motion.panel, value: showsBanner)
@@ -95,6 +104,14 @@ public struct MainWindow: View {
     private func body(for pane: Pane) -> some View {
         switch pane {
         case .history: HistoryPane(model: model)
+        case .imports:
+            ImportPane(
+                rows: model.importRows,
+                onEnqueue: { model.enqueueImports($0) },
+                onCancel: { model.importQueue.cancel($0) },
+                onRetry: { model.importQueue.retry($0) },
+                onClearFinished: { model.importQueue.clearFinished() }
+            )
         case .dictionary: DictionaryPane(model: model)
         case .permissions: PermissionsPane(model: model, unbounded: unbounded)
         }
@@ -520,6 +537,7 @@ public enum PreviewFixtures {
             sheet("main-history", window, MainWindow(model: main, pane: .history)),
             sheet("main-history-banner", window,
                   MainWindow(model: model(), pane: .history, forcesBanner: true)),
+            sheet("main-import", window, MainWindow(model: model(), pane: .imports)),
             sheet("main-dictionary", window, MainWindow(model: model(), pane: .dictionary)),
             sheet("main-permissions", window,
                   MainWindow(model: model(), pane: .permissions, unbounded: true)),

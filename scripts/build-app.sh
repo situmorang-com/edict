@@ -164,6 +164,23 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>NSSupportsSuddenTermination</key>   <false/>
 	<key>NSMicrophoneUsageDescription</key>  <string>$APP_NAME records from the microphone so it can transcribe your speech on-device.</string>
 	<key>NSSpeechRecognitionUsageDescription</key><string>$APP_NAME transcribes your dictation on-device.</string>
+	<!-- File transcription, declared so a recording can be handed to Edict from the Finder or
+	     from \`open -a Edict <file>\`. LSHandlerRank is Alternate, never Owner or Default: Edict
+	     must show up in "Open With" without displacing QuickTime Player as the app that opens a
+	     double-clicked .m4a. Role Viewer, because nothing here writes the media back. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>     <string>Audio or Video Recording</string>
+			<key>CFBundleTypeRole</key>     <string>Viewer</string>
+			<key>LSHandlerRank</key>        <string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.audio</string>
+				<string>public.movie</string>
+			</array>
+		</dict>
+	</array>
 	<!-- No NSAppleEventsUsageDescription. It is only ever shown for the matching
 	     com.apple.security.automation.apple-events entitlement, which we deliberately do not ship
 	     (see the entitlement notes below), and nothing in Sources/ sends an Apple Event: the
