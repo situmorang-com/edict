@@ -50,6 +50,17 @@ Three, granted once, all with a plain-language explanation in the app's Permissi
 | Input Monitoring | To see the hold-to-talk key while you are in another app |
 | Accessibility | To read the focused text field, so it can confirm the text actually landed |
 
+## Languages
+
+54 locales, including **Indonesian (`id_ID`)** and Malay (`ms_MY`). Pick one in Settings; the on-device model
+for a new locale downloads on first use (~30 s). Verified: a spoken Indonesian sentence transcribed word-perfect
+in 0.36 s.
+
+Note that `SpeechTranscriber` and `DictationTranscriber` expose *different* locale sets — 45 versus 54, and
+Indonesian is only in the latter. Edict uses `DictationTranscriber`.
+
+macOS reserves at most 5 locales per app at a time; Edict evicts the least recently used when it needs a slot.
+
 ## Documentation
 
 - [`docs/RECON.md`](docs/RECON.md) — empirical findings from probing these APIs. Most are

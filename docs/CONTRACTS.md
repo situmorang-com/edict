@@ -33,7 +33,8 @@
 >    `AssetInventory.status(...)`; it returns `.supported` for locales that are installed but unreserved. Gate on
 >    `assetInstallationRequest(supporting:) == nil` instead.
 > 7. **Never derive the locale from `Locale.current`.** This machine's locale is `en_ID`, which resolves to `en-IN`
->    — silently the wrong acoustic model. Default to an explicit `en-US`. Indonesian (`id-ID`) is unsupported.
+>    — silently the wrong acoustic model. Default to an explicit `en-US`. Note the two modules have *different* locale sets: `id-ID` is unsupported by
+>    `SpeechTranscriber` but IS supported by `DictationTranscriber`, which is what we use (54 locales vs 45).
 > 8. **The default hotkey is Right Option** (keyCode 61, device bit `0x40`, full down-flags `0x00080040`).
 >    This machine runs **Karabiner-Elements with 729 event taps** and its active profile already claims
 >    `right_command` (→Hyper/Escape), `caps_lock` (→symbol layer) and `fn`. Siri and SiriNCService hold
