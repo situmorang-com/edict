@@ -32,7 +32,50 @@ public enum HotkeyChoice: String, Codable, CaseIterable, Sendable, Identifiable 
     }
 }
 
+/// A bare modifier that can be held *alongside* the push-to-talk key to change something about the
+/// utterance. Edict uses exactly one of these, for the secondary dictation locale.
+///
+/// Deliberately locale-agnostic: `HotkeyMonitor` reports "this modifier was held" and nothing more,
+/// and the mapping from that boolean to a language lives in `DictationController`. The bit masks and
+/// keycodes are in `HotkeyMonitor.swift` next to the rest of the device-bit knowledge.
+///
+/// Why a modifier at all, rather than a second hotkey: RECON §8 found that the only keys this
+/// machine's active Karabiner profile leaves alone are `right_option` and `right_control`, and the
+/// only attached keyboard has no Right Control key — so there is no second key to give out. Shift
+/// appears in the profile only as a *combination condition*, never as a `from` key, so it is not
+/// swallowed by the remapper and its state is readable.
+public enum HotkeyModifier: String, Codable, CaseIterable, Sendable, Identifiable {
+    case shift, control, command, option
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .shift: "Shift (⇧)"
+        case .control: "Control (⌃)"
+        case .command: "Command (⌘)"
+        case .option: "Option (⌥)"
+        }
+    }
+
+    public var glyph: String {
+        switch self {
+        case .shift: "⇧"
+        case .control: "⌃"
+        case .command: "⌘"
+        case .option: "⌥"
+        }
+    }
+}
+
 /// User preferences, persisted to `UserDefaults.standard` under the `edict.` prefix.
+///
+/// **"Open at login" is deliberately not here.** It used to be, as a `Bool` that nothing read: the
+/// switch wrote a preference and no `SMAppService` call existed anywhere in the app, so the control
+/// silently lied. The fix is not a better-behaved preference — it is having no preference at all.
+/// `SMAppService.mainApp.status` is the only truth about whether macOS will launch Edict, it survives
+/// reinstalls and it can be changed behind Edict's back in System Settings, so a mirror of it in
+/// `UserDefaults` could only ever go stale. See `LoginItem` in `AppModel.swift`.
 ///
 /// Every property writes through on `didSet`. That is deliberately eager: settings changes are rare,
 /// human-paced events, and a lost preference after a crash is far more annoying than the write cost.
@@ -47,6 +90,17 @@ public final class Settings {
         /// RECON §7: never derive this from `Locale.current`. This machine's locale is `en_ID`, which
         /// resolves to the `en-IN` acoustic model — silently the wrong one. Always start from `en-US`.
         public static let localeIdentifier = "en-US"
+        /// On by default. The user of this build is Indonesian, works bilingually, and the locale is
+        /// fixed per utterance by the framework — `DictationTranscriber` takes one `Locale` and there
+        /// is no multilingual model that covers Indonesian (`mul_IN` exists on `SpeechTranscriber`
+        /// only, which does not support `id-ID` at all). Automatic detection is therefore impossible,
+        /// and switching languages in Settings before every sentence is not a workflow.
+        public static let secondaryLocaleEnabled = true
+        public static let secondaryLocaleIdentifier = "id-ID"
+        /// RECON §8: `right_option` survives Karabiner's DriverKit virtual keyboard with its device
+        /// bit intact, and Shift is referenced in the active profile only as a combination condition,
+        /// so it is neither remapped nor swallowed.
+        public static let secondaryLocaleModifier = HotkeyModifier.shift
         public static let pushToTalk = true
         public static let autoInject = true
         public static let showHUD = true
@@ -65,7 +119,6 @@ public final class Settings {
         /// realtime against 15x on the same 377 s file. See `SpeechEngine.build`.
         public static let importUsesGeneralModel = true
         public static let historyLimit = 5000
-        public static let launchAtLogin = false
     }
 
     /// The hard ceiling on contextual strings handed to the analyzer. See `Default.biasingLimit`.
@@ -80,6 +133,26 @@ public final class Settings {
 
     public var localeIdentifier: String {
         didSet { write(localeIdentifier, .localeIdentifier) }
+    }
+
+    /// Hold the push-to-talk key *plus* `secondaryLocaleModifier` to dictate one utterance in
+    /// `secondaryLocaleIdentifier` instead of `localeIdentifier`.
+    ///
+    /// A per-utterance modifier rather than a mode or a menu-bar toggle, and that is the whole design:
+    /// a mode means discovering you dictated an entire paragraph in the wrong language. The modifier
+    /// decides one utterance at a time, so the user cannot drift.
+    public var secondaryLocaleEnabled: Bool {
+        didSet { write(secondaryLocaleEnabled, .secondaryLocaleEnabled) }
+    }
+
+    /// The language of an utterance dictated with the modifier held. Validated against the framework's
+    /// own list at launch — see `reconcileSecondaryLocale(supportedIdentifiers:)`.
+    public var secondaryLocaleIdentifier: String {
+        didSet { write(secondaryLocaleIdentifier, .secondaryLocaleIdentifier) }
+    }
+
+    public var secondaryLocaleModifier: HotkeyModifier {
+        didSet { write(secondaryLocaleModifier.rawValue, .secondaryLocaleModifier) }
     }
 
     /// Hold-to-talk (release ends the utterance) vs press-once-to-start / press-again-to-stop.
@@ -152,10 +225,6 @@ public final class Settings {
         }
     }
 
-    public var launchAtLogin: Bool {
-        didSet { write(launchAtLogin, .launchAtLogin) }
-    }
-
     // MARK: Lifecycle
 
     /// `defaults` is injectable so tests can use a throwaway suite instead of the user's real prefs.
@@ -178,6 +247,11 @@ public final class Settings {
 
         hotkey = HotkeyChoice(rawValue: string(.hotkey, Default.hotkey.rawValue)) ?? Default.hotkey
         localeIdentifier = string(.localeIdentifier, Default.localeIdentifier)
+        secondaryLocaleEnabled = bool(.secondaryLocaleEnabled, Default.secondaryLocaleEnabled)
+        secondaryLocaleIdentifier = string(.secondaryLocaleIdentifier, Default.secondaryLocaleIdentifier)
+        secondaryLocaleModifier = HotkeyModifier(
+            rawValue: string(.secondaryLocaleModifier, Default.secondaryLocaleModifier.rawValue)
+        ) ?? Default.secondaryLocaleModifier
         pushToTalk = bool(.pushToTalk, Default.pushToTalk)
         autoInject = bool(.autoInject, Default.autoInject)
         showHUD = bool(.showHUD, Default.showHUD)
@@ -189,12 +263,14 @@ public final class Settings {
         prewarmMicrophone = bool(.prewarmMicrophone, Default.prewarmMicrophone)
         importUsesGeneralModel = bool(.importUsesGeneralModel, Default.importUsesGeneralModel)
         historyLimit = Self.historyLimitRange.clamped(to: int(.historyLimit, Default.historyLimit))
-        launchAtLogin = bool(.launchAtLogin, Default.launchAtLogin)
     }
 
     public func resetToDefaults() {
         hotkey = Default.hotkey
         localeIdentifier = Default.localeIdentifier
+        secondaryLocaleEnabled = Default.secondaryLocaleEnabled
+        secondaryLocaleIdentifier = Default.secondaryLocaleIdentifier
+        secondaryLocaleModifier = Default.secondaryLocaleModifier
         pushToTalk = Default.pushToTalk
         autoInject = Default.autoInject
         showHUD = Default.showHUD
@@ -206,19 +282,79 @@ public final class Settings {
         prewarmMicrophone = Default.prewarmMicrophone
         importUsesGeneralModel = Default.importUsesGeneralModel
         historyLimit = Default.historyLimit
-        launchAtLogin = Default.launchAtLogin
         Log.data.info("Settings reset to defaults")
     }
 
     /// The effective biasing list length: zero when biasing is off, so callers do not have to check both.
     public var effectiveBiasingLimit: Int { biasingEnabled ? biasingLimit : 0 }
 
+    // MARK: Secondary locale validation
+
+    /// The identifier a secondary-locale utterance should actually use, or `nil` when the shortcut is
+    /// off or points at the primary language anyway (in which case the modifier is a no-op and the
+    /// utterance is just an ordinary one).
+    public var effectiveSecondaryLocaleIdentifier: String? {
+        guard secondaryLocaleEnabled else { return nil }
+        let trimmed = secondaryLocaleIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard Self.localeKey(trimmed) != Self.localeKey(localeIdentifier) else { return nil }
+        return trimmed
+    }
+
+    /// Compare `en-US`, `en_US` and `EN-us` as the same thing.
+    ///
+    /// Load-bearing rather than tidy: `DictationTranscriber.supportedLocales` reports **underscored**
+    /// identifiers (`id_ID`), Edict stores hyphenated ones (`id-ID`), and RECON §6 records that
+    /// `AssetInventory.release` matches on the raw identifier string — so anything comparing these two
+    /// forms naively concludes the locale is unsupported and silently disables the feature.
+    public static func localeKey(_ identifier: String) -> String {
+        identifier.replacingOccurrences(of: "-", with: "_").lowercased()
+    }
+
+    /// Drop a secondary locale the speech framework cannot actually serve.
+    ///
+    /// Called once at launch with `DictationTranscriber.supportedLocales`. A stale value — a locale
+    /// that was removed by an OS update, or a hand-edited `defaults write` — must not be able to wedge
+    /// dictation: the modifier would then throw on every press with nothing the user could do from the
+    /// UI. Falling back to the default identifier, and turning the shortcut off if that is unsupported
+    /// too, keeps the primary language working no matter what is in the preference.
+    ///
+    /// Takes the list as a parameter rather than importing `Speech` here so it stays a pure function
+    /// the tests can drive. The caller (`DictationController.prewarm`) has the framework's answer.
+    ///
+    /// - Returns: true when something had to be changed.
+    @discardableResult
+    public func reconcileSecondaryLocale(supportedIdentifiers: [String]) -> Bool {
+        guard secondaryLocaleEnabled else { return false }
+        let supported = Set(supportedIdentifiers.map(Self.localeKey))
+        guard !supported.isEmpty else { return false }   // nothing to validate against; leave it alone
+
+        if supported.contains(Self.localeKey(secondaryLocaleIdentifier)) { return false }
+
+        let previous = secondaryLocaleIdentifier
+        if supported.contains(Self.localeKey(Default.secondaryLocaleIdentifier)) {
+            secondaryLocaleIdentifier = Default.secondaryLocaleIdentifier
+            Log.data.error("""
+                secondary locale \(previous, privacy: .public) is not supported; \
+                reset to \(Default.secondaryLocaleIdentifier, privacy: .public)
+                """)
+        } else {
+            secondaryLocaleEnabled = false
+            Log.data.error("""
+                secondary locale \(previous, privacy: .public) is not supported and neither is the \
+                default; the language shortcut is off
+                """)
+        }
+        return true
+    }
+
     // MARK: Storage
 
     private enum Key: String {
         case hotkey, localeIdentifier, pushToTalk, autoInject, showHUD, playSounds
+        case secondaryLocaleEnabled, secondaryLocaleIdentifier, secondaryLocaleModifier
         case biasingEnabled, biasingLimit, correctionsEnabled, termCaseNormalisation
-        case prewarmMicrophone, importUsesGeneralModel, historyLimit, launchAtLogin
+        case prewarmMicrophone, importUsesGeneralModel, historyLimit
 
         var storageKey: String { "edict.\(rawValue)" }
     }

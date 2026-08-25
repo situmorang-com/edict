@@ -7,7 +7,12 @@ import Foundation
 
 public enum HotkeyEvent: Sendable, Hashable {
     /// The key has been held long enough to be a deliberate dictation gesture. Start recording.
-    case pressed
+    ///
+    /// - Parameter alternate: the configured language modifier was held at the moment the hold armed.
+    ///   The monitor deliberately knows nothing about locales — it reports the modifier state and
+    ///   `DictationController` maps it to a language. Sampled once, at arm time, and never revised for
+    ///   the rest of the hold; see `armTimerFired`.
+    case pressed(alternate: Bool)
     /// The hold ended. Always follows a `.pressed`, exactly once — including when the hold was aborted,
     /// so a consumer can never be left recording forever.
     case released
@@ -84,8 +89,32 @@ struct HotkeyBinding: Sendable, Hashable {
     let isModifier: Bool
     let displayName: String
 
-    init(_ choice: HotkeyChoice) {
+    /// Flag bits that mean "the language modifier is held". Zero when no modifier is configured, or
+    /// when every bit the modifier owns is also owned by the hotkey itself — see `init` below.
+    let alternateMask: UInt64
+    /// Keycodes belonging to the language modifier, which are therefore *exempt* from chord
+    /// cancellation. Only the sides whose device bit survives into `alternateMask` are listed, so the
+    /// exemption can never be wider than the thing it is exempting for.
+    let alternateKeyCodes: Set<Int64>
+
+    init(_ choice: HotkeyChoice, alternate: HotkeyModifier? = nil) {
         displayName = choice.displayName
+
+        // The modifier is masked against the hotkey's *own* bits before anything else. Without this,
+        // choosing Option as the language modifier while the hotkey is Right Option would make every
+        // single hold look "alternate", because Right Option sets `maskAlternate` itself. What is left
+        // after the subtraction is the honest gesture — for that pair, Right Option + *Left* Option.
+        // If nothing survives, the combination is unusable and the shortcut is simply off.
+        let own = HotkeyBinding.ownedFlags(for: choice)
+        let sides = (alternate?.sides ?? []).filter { $0.deviceBit & own == 0 }
+        let mask = sides.reduce(UInt64(0)) { $0 | $1.deviceBit }
+            | ((alternate?.deviceIndependentBit ?? 0) & ~own)
+        // A device-independent bit on its own is not enough to identify a side, but it is enough to
+        // answer "is it held", which is all `isAlternateHeld` is asked. Require at least one surviving
+        // side *or* a surviving shared bit.
+        alternateMask = sides.isEmpty && (alternate?.deviceIndependentBit ?? 0) & ~own == 0 ? 0 : mask
+        alternateKeyCodes = Set(sides.map(\.keyCode))
+
         switch choice {
         case .rightOption:
             keyCode = KeyCode.rightOption; deviceBit = DevBits.ralt; fallbackMask = 0; isModifier = true
@@ -110,6 +139,64 @@ struct HotkeyBinding: Sendable, Hashable {
     /// only after `keyCode` has matched.
     func isHeld(rawFlags: UInt64) -> Bool {
         deviceBit != 0 ? (rawFlags & deviceBit) != 0 : (rawFlags & fallbackMask) != 0
+    }
+
+    /// True when the configured language modifier is held.
+    ///
+    /// **Bit test, never an equality test.** RECON §9 and the Karabiner finding together: this machine
+    /// re-synthesises every keystroke through a DriverKit virtual keyboard that stamps
+    /// `nonCoalesced` (`0x100`) on every event, so any comparison against a literal raw value — even a
+    /// correct one like `0x00020002` — fails for reasons that look like the key is not being pressed.
+    func isAlternateHeld(rawFlags: UInt64) -> Bool {
+        alternateMask != 0 && (rawFlags & alternateMask) != 0
+    }
+
+    /// Every flag bit the hotkey key itself sets while held. Subtracted from the language modifier's
+    /// mask so a modifier can never be satisfied by the hotkey it is qualifying.
+    private static func ownedFlags(for choice: HotkeyChoice) -> UInt64 {
+        switch choice {
+        case .rightOption: UInt64(CGEventFlags.maskAlternate.rawValue) | DevBits.ralt
+        case .rightCommand: UInt64(CGEventFlags.maskCommand.rawValue) | DevBits.rcmd
+        case .rightControl: UInt64(CGEventFlags.maskControl.rawValue) | DevBits.rctrl
+        case .fn: UInt64(CGEventFlags.maskSecondaryFn.rawValue)
+        case .f13: 0
+        }
+    }
+}
+
+// MARK: - HotkeyModifier bits
+
+extension HotkeyModifier {
+
+    /// One physical key of a paired modifier: its virtual keycode and its device-dependent flag bit.
+    struct Side: Sendable, Hashable {
+        let keyCode: Int64
+        let deviceBit: UInt64
+    }
+
+    /// Left and right, in that order. Device bits are verbatim from
+    /// `IOKit.framework/Headers/hidsystem/IOLLEvent.h`; keycodes are the standard virtual keycodes.
+    /// **Either side counts** — a user reaching for Shift with the left hand while the right hand
+    /// holds Right Option is doing exactly the intended gesture.
+    var sides: [Side] {
+        switch self {
+        case .shift:   [Side(keyCode: 56, deviceBit: 0x0000_0002), Side(keyCode: 60, deviceBit: 0x0000_0004)]
+        case .control: [Side(keyCode: 59, deviceBit: 0x0000_0001), Side(keyCode: 62, deviceBit: 0x0000_2000)]
+        case .command: [Side(keyCode: 55, deviceBit: 0x0000_0008), Side(keyCode: 54, deviceBit: 0x0000_0010)]
+        case .option:  [Side(keyCode: 58, deviceBit: 0x0000_0020), Side(keyCode: 61, deviceBit: 0x0000_0040)]
+        }
+    }
+
+    /// The side-agnostic bit in the high half of the flags word. Kept as a *fallback* alongside the
+    /// device bits, not instead of them: if Karabiner's virtual keyboard ever normalises the low bits
+    /// away, this one still answers "is it held".
+    var deviceIndependentBit: UInt64 {
+        switch self {
+        case .shift: UInt64(CGEventFlags.maskShift.rawValue)
+        case .control: UInt64(CGEventFlags.maskControl.rawValue)
+        case .command: UInt64(CGEventFlags.maskCommand.rawValue)
+        case .option: UInt64(CGEventFlags.maskAlternate.rawValue)
+        }
     }
 }
 
@@ -175,6 +262,16 @@ public final class HotkeyMonitor: Sendable {
 
         /// Non-nil while the key is physically down.
         var holdStart: CFAbsoluteTime?
+        /// The raw flags word from the most recent `.flagsChanged` the tap delivered.
+        ///
+        /// A second, independent source for the language-modifier test. Every `.flagsChanged` carries
+        /// the *complete* modifier state at that moment, so this is current rather than accumulated —
+        /// and it needs no API beyond the tap we already have. It exists because RECON could not
+        /// confirm whether `CGEventSource.flagsState` works at all without Input Monitoring (it polled
+        /// 310 samples while nobody was pressing anything, so all-zero was inconclusive). If that call
+        /// turns out to be inert, the feature would silently always choose the primary language; this
+        /// makes that impossible.
+        var lastObservedFlags: UInt64 = 0
         /// True once `.pressed` has been emitted for the current hold.
         var armed = false
         /// True once this hold has been disqualified; suppresses repeat cancellations.
@@ -247,8 +344,11 @@ public final class HotkeyMonitor: Sendable {
     /// Throws `.permissionDenied` *before* creating anything, because a tap created while denied can
     /// never be enabled — only replaced (RECON §11). Call this again after the grant arrives; do not try
     /// to revive a dead monitor.
-    public func start(key: HotkeyChoice) throws {
-        let binding = HotkeyBinding(key)
+    /// - Parameter alternate: the modifier that may be held alongside the hotkey without cancelling
+    ///   the hold, whose state is reported on `.pressed(alternate:)`. `nil` restores the strict
+    ///   "held alone" rule for every modifier.
+    public func start(key: HotkeyChoice, alternate: HotkeyModifier? = nil) throws {
+        let binding = HotkeyBinding(key, alternate: alternate)
 
         // Gate BEFORE creating. This is the whole point of RECON §11: `.listenOnly` `tapCreate` hands
         // back a non-nil CFMachPort even when access is denied, and five `tapEnable` retries over a
@@ -318,20 +418,29 @@ public final class HotkeyMonitor: Sendable {
             throw HotkeyError.tapCreationFailed
         }
 
-        Log.hotkey.notice("hotkey monitor live on \(binding.displayName, privacy: .public) (keyCode \(binding.keyCode))")
+        Log.hotkey.notice("""
+            hotkey monitor live on \(binding.displayName, privacy: .public) \
+            (keyCode \(binding.keyCode)) \
+            alternate=\(alternate?.rawValue ?? "none", privacy: .public) \
+            mask=0x\(String(binding.alternateMask, radix: 16), privacy: .public)
+            """)
     }
 
     /// Rebinding while running needs no new tap: the mask is identical for every choice, and the
     /// callback reads the binding fresh on every event.
-    public func update(key: HotkeyChoice) {
-        let binding = HotkeyBinding(key)
+    public func update(key: HotkeyChoice, alternate: HotkeyModifier? = nil) {
+        let binding = HotkeyBinding(key, alternate: alternate)
         let wasHolding: Bool = state.withLock { s in
             let changed = s.binding?.keyCode != binding.keyCode
             s.binding = binding
             return changed && s.holdStart != nil
         }
         if wasHolding { abortHold(reason: .keyChanged) }
-        Log.hotkey.info("hotkey rebound to \(binding.displayName, privacy: .public)")
+        Log.hotkey.info("""
+            hotkey rebound to \(binding.displayName, privacy: .public) \
+            alternate=\(alternate?.rawValue ?? "none", privacy: .public) \
+            mask=0x\(String(binding.alternateMask, radix: 16), privacy: .public)
+            """)
     }
 
     public func stop() {
@@ -496,7 +605,13 @@ public final class HotkeyMonitor: Sendable {
         case .keyDown:
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
             let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
-            let binding = state.withLock { $0.binding }
+            // A `.keyDown` carries the full modifier state too, and for a non-modifier hotkey (F13)
+            // this event *is* the start of the hold — so without recording it here the arm sampler
+            // would be looking at whatever modifier last toggled instead.
+            let binding: HotkeyBinding? = state.withLock { s in
+                s.lastObservedFlags = event.flags.rawValue
+                return s.binding
+            }
             if let binding, !binding.isModifier, keyCode == binding.keyCode {
                 if !isRepeat { beginHold() }
             } else {
@@ -511,14 +626,27 @@ public final class HotkeyMonitor: Sendable {
 
         case .flagsChanged:
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-            guard let binding = state.withLock({ $0.binding }) else { break }
+            let rawFlags = event.flags.rawValue
+            // Recorded for every modifier, including the ones that go on to cancel the hold: the arm
+            // sampler needs the state of a modifier that is not the hotkey.
+            let binding: HotkeyBinding? = state.withLock { s in
+                s.lastObservedFlags = rawFlags
+                return s.binding
+            }
+            guard let binding else { break }
             guard binding.isModifier, keyCode == binding.keyCode else {
+                // The designated language modifier is the ONE exemption from chord cancellation, and
+                // it is deliberately narrow. Every other modifier still cancels (that is what stops a
+                // ⌘-shortcut from arming a recording), and any ordinary *key* down still cancels
+                // regardless of which modifier is held — see the `.keyDown` branch, which is
+                // untouched. Widening this to "ignore all modifiers" would make ⌘⇧4 start dictating.
+                if binding.alternateKeyCodes.contains(keyCode) { break }
                 // A *different* modifier toggled — Shift for a capital letter, Cmd for a shortcut.
                 cancelHoldIfAny(.chordedWithModifier(keyCode))
                 break
             }
             // RECON §9: raw `UInt64` flags, never `.deviceIndependentFlagsMask`.
-            binding.isHeld(rawFlags: event.flags.rawValue) ? beginHold() : endHold()
+            binding.isHeld(rawFlags: rawFlags) ? beginHold() : endHold()
 
         default:
             break
@@ -542,15 +670,41 @@ public final class HotkeyMonitor: Sendable {
     }
 
     /// Fires `armDelay` after key-down. Only here does a hold become a recording.
+    ///
+    /// ## The language modifier is sampled HERE, and this is the contract
+    ///
+    /// Not at key-down. The whole `armDelay` window (~120 ms) is a grace period in which the user may
+    /// press the hotkey and the modifier **in either order** and still get the secondary language —
+    /// which matters because there is no natural order for a two-handed chord, and requiring one would
+    /// mean silently dictating Indonesian speech with an English model whenever the thumbs landed the
+    /// wrong way round. Pressing the modifier *after* arming does not retroactively change the
+    /// language: the locale is fixed for the whole utterance by the framework
+    /// (`DictationTranscriber` takes one `Locale`), so there is nothing to change it to.
     private func armTimerFired() {
-        let shouldArm: Bool = state.withLock { s in
-            guard s.holdStart != nil, !s.armed, !s.chorded else { return false }
+        let sample: (binding: HotkeyBinding, observed: UInt64)? = state.withLock { s in
+            guard s.holdStart != nil, !s.armed, !s.chorded, let binding = s.binding else { return nil }
             s.armed = true
-            return true
+            return (binding, s.lastObservedFlags)
         }
-        guard shouldArm else { return }
-        Log.hotkey.debug("hotkey armed")
-        eventContinuation.yield(.pressed)
+        guard let sample else { return }
+
+        // `.combinedSessionState`, NEVER `.privateState`: RECON's injection section measured
+        // `CGEventSource.flagsState(.privateState)` blocking FOREVER — the probe process had to be
+        // SIGTERMed at both 12 s and 120 s. Blocking here would wedge the tap thread's run loop and
+        // kill the hotkey outright.
+        let polled = CGEventSource.flagsState(.combinedSessionState).rawValue
+        // Two independent sources, OR-ed. Either one saying the modifier is held is enough: the tap's
+        // own last `.flagsChanged` cannot be inert, and the poll covers a modifier that was already
+        // down before the tap started. They agree in the normal case.
+        let alternate = sample.binding.isAlternateHeld(rawFlags: polled)
+            || sample.binding.isAlternateHeld(rawFlags: sample.observed)
+
+        Log.hotkey.debug("""
+            hotkey armed polled=0x\(String(polled, radix: 16), privacy: .public) \
+            observed=0x\(String(sample.observed, radix: 16), privacy: .public) \
+            alternate=\(alternate, privacy: .public)
+            """)
+        eventContinuation.yield(.pressed(alternate: alternate))
     }
 
     private func endHold() {

@@ -31,6 +31,30 @@ public enum InjectStrategy: String, Codable, Sendable, CaseIterable {
     case unicodeOnly
     /// Never inject; just leave the text on the clipboard and say so.
     case clipboardOnly
+
+    /// What the recovery UI prints for this policy. Natural case; the silkscreen type uppercases it.
+    public var displayName: String {
+        switch self {
+        case .axFirst: "Accessibility first"
+        case .pasteOnly: "Paste only"
+        case .unicodeOnly: "Type it out"
+        case .clipboardOnly: "Clipboard only"
+        }
+    }
+}
+
+public extension InjectionOutcome {
+    /// True when the text never reached the cursor and re-running the ladder could still land it.
+    ///
+    /// `.notAttempted` is deliberately excluded: it means nothing was *meant* to be injected — an
+    /// imported file, or an utterance started from Edict's own window — so offering to retry it would
+    /// invent a failure the user never had.
+    var needsRecovery: Bool {
+        switch self {
+        case .clipboardOnly, .failed: true
+        case .accessibility, .paste, .keystrokes, .notAttempted: false
+        }
+    }
 }
 
 // MARK: - TextInjector
@@ -58,13 +82,20 @@ public actor TextInjector {
     /// dictation would also let a naive fixed-delay clipboard restore fire before the paste is delivered.
     private var eventSource: CGEventSource?
 
-    /// Learned per-bundle-id policy. Loaded lazily, written through on every demotion.
-    private var learned: [String: InjectStrategy]?
+    /// Where learned per-bundle policy lives. Shared by every injector in the process by default —
+    /// see `InjectPolicyStore`.
+    private let policies: InjectPolicyStore
 
     /// Set once `prewarm()` has run, so `inject` never pays the cold cost twice.
     private var warmed = false
 
-    public init() {}
+    /// - Parameter policies: the learned-policy store. Defaults to the process-wide one, which is what
+    ///   keeps two injectors — the dictation controller's and the history pane's retry path — from
+    ///   holding divergent snapshots of the same on-disk map. Tests pass their own so they never touch
+    ///   `UserDefaults.standard`.
+    public init(policies: InjectPolicyStore = .standard) {
+        self.policies = policies
+    }
 
     // MARK: Target
 
@@ -101,7 +132,6 @@ public actor TextInjector {
         // Warming the layout scan is the whole reason this hop exists: doing it here keeps TIS off
         // the first real paste, where the main actor may be busy rendering the HUD.
         _ = await MainActor.run { InjectKeycodes.vKeyCode() }
-        if learned == nil { learned = InjectPolicyStore.load() }
         Log.inject.debug("injection path pre-warmed")
     }
 
@@ -130,27 +160,28 @@ public actor TextInjector {
 
     /// Lets the UI offer "always paste into this app" / "type character by character here".
     public func setStrategy(_ strategy: InjectStrategy, for bundleID: String) {
-        if learned == nil { learned = InjectPolicyStore.load() }
-        learned?[bundleID] = strategy
-        InjectPolicyStore.save(learned ?? [:])
+        policies.set(strategy, for: bundleID)
         Log.inject.notice("policy for \(bundleID, privacy: .public) set to \(strategy.rawValue, privacy: .public)")
     }
 
     /// Every app Edict has learned something about, for a settings pane.
     public func learnedStrategies() -> [String: InjectStrategy] {
-        if learned == nil { learned = InjectPolicyStore.load() }
-        return learned ?? [:]
+        policies.all()
+    }
+
+    /// True when this app's policy was *learned* rather than seeded or defaulted. The recovery UI needs
+    /// the distinction: "Edict decided this" and "Edict shipped with this" are different sentences.
+    public func hasLearnedStrategy(for bundleID: String) -> Bool {
+        policies.learned(for: bundleID) != nil
     }
 
     public func forgetStrategy(for bundleID: String) {
-        if learned == nil { learned = InjectPolicyStore.load() }
-        learned?.removeValue(forKey: bundleID)
-        InjectPolicyStore.save(learned ?? [:])
+        policies.remove(bundleID)
+        Log.inject.notice("policy for \(bundleID, privacy: .public) forgotten")
     }
 
     private func explicitStrategy(for bundleID: String) -> InjectStrategy? {
-        if learned == nil { learned = InjectPolicyStore.load() }
-        if let remembered = learned?[bundleID] { return remembered }
+        if let remembered = policies.learned(for: bundleID) { return remembered }
         if InjectSeed.pasteOnlyBundles.contains(bundleID) { return .pasteOnly }
         if InjectSeed.terminalBundles.contains(bundleID) { return .pasteOnly }
         return nil
@@ -161,10 +192,8 @@ public actor TextInjector {
     /// `.success` return from it is unfalsifiable.
     private func demoteToPasteOnly(_ bundleID: String?, why: String) {
         guard let bundleID else { return }
-        if learned == nil { learned = InjectPolicyStore.load() }
-        guard learned?[bundleID] != .pasteOnly else { return }
-        learned?[bundleID] = .pasteOnly
-        InjectPolicyStore.save(learned ?? [:])
+        guard policies.learned(for: bundleID) != .pasteOnly else { return }
+        policies.set(.pasteOnly, for: bundleID)
         Log.inject.notice("demoted \(bundleID, privacy: .public) to paste-only: \(why, privacy: .public)")
     }
 
@@ -429,16 +458,70 @@ private enum InjectSeed {
 
 // MARK: - Learned-policy persistence
 
-private enum InjectPolicyStore {
+/// The learned per-bundle policy map, cached in memory and written through to `UserDefaults`.
+///
+/// A shared **object** rather than the static functions this used to be, because there is now more than
+/// one `TextInjector` in the process: `DictationController` owns the one on the dictation path, and
+/// `AppModel` owns the one behind the history pane's retry key. With a per-actor snapshot, a demotion
+/// learned on one path was invisible to the other until the app relaunched — so the pane could offer
+/// "always paste only here" and the *next dictation* would still try Accessibility first. One store
+/// behind both makes the learning mean what it says.
+///
+/// `@unchecked Sendable` with an `NSLock`: it is reached from two actors on two different executors, so
+/// main-actor confinement is not available and the dictionary has to be genuinely guarded.
+public final class InjectPolicyStore: @unchecked Sendable {
+
+    public static let standard = InjectPolicyStore(defaults: .standard)
+
     static let key = "edict.injectPolicies"
 
-    static func load() -> [String: InjectStrategy] {
-        guard let raw = UserDefaults.standard.dictionary(forKey: key) as? [String: String] else { return [:] }
-        return raw.compactMapValues(InjectStrategy.init(rawValue:))
+    private let defaults: UserDefaults
+    private let lock = NSLock()
+    private var cache: [String: InjectStrategy]?
+
+    /// - Parameter defaults: injected so tests can use an `EphemeralDefaults` and never write a key
+    ///   into the user's real preferences.
+    public init(defaults: UserDefaults) {
+        self.defaults = defaults
     }
 
-    static func save(_ policies: [String: InjectStrategy]) {
-        UserDefaults.standard.set(policies.mapValues(\.rawValue), forKey: key)
+    func all() -> [String: InjectStrategy] {
+        lock.withLock { loaded() }
+    }
+
+    func learned(for bundleID: String) -> InjectStrategy? {
+        lock.withLock { loaded()[bundleID] }
+    }
+
+    func set(_ strategy: InjectStrategy, for bundleID: String) {
+        lock.withLock {
+            var map = loaded()
+            map[bundleID] = strategy
+            store(map)
+        }
+    }
+
+    func remove(_ bundleID: String) {
+        lock.withLock {
+            var map = loaded()
+            guard map.removeValue(forKey: bundleID) != nil else { return }
+            store(map)
+        }
+    }
+
+    /// Callers hold `lock`.
+    private func loaded() -> [String: InjectStrategy] {
+        if let cache { return cache }
+        let raw = defaults.dictionary(forKey: Self.key) as? [String: String] ?? [:]
+        let map = raw.compactMapValues(InjectStrategy.init(rawValue:))
+        cache = map
+        return map
+    }
+
+    /// Callers hold `lock`.
+    private func store(_ map: [String: InjectStrategy]) {
+        cache = map
+        defaults.set(map.mapValues(\.rawValue), forKey: Self.key)
     }
 }
 

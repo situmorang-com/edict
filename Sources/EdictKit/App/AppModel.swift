@@ -1,5 +1,7 @@
+import AppKit
 import Foundation
 import Observation
+import ServiceManagement
 import SwiftUI
 
 // MARK: - DictationPhase
@@ -44,6 +46,197 @@ public enum DictationPhase: Sendable, Hashable {
     }
 }
 
+// MARK: - LoginItem
+
+/// "Open at login", wired to `SMAppService` and reporting **what macOS actually did**.
+///
+/// This exists because the switch that used to be here was inert: `Settings.launchAtLogin` persisted a
+/// boolean and no `SMAppService` call existed in the whole app. The lesson taken from that is not "call
+/// register()" — it is that the control must never show the user's *intent*. So `state` is only ever
+/// assigned from a fresh read of `SMAppService.mainApp.status`, including immediately after a
+/// `register()` that returned without throwing. If macOS disagrees with the press, the switch snaps
+/// back and `failure` says why.
+///
+/// Three things that are easy to get wrong here, all handled below:
+///
+/// * **`.requiresApproval` is a success, not an error.** macOS registered the job but is waiting for
+///   the user to switch it on in System Settings ▸ General ▸ Login Items. `register()` does not throw
+///   in that case, so treating a non-throwing call as "on" and stopping there produces a switch that
+///   claims a login item the system will not run.
+/// * **`SMAppService` needs a real bundle launched by LaunchServices.** Under `swift run` there is no
+///   `.app` around the executable, `status` reports `.notFound`, and `register()` throws — so the
+///   control reports itself unavailable with a reason instead of failing on every press.
+/// * **The state can change behind Edict's back.** The user can remove the login item in System
+///   Settings while Edict runs. `refresh()` is therefore called every time the pane appears and every
+///   time the app is activated, rather than once at launch.
+@MainActor @Observable
+public final class LoginItem {
+
+    /// What macOS will actually do at the next login.
+    public enum State: Sendable, Hashable {
+        /// Registered and enabled: Edict launches at login.
+        case enabled
+        /// Not registered.
+        case disabled
+        /// Registered, but switched off (or not yet switched on) by the user in Login Items. macOS
+        /// will **not** launch Edict until they do.
+        case requiresApproval
+        /// `SMAppService` cannot work in this launch — the string says why.
+        case unavailable(String)
+
+        /// What the rocker plate shows. `.requiresApproval` reads as on because Edict *is* registered
+        /// and the remaining step is the user's, in another app.
+        public var isOn: Bool {
+            switch self {
+            case .enabled, .requiresApproval: true
+            case .disabled, .unavailable: false
+            }
+        }
+
+        /// The word in the lit window beside the switch.
+        public var displayName: String {
+            switch self {
+            case .enabled: "On"
+            case .disabled: "Off"
+            case .requiresApproval: "Needs approval"
+            case .unavailable: "Unavailable"
+            }
+        }
+
+        /// True when the row should carry the alert tell-tale.
+        public var isFault: Bool {
+            switch self {
+            case .enabled, .disabled: false
+            case .requiresApproval, .unavailable: true
+            }
+        }
+    }
+
+    /// The last read of `SMAppService.mainApp.status`, never an assumption about it.
+    public private(set) var state: State = .disabled
+
+    /// Why the last press did not do what it looked like it would. Cleared by a successful change.
+    public private(set) var failure: String?
+
+    /// True while `set(_:)` is in flight, so the plate cannot be flipped into a second call.
+    public private(set) var isBusy = false
+
+    /// The service, or nil when this process cannot use one. Injected so tests and previews can drive
+    /// the state machine without touching the real login-item database.
+    private let service: (any LoginItemService)?
+
+    public init(service: (any LoginItemService)? = SystemLoginItemService.resolve()) {
+        self.service = service
+        refresh()
+    }
+
+    /// Read reality. Cheap — a `launchd` query, no disk I/O.
+    public func refresh() {
+        guard let service else {
+            state = .unavailable("Edict is not running from an app bundle")
+            return
+        }
+        state = Self.state(for: service.status)
+    }
+
+    /// Ask macOS to change it, then **read back what happened**.
+    ///
+    /// Deliberately not `async`: `SMAppService.register()` and `unregister()` are synchronous and
+    /// return in well under a frame, and an `await` here would open a window in which the plate showed
+    /// a state nothing had confirmed yet.
+    public func set(_ on: Bool) {
+        guard let service else {
+            failure = "Edict has to be in your Applications folder and launched normally for this to work."
+            refresh()
+            return
+        }
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+
+        do {
+            if on { try service.register() } else { try service.unregister() }
+            failure = nil
+        } catch {
+            // The `register()` return is not the answer either way, so the message is recorded and the
+            // state still comes from the status read below.
+            failure = Self.explain(error, registering: on)
+            let verb = on ? "register" : "unregister"
+            let why = error.localizedDescription
+            Log.data.error("login item \(verb, privacy: .public) failed: \(why, privacy: .public)")
+        }
+        refresh()
+        Log.data.notice("login item is now \(String(describing: self.state), privacy: .public)")
+    }
+
+    /// Opens System Settings ▸ General ▸ Login Items, which is the only place `.requiresApproval` can
+    /// be resolved. Uses the framework's own opener rather than an `x-apple.systempreferences:` URL, so
+    /// it keeps working if Apple moves the pane.
+    public func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
+
+    // MARK: Pure mapping
+    //
+    // Split out so the whole state machine is testable without a login-item database.
+
+    static func state(for status: SMAppService.Status) -> State {
+        switch status {
+        case .enabled: return .enabled
+        case .notRegistered: return .disabled
+        case .requiresApproval: return .requiresApproval
+        case .notFound: return .unavailable("macOS has no record of this copy of Edict")
+        @unknown default: return .unavailable("macOS reported a state Edict does not know")
+        }
+    }
+
+    static func explain(_ error: any Error, registering: Bool) -> String {
+        let ns = error as NSError
+        // Code 1 is the one a self-signed or oddly-placed bundle actually produces; the rest are
+        // reported verbatim rather than guessed at.
+        if ns.domain == "SMAppServiceErrorDomain" && ns.code == 1 {
+            return registering
+                ? "macOS refused the login item. Move Edict to your Applications folder and try again."
+                : "macOS refused to remove the login item."
+        }
+        return ns.localizedDescription
+    }
+}
+
+// MARK: - LoginItemService
+
+/// The two calls `LoginItem` makes, behind a seam so its state machine can be tested.
+public protocol LoginItemService: Sendable {
+    var status: SMAppService.Status { get }
+    func register() throws
+    func unregister() throws
+}
+
+/// `SMAppService.mainApp`, plus the one precondition that cannot be recovered from.
+public struct SystemLoginItemService: LoginItemService {
+
+    public init() {}
+
+    public var status: SMAppService.Status { SMAppService.mainApp.status }
+    public func register() throws { try SMAppService.mainApp.register() }
+    public func unregister() throws { try SMAppService.mainApp.unregister() }
+
+    /// nil when this process is not an app bundle at all.
+    ///
+    /// RECON is explicit that a bare SwiftPM executable has no bundle identity, and `SMAppService`
+    /// needs one: under `swift run` every call here would throw and the switch would look broken rather
+    /// than inapplicable. Checked once, at the only place that can act on the answer.
+    public static func resolve() -> SystemLoginItemService? {
+        guard Bundle.main.bundleURL.pathExtension == "app",
+              Bundle.main.bundleIdentifier != nil
+        else {
+            Log.data.notice("no app bundle; the login-item switch is unavailable in this launch")
+            return nil
+        }
+        return SystemLoginItemService()
+    }
+}
+
 // MARK: - AppModel
 
 /// The single main-actor façade the views bind to.
@@ -85,6 +278,23 @@ public final class AppModel {
 
     public private(set) var modelState: ModelState = .unavailable("starting up")
 
+    /// The language of the utterance in flight, or `nil` when nothing is being dictated.
+    ///
+    /// Published live because the locale is fixed for the whole utterance and chosen by a modifier the
+    /// user pressed a tenth of a second ago: if the chord did not register, the only moment they can
+    /// notice is *while speaking*, and the fix is free (release, press again). Learning it afterwards
+    /// from a history row is learning it too late.
+    public private(set) var activeLocaleIdentifier: String?
+
+    /// True while the in-flight utterance is running in the secondary language. Separate from a string
+    /// comparison so a view can style the badge without knowing what the two locales are.
+    public private(set) var activeLocaleIsSecondary: Bool = false
+
+    /// False when the language shortcut is configured but the engine could not prepare it — an
+    /// unsupported identifier, a failed reservation, or assets that are not on disk yet. The modifier
+    /// silently does nothing in that state, so the UI has to be able to say so.
+    public private(set) var secondaryLocaleReady: Bool = false
+
     public private(set) var lastOutcome: InjectionOutcome?
 
     /// The transcript just produced, so a view can flash it without re-querying history.
@@ -106,6 +316,9 @@ public final class AppModel {
     public let dictionary: DictionaryStore
     public let history: HistoryStore
     public let permissions: Permissions
+
+    /// "Open at login", reading its state from `SMAppService` rather than from a preference.
+    public let loginItem: LoginItem
 
     /// The 60 Hz meter. A `let`, so `@Observable` never sees it; hand it straight to `VUMeter` /
     /// `Waveform` and drive it from a `TimelineView`.
@@ -140,16 +353,21 @@ public final class AppModel {
 
     // MARK: Init
 
+    /// - Parameter loginItem: injected so previews and the offscreen render harness can show all four
+    ///   states of the switch — including `.requiresApproval`, which cannot be reached on demand on a
+    ///   machine where `SMAppService.register()` goes straight to `.enabled`.
     public init(
         settings: Settings = .shared,
         dictionary: DictionaryStore = .shared,
         history: HistoryStore = .shared,
-        permissions: Permissions = .shared
+        permissions: Permissions = .shared,
+        loginItem: LoginItem = LoginItem()
     ) {
         self.settings = settings
         self.dictionary = dictionary
         self.history = history
         self.permissions = permissions
+        self.loginItem = loginItem
         let controller = DictationController(
             settings: settings,
             dictionary: dictionary,
@@ -185,9 +403,17 @@ public final class AppModel {
         }
         if !hotkeyLive { return "Hotkey inactive" }
         switch phase {
-        case .idle: return "Hold \(settings.hotkey.displayName) to dictate"
+        case .idle:
+            // The secondary language is discoverable only from here. A modifier nobody is told about
+            // is a feature nobody uses, and there is no other surface — the app has no menu of modes.
+            let base = "Hold \(settings.hotkey.displayName) to dictate"
+            guard secondaryLocaleReady, let secondary = settings.effectiveSecondaryLocaleIdentifier else {
+                return base
+            }
+            return "\(base) — add \(settings.secondaryLocaleModifier.glyph) for \(Self.badge(secondary))"
         case .arming: return "Arming"
-        case .listening: return "Listening"
+        case .listening:
+            return activeLocaleIsSecondary ? "Listening (\(localeBadge))" : "Listening"
         case .transcribing: return "Transcribing"
         case .injecting: return "Inserting text"
         case .error(let message): return message
@@ -233,12 +459,20 @@ public final class AppModel {
     public func bootstrap() async {
         guard !didBootstrap else { return }
         didBootstrap = true
+        observeForegroundApp()
+        loginItem.refresh()
+        await refreshLearnedPolicies()
         await controller.bootstrap()
     }
+
 
     /// Called from `applicationWillTerminate`. Flushing matters: both stores debounce their writes,
     /// so a dictation from the last half-second would otherwise be lost.
     public func shutdown() {
+        if let foregroundObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(foregroundObserver)
+            self.foregroundObserver = nil
+        }
         stopTickers()
         controller.shutdown()
         history.flushPendingSave()
@@ -359,6 +593,36 @@ public final class AppModel {
             level = .silent
             levelMeter.reset()
         }
+        // Cleared here rather than at every exit from `DictationController.run` — success, cancel and
+        // error all pass through a non-active phase, so one rule covers all three and none can be
+        // forgotten.
+        if !newPhase.isActive {
+            activeLocaleIdentifier = nil
+            activeLocaleIsSecondary = false
+        }
+    }
+
+    /// The language chosen for the utterance that is starting. Set at key-down, before any audio.
+    func apply(activeLocale identifier: String?, isSecondary: Bool) {
+        guard activeLocaleIdentifier != identifier || activeLocaleIsSecondary != isSecondary else { return }
+        activeLocaleIdentifier = identifier
+        activeLocaleIsSecondary = isSecondary
+    }
+
+    func apply(secondaryLocaleReady ready: Bool) {
+        guard secondaryLocaleReady != ready else { return }
+        secondaryLocaleReady = ready
+    }
+
+    /// A short label for the active or configured dictation language — "EN", "ID" — for the HUD and
+    /// the menu bar, where there is room for two characters and not for "Indonesian (Indonesia)".
+    public var localeBadge: String {
+        Self.badge(activeLocaleIdentifier ?? settings.localeIdentifier)
+    }
+
+    static func badge(_ identifier: String) -> String {
+        let language = identifier.split(whereSeparator: { $0 == "-" || $0 == "_" }).first ?? ""
+        return language.isEmpty ? identifier.uppercased() : language.uppercased()
     }
 
     func apply(committed: String, volatile: String) {
@@ -386,6 +650,214 @@ public final class AppModel {
         lastTranscript = transcript
         lastOutcome = transcript.injection
         lastCaptureSuspect = transcript.mayBeIncomplete
+    }
+
+    // MARK: Injection recovery
+
+    /// Re-injection outcomes, keyed by transcript id, for rows the user retried in this session.
+    ///
+    /// An overlay rather than a rewrite of the stored `Transcript`: `HistoryStore` is another agent's
+    /// file and exposes no update, and — more to the point — the stored record is the *history* of what
+    /// happened when the user spoke. A retry an hour later into a different app is a new event, so
+    /// overwriting the original row's outcome would destroy the only evidence of the original failure.
+    /// The cost is that a retry is forgotten on quit, which is correct: the text has landed by then, and
+    /// what a stale "retried successfully" badge would mean the next morning is nothing.
+    public private(set) var retryOutcomes: [UUID: RetryRecord] = [:]
+
+    /// The row whose retry is in flight, so its key can latch and the others stay pressable.
+    public private(set) var retryingTranscriptID: UUID?
+
+    /// One re-injection attempt.
+    public struct RetryRecord: Sendable, Hashable {
+        public var outcome: InjectionOutcome
+        /// The app the text was actually aimed at — never the one in the stored transcript.
+        public var appName: String
+    }
+
+    /// The app the user was in before they came to Edict. See `observeForegroundApp`.
+    public private(set) var lastForegroundApp: ForegroundApp?
+
+    public struct ForegroundApp: Sendable, Hashable {
+        public var pid: pid_t
+        public var bundleID: String?
+        public var name: String
+    }
+
+    /// The injector behind the retry key.
+    ///
+    /// A second `TextInjector`, because `DictationController` keeps its own `private`. That is safe
+    /// precisely because the learned policy now lives in one process-wide `InjectPolicyStore` (see
+    /// `TextInjector.init(policies:)`) — otherwise "always paste only here", set from the history pane,
+    /// would be invisible to the next dictation.
+    @ObservationIgnored private let retryInjector = TextInjector()
+
+    @ObservationIgnored private var foregroundObserver: (any NSObjectProtocol)?
+
+    /// A cached copy of the learned map, so a view can read a policy without an `await`.
+    public private(set) var learnedPolicies: [String: InjectStrategy] = [:]
+
+    /// The outcome a history row should show: the retry if there was one, otherwise what was recorded.
+    public func displayOutcome(for transcript: Transcript) -> InjectionOutcome {
+        retryOutcomes[transcript.id]?.outcome ?? transcript.injection
+    }
+
+    /// The learned policy for an app, or nil when Edict has not learned one (a seeded or defaulted
+    /// strategy is not a *learned* one, and the recovery block says so).
+    public func learnedPolicy(for bundleID: String?) -> InjectStrategy? {
+        guard let bundleID else { return nil }
+        return learnedPolicies[bundleID]
+    }
+
+    /// Re-run the injection ladder for a transcript whose text never landed.
+    ///
+    /// Nothing is re-transcribed — this is the stored string going through `TextInjector` again.
+    ///
+    /// **It aims at the app the user was last working in, not the one in the transcript.** Two reasons,
+    /// and the first is a bug waiting to happen: the frontmost application at the moment the user
+    /// clicks a key in Edict's window *is Edict*, so the naive "inject into the frontmost app" would
+    /// paste the transcript into the history pane's own search field. The second is the brief's: by the
+    /// time someone comes back to a failed row they have moved on, and the original target may not even
+    /// be running.
+    ///
+    /// - Returns: the rung that worked, or nil when there was nowhere to aim.
+    @discardableResult
+    public func retryInjection(_ transcript: Transcript) async -> InjectionOutcome? {
+        guard !transcript.text.isEmpty else { return nil }
+        guard retryingTranscriptID == nil else { return nil }
+
+        guard let target = lastForegroundApp,
+              let running = NSRunningApplication(processIdentifier: target.pid)
+        else {
+            Log.inject.notice("retry declined: no app to aim at")
+            return nil
+        }
+
+        retryingTranscriptID = transcript.id
+        defer { retryingTranscriptID = nil }
+
+        // Bring the target forward and *wait for it*. Injection reads the focused AX element, so the
+        // ladder would otherwise run against whatever still had focus — Edict.
+        running.activate()
+        let arrived = await Self.waitForFrontmost(pid: target.pid)
+        if !arrived {
+            Log.inject.error("\(target.name, privacy: .public) did not come to the front; retry aborted")
+            let record = RetryRecord(outcome: .failed, appName: target.name)
+            retryOutcomes[transcript.id] = record
+            return .failed
+        }
+
+        let outcome = await retryInjector.inject(
+            transcript.text,
+            into: InjectionTarget(bundleID: target.bundleID, appName: target.name)
+        )
+        retryOutcomes[transcript.id] = RetryRecord(outcome: outcome, appName: target.name)
+        await refreshLearnedPolicies()
+        Log.inject.notice("""
+            retry into \(target.name, privacy: .public) finished as \(outcome.rawValue, privacy: .public)
+            """)
+        return outcome
+    }
+
+    /// Teach Edict to skip the Accessibility rung in an app for good. The learning the injector already
+    /// does silently, made available as a decision the user can make on purpose.
+    public func setPasteOnly(for bundleID: String) async {
+        await retryInjector.setStrategy(.pasteOnly, for: bundleID)
+        await refreshLearnedPolicies()
+    }
+
+    /// Undo the above — and any demotion the injector learned by itself — so the app gets a clean try.
+    public func forgetPolicy(for bundleID: String) async {
+        await retryInjector.forgetStrategy(for: bundleID)
+        await refreshLearnedPolicies()
+    }
+
+    func refreshLearnedPolicies() async {
+        learnedPolicies = await retryInjector.learnedStrategies()
+    }
+
+    /// Poll rather than await an activation notification: `activate()` has no completion, and the
+    /// window server takes a few frames. 1.2 s is generous for a running app and short enough that a
+    /// refusal is still felt as a refusal.
+    private static func waitForFrontmost(pid: pid_t, timeout: Duration = .milliseconds(1200)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { return true }
+            try? await Task.sleep(for: .milliseconds(40))
+        }
+        return NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+    }
+
+    // MARK: Render seams
+    //
+    // `internal`, and only for `#Preview` blocks and the offscreen render harness. Retry state is
+    // otherwise produced solely by `retryInjection`, which needs a live app in front of it.
+
+    func recordRetryForRender(_ id: UUID, outcome: InjectionOutcome, appName: String) {
+        retryOutcomes[id] = RetryRecord(outcome: outcome, appName: appName)
+    }
+
+    func noteForegroundAppForRender(name: String, bundleID: String?) {
+        lastForegroundApp = ForegroundApp(pid: 0, bundleID: bundleID, name: name)
+    }
+
+    // MARK: Foreground tracking
+
+    /// Remember the last application that was frontmost *other than Edict*.
+    ///
+    /// macOS has no public "previous application" API, so it has to be watched for. This is the whole
+    /// basis of the retry key: it is the only way to answer "where does this text belong" from inside
+    /// a window that is, by definition, the thing in front.
+    private func observeForegroundApp() {
+        guard foregroundObserver == nil else { return }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != ownPID {
+            lastForegroundApp = Self.describe(front)
+        }
+
+        foregroundObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            // `queue: .main` guarantees this body is already on the main thread, so `assumeIsolated` is
+            // how it reaches main-actor state. A `Task { @MainActor in … }` hop would be wrong as well
+            // as slower: the user can switch apps again before it runs, and then the recorded app is
+            // not the one that was activated.
+            MainActor.assumeIsolated {
+                guard let self, let app, app.processIdentifier != ownPID else { return }
+                self.lastForegroundApp = Self.describe(app)
+            }
+        }
+    }
+
+    private static func describe(_ app: NSRunningApplication) -> ForegroundApp {
+        ForegroundApp(
+            pid: app.processIdentifier,
+            bundleID: app.bundleIdentifier,
+            name: app.localizedName ?? app.bundleIdentifier ?? "the other app"
+        )
+    }
+
+    // MARK: Hotkey restart
+
+    /// Restart the hotkey watcher and **wait long enough to say whether it worked**.
+    ///
+    /// The synchronous `retryHotkey()` is what cost an hour of debugging: it works, it returns
+    /// immediately, and nothing on screen changes, so a user who has just been told the hotkey is dead
+    /// concludes the key is dead too. `hotkeyLive` does move — a beat later, from the controller — so
+    /// the fix is to give the control something to report.
+    ///
+    /// - Returns: true when the tap came back live.
+    public func restartHotkey() async -> Bool {
+        controller.restartHotkey()
+        let deadline = ContinuousClock.now + .milliseconds(1500)
+        while ContinuousClock.now < deadline {
+            if hotkeyLive { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return hotkeyLive
     }
 
     // MARK: Tickers

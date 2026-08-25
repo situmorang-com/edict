@@ -15,6 +15,17 @@ import Speech
 /// swallows the utterance). Warm setup is ~2.5 ms, so per-utterance construction is not a cost worth optimising.
 public actor SpeechEngine: TranscriptionEngine {
 
+    /// Which of the two prepared languages an utterance runs in.
+    ///
+    /// The locale is fixed for the whole utterance by the framework — `DictationTranscriber` takes one
+    /// `Locale` and there is no multilingual model that covers Indonesian — so this is chosen once, at
+    /// key-down, and cannot change mid-stream. Because a fresh module and analyzer are built per
+    /// utterance anyway (RECON §3), running one in a different locale costs nothing extra beyond the
+    /// second model's own cold load.
+    public enum UtteranceLocale: String, Sendable, Hashable, CaseIterable {
+        case primary, secondary
+    }
+
     /// RECON §5: cost is ~65 ms fixed plus ~1.5 ms/term at analyzer init, and hit rate measurably *degrades*
     /// with list length — a 9-term list fixed "Wispr Flow" and "Obsidian" where a 200-term list fixed neither.
     /// `Settings.biasingLimit` already clamps to this; the engine enforces it again so no caller can defeat it.
@@ -22,12 +33,26 @@ public actor SpeechEngine: TranscriptionEngine {
 
     public private(set) var modelState: ModelState = .unavailable("not prepared")
 
+    /// The second language's own asset state, reported separately so the UI can say "English ready,
+    /// Indonesian downloading" rather than one aggregate lie.
+    public private(set) var secondaryModelState: ModelState = .unavailable("not prepared")
+
     /// Set by `prepare`. Never derived from `Locale.current`: RECON §6 found this machine's `en_ID` resolves to
     /// `en-IN`, silently the wrong acoustic model for a US-English speaker.
     private var canonicalLocale: Locale?
     /// Cached because `bestAvailableAudioFormat` needs a throwaway module and the answer never changes for a
     /// given locale. Observed: 1 ch / 16000 Hz / Int16 / interleaved.
     private var cachedFormat: AVAudioFormat?
+    /// The second dictation language, reserved at launch alongside the primary. macOS allows 5
+    /// concurrent reservations and Edict holds 2, so this costs a slot and nothing else.
+    private var secondaryLocale: Locale?
+    private var secondaryFormat: AVAudioFormat?
+    /// Whether the second language's assets are on disk. **Never used to fall back to the primary
+    /// model** — see `beginSession`.
+    private var secondaryAssetsReady = false
+    /// The one in-flight download of the secondary assets, so a user leaning on the shortcut cannot
+    /// start five of them.
+    private var secondaryDownload: Task<Void, Never>?
     /// The `SpeechTranscriber` half of the same two facts. Resolved lazily, the first time a file
     /// import asks for the general module — live dictation never touches it.
     private var generalLocale: Locale?
@@ -40,7 +65,41 @@ public actor SpeechEngine: TranscriptionEngine {
     /// be handed to `SpeechAnalyzer.init(analysisContext:)`. Read the dictionary at key-down.
     private var biasingStrings: [String] = []
     private var warmed = false
+
+    // MARK: The analyzer slot
+
+    /// The session currently holding the slot, once it exists.
+    ///
+    /// Never the gate itself — see `slotHolder`. This is here so `cancel()` has something to abort
+    /// and so a stale holder can be identified in a log line.
     private var activeSession: SpeechSession?
+    /// Serial of whoever holds the slot, or `nil` when it is free.
+    ///
+    /// **The gate is this, not `activeSession`.** The claim has to be taken before the analyzer
+    /// exists: `beginSession` awaits an asset check, a format query and `prepareToAnalyze` between
+    /// deciding to start and having a session, and two presses that both got past a
+    /// `activeSession == nil` check would both build one — the second overwriting the first, which
+    /// orphans a live analyzer and wedges the engine permanently.
+    private var slotHolder: UInt64?
+    private var nextSlotSerial: UInt64 = 1
+    /// Tasks suspended waiting for the slot, keyed so a timeout can resume exactly one of them.
+    private var slotWaiters: [UInt64: CheckedContinuation<Void, Never>] = [:]
+    private var nextWaiterID: UInt64 = 1
+
+    /// Ceiling on waiting for the previous utterance to hand the slot back.
+    ///
+    /// **Deliberately unchanged at 1.5 s, and deliberately not the fix.** The leak that used to
+    /// make this fire on every other press is fixed in `releaseSlot`; this is only the safety valve
+    /// for a genuinely wedged analyzer, which has to surface as an error rather than hang the
+    /// hotkey for ever. RECON §8 measured finalize at 0.15 s for a 4.7 s clip and 0.53 s for a 24 s
+    /// one, so a healthy hand-back has ~3x headroom and a raised ceiling would buy nothing.
+    private static let slotWaitCeiling = Duration.milliseconds(1500)
+
+    /// Whether an utterance currently holds the analyzer slot. Diagnostics and tests only.
+    ///
+    /// Exists because the invariant it reports — "when `finishAndCommit` or `abort` has returned,
+    /// the slot is free" — is not observable from anywhere else, and it is the invariant that broke.
+    public var isSlotClaimed: Bool { slotHolder != nil }
 
     public init() {}
 
@@ -82,6 +141,109 @@ public actor SpeechEngine: TranscriptionEngine {
         }
     }
 
+    /// Resolve and reserve the *second* dictation language, and report whether its assets are present.
+    ///
+    /// Called at launch, right after `prepare`. Reserving both up front is deliberate: reservations are
+    /// keyed to the bundle identifier and persist across launches, there are only 5 slots, and taking
+    /// the second one lazily at key-down would mean a reservation — and possibly an eviction round —
+    /// inside the utterance the user is already speaking into.
+    ///
+    /// The assets are **not** downloaded here. A cold download was measured at ~31 s for Indonesian,
+    /// and paying that at every launch for a language the user may not touch today is worse than
+    /// paying it once, on the first press, where the UI can say what is happening.
+    public func prepareSecondary(localeIdentifier: String) async throws {
+        do {
+            let canonical = try await reserveLocale(localeIdentifier)
+            secondaryLocale = canonical
+            secondaryFormat = nil
+
+            let probe = Self.makeModule(locale: canonical)
+            let request = try await AssetInventory.assetInstallationRequest(supporting: [probe])
+            secondaryAssetsReady = request == nil
+            secondaryModelState = secondaryAssetsReady ? .ready : .needsDownload
+
+            Log.stt.info("""
+                prepared secondary locale=\(canonical.identifier, privacy: .public) \
+                assets=\(self.secondaryAssetsReady ? "installed" : "needsDownload", privacy: .public)
+                """)
+        } catch {
+            secondaryLocale = nil
+            secondaryAssetsReady = false
+            secondaryModelState = .unavailable(Self.describe(error))
+            Log.stt.error("""
+                prepareSecondary(\(localeIdentifier, privacy: .public)) failed: \
+                \(Self.describe(error), privacy: .public)
+                """)
+            throw error
+        }
+    }
+
+    /// Forget the second language. Its reservation is released — and only ever by handing back a
+    /// `Locale` taken from `AssetInventory.reservedLocales`, because RECON §6 measured `release`
+    /// matching on the raw identifier *string*: releasing a freshly-built `Locale(identifier: "id-ID")`
+    /// against a stored `"id_ID"` returns false, does nothing, and leaks the slot permanently across
+    /// every future launch of the app.
+    public func clearSecondary() async {
+        guard let locale = secondaryLocale else { return }
+        secondaryDownload?.cancel()
+        secondaryDownload = nil
+        secondaryLocale = nil
+        secondaryFormat = nil
+        secondaryAssetsReady = false
+        secondaryModelState = .unavailable("not prepared")
+
+        for reserved in await AssetInventory.reservedLocales
+        where reserved.identifier == locale.identifier {
+            let released = await AssetInventory.release(reservedLocale: reserved)
+            Log.stt.info("released \(reserved.identifier, privacy: .public): \(released, privacy: .public)")
+        }
+    }
+
+    /// The reservation state as the framework sees it, for the launch log and for diagnostics.
+    public func reservedLocaleIdentifiers() async -> [String] {
+        await AssetInventory.reservedLocales.map(\.identifier).sorted()
+    }
+
+    /// Release every reservation Edict does not currently want.
+    ///
+    /// Called once at launch, after both languages are prepared. This exists because reservations
+    /// **persist across process launches**, keyed to the bundle identifier, and there are only 5 —
+    /// so anything Edict reserved and then stopped wanting is a slot lost until something explicitly
+    /// hands it back. The observed case: the user turns the language shortcut off, and `id_ID` stays
+    /// reserved for every future launch with nothing left in the app that remembers to release it.
+    /// Enumerating what we *do* want and releasing the rest is the only version of this that cannot
+    /// drift, since it needs no memory of what a previous launch did.
+    ///
+    /// Only ever releases `Locale` objects taken straight from `reservedLocales` — RECON §6 measured
+    /// `release(reservedLocale:)` matching on the raw identifier *string*, so passing a rebuilt
+    /// `Locale(identifier: "id-ID")` against a stored `"id_ID"` returns false, does nothing, and
+    /// leaks the slot permanently.
+    ///
+    /// - Returns: the identifiers that were released.
+    @discardableResult
+    public func pruneReservations() async -> [String] {
+        let keep = Set([
+            canonicalLocale?.identifier,
+            secondaryLocale?.identifier,
+            generalLocale?.identifier,
+        ].compactMap { $0 })
+        // Never run this before anything is prepared: an empty keep set would release the primary.
+        guard !keep.isEmpty else { return [] }
+
+        var released: [String] = []
+        for reserved in await AssetInventory.reservedLocales where !keep.contains(reserved.identifier) {
+            if await AssetInventory.release(reservedLocale: reserved) {
+                released.append(reserved.identifier)
+            } else {
+                Log.stt.error("release(\(reserved.identifier, privacy: .public)) refused")
+            }
+        }
+        if !released.isEmpty {
+            Log.stt.notice("released stale reservations: \(released.joined(separator: ","), privacy: .public)")
+        }
+        return released
+    }
+
     /// Resolve a locale identifier to the framework's canonical form and hold a reservation for it.
     ///
     /// RECON §6: reservation is effectively required (the framework logs "will be an error in a future
@@ -94,7 +256,10 @@ public actor SpeechEngine: TranscriptionEngine {
         guard let canonical = await DictationTranscriber.supportedLocale(
             equivalentTo: Locale(identifier: localeIdentifier)
         ) else {
-            // `id-ID` lands here — Indonesian is not supported, which matters on this user's machine.
+            // Note for anyone reading the older comment that used to live here: `id-ID` does NOT land
+            // here. RECON's correction is explicit — Indonesian is unsupported by `SpeechTranscriber`
+            // but resolves to `id_ID` on `DictationTranscriber`, which is the module live dictation
+            // uses, and an 18.8 s Indonesian clip transcribed word-perfect at 34.5x realtime.
             throw SpeechEngineError.localeUnsupported(localeIdentifier)
         }
 
@@ -118,11 +283,17 @@ public actor SpeechEngine: TranscriptionEngine {
             _ = try await AssetInventory.reserve(locale: canonical)
         } catch {
             // SFSpeechErrorDomain Code=11 "Too many allocated locales, 5 maximum". Evict everything else and
-            // retry — Edict only ever needs one locale at a time. `generalLocale` is spared as well as the
-            // one being reserved, because evicting the import model's slot here would silently demote every
-            // later import back to the dictation module.
+            // retry. `generalLocale` is spared as well as the one being reserved, because evicting the
+            // import model's slot here would silently demote every later import back to the dictation
+            // module — and `secondaryLocale` too, because evicting *that* is how the language shortcut
+            // would start throwing halfway through a session for no reason the user could see.
             Log.stt.warning("reserve(\(canonical.identifier, privacy: .public)) failed, evicting: \(Self.describe(error), privacy: .public)")
-            let keep = Set([canonical.identifier, canonicalLocale?.identifier, generalLocale?.identifier].compactMap { $0 })
+            let keep = Set([
+                canonical.identifier,
+                canonicalLocale?.identifier,
+                secondaryLocale?.identifier,
+                generalLocale?.identifier,
+            ].compactMap { $0 })
             for stale in await AssetInventory.reservedLocales where !keep.contains(stale.identifier) {
                 _ = await AssetInventory.release(reservedLocale: stale)
             }
@@ -166,6 +337,24 @@ public actor SpeechEngine: TranscriptionEngine {
     /// while a live tap is typically 48 kHz Float32 non-interleaved.
     public func bestAudioFormat() async -> AVAudioFormat? {
         await bestAudioFormat(for: .dictation)
+    }
+
+    /// The same question for the second dictation language.
+    ///
+    /// Asked separately rather than assumed identical to the primary's. In practice both come back
+    /// 1 ch / 16 kHz / Int16 / interleaved, but `availableCompatibleAudioFormats` is a property of the
+    /// module — which is built per locale — and `AudioCapture`'s converter is configured from whatever
+    /// this returns. Guessing here would be a silent format mismatch on the one path that has no
+    /// English speech to sanity-check it against.
+    public func bestAudioFormat(secondary: Bool) async -> AVAudioFormat? {
+        guard secondary else { return await bestAudioFormat(for: .dictation) }
+        if let secondaryFormat { return secondaryFormat }
+        guard let locale = secondaryLocale else { return nil }
+        let format = await SpeechAnalyzer.bestAvailableAudioFormat(
+            compatibleWith: [Self.makeModule(locale: locale)]
+        )
+        secondaryFormat = format
+        return format
     }
 
     /// The same question for a named module. The two modules are asked separately rather than
@@ -221,64 +410,306 @@ public actor SpeechEngine: TranscriptionEngine {
     public func begin(
         onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
     ) async throws -> any TranscriptionSession {
-        try await beginSession(module: .dictation, biasing: nil, onUpdate: onUpdate)
+        try await beginSession(module: .dictation, locale: .primary, biasing: nil, onUpdate: onUpdate)
+    }
+
+    /// Start one utterance in a named language.
+    ///
+    /// `.secondary` requires `prepareSecondary` to have succeeded and the assets to be installed; it
+    /// throws rather than quietly using the primary model. See `beginSession`.
+    public func begin(
+        locale: UtteranceLocale,
+        onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
+    ) async throws -> any TranscriptionSession {
+        try await beginSession(module: .dictation, locale: locale, biasing: nil, onUpdate: onUpdate)
     }
 
     /// - Parameters:
     ///   - module: which of Apple's two modules to build. `.dictation` for live push-to-talk;
     ///     `.general` for a file import whose locale `SpeechTranscriber` covers.
+    ///   - locale: which prepared dictation language to run in. Ignored for `.general`, which has
+    ///     exactly one prepared locale of its own.
     ///   - biasing: contextual strings for *this* session only, bypassing the staged list. The
     ///     import path passes its own so a file cannot inherit — or clobber — the list a
     ///     concurrent dictation staged at key-down. `nil` uses the staged list.
     private func beginSession(
         module: TranscriptionModule,
+        locale which: UtteranceLocale,
         biasing: [String]?,
         onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
     ) async throws -> SpeechSession {
-        if activeSession != nil { throw SpeechEngineError.sessionAlreadyRunning }
-        guard let locale = module == .general ? generalLocale : canonicalLocale else {
+        // Serialised, not raced. A second utterance can arrive while the previous session is still
+        // finalizing — RECON §8 puts that window at 0.15–0.53 s, comfortably inside a normal
+        // press-pause-press rhythm — and throwing would discard speech the user has ALREADY SPOKEN.
+        // So wait, and only give up if the holder is genuinely wedged. `claimSlot` also takes the
+        // claim *before* any of the awaits below, which is what stops two presses from both
+        // building a session.
+        let serial = try await claimSlot(module: module, locale: which)
+
+        do {
+            let secondary = module == .dictation && which == .secondary
+            if secondary { try await requireSecondaryAssets() }
+
+            let resolved: Locale? = switch (module, which) {
+            case (.general, _): generalLocale
+            case (.dictation, .primary): canonicalLocale
+            case (.dictation, .secondary): secondaryLocale
+            }
+            guard let locale = resolved else { throw SpeechEngineError.notPrepared }
+            let format = secondary
+                ? await bestAudioFormat(secondary: true)
+                : await bestAudioFormat(for: module)
+            guard let format else { throw SpeechEngineError.noAudioFormat }
+
+            let built = Self.build(module: module, locale: locale)
+
+            // Context MUST be supplied at init; `SpeechAnalyzer.setContext(_:)` later is a silent no-op
+            // (RECON §2). Biasing is dropped entirely for `.general`: RECON §1 measured it as a
+            // byte-for-byte no-op there, so paying the ~65 ms + ~1.5 ms/term setup cost would buy
+            // literally nothing.
+            let strings = module.supportsBiasing ? (biasing ?? biasingStrings) : []
+            let context = AnalysisContext()
+            if !strings.isEmpty {
+                context.contextualStrings = [.general: strings]
+            }
+
+            let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
+            let analyzer = SpeechAnalyzer(
+                inputSequence: stream,
+                modules: [built.module],
+                options: SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .processLifetime),
+                analysisContext: context
+            )
+            try await analyzer.prepareToAnalyze(in: format)
+            // Only the primary counts as warm: `warmUp()` loads the primary model, and letting a
+            // secondary utterance set this flag would mean the *English* model stays cold until the
+            // first English press, which is the common case.
+            if module == .dictation, which == .primary { warmed = true }
+
+            let sink = TranscriptSink(onUpdate: onUpdate)
+            // The results consumer is built by `build` rather than here, because the two modules have
+            // *different* `Result` types and no common protocol member carrying `text` —
+            // `SpeechModuleResult` only promises `range` and `resultsFinalizationTime`. Hoisting
+            // `module.results` out of the `Task` still happens, inside `build`: capturing mutable local
+            // state in the task closure is what Swift 6 rejects (RECON §7).
+            sink.attach(built.attach(sink))
+
+            let session = SpeechSession(
+                serial: serial,
+                continuation: continuation,
+                analyzer: analyzer,
+                sink: sink,
+                sampleRate: format.sampleRate,
+                biasingCount: strings.count,
+                // THE FIX. The slot is handed back by the session itself, on whichever of its two
+                // terminal paths actually runs, rather than by the caller remembering to. The leak
+                // this closes: live dictation never calls `transcribe(input:)` — it calls `begin`
+                // and drives the returned session directly, because it needs the object to feed
+                // microphone buffers into — so the `defer` in `transcribe` was the only release and
+                // it was on a path the hotkey never took.
+                onTerminate: { [weak self] reason in
+                    await self?.releaseSlot(serial: serial, reason: reason)
+                }
+            )
+            activeSession = session
+            Log.stt.debug("""
+                slot #\(serial, privacy: .public) session built \
+                module=\(module.rawValue, privacy: .public) \
+                locale=\(locale.identifier, privacy: .public) \
+                biasing=\(strings.count, privacy: .public)
+                """)
+            return session
+        } catch {
+            // Anything above can throw — a missing secondary asset, a locale that is not prepared,
+            // `prepareToAnalyze`. The claim was taken before all of it, so it has to be handed back
+            // here or the next press inherits a slot nobody is using.
+            releaseSlot(serial: serial, reason: "begin failed: \(Self.describe(error))")
+            throw error
+        }
+    }
+
+    // MARK: - The analyzer slot
+
+    /// Take the analyzer slot, waiting for the current holder if there is one.
+    ///
+    /// Returns the serial the caller must release with. Throws `.sessionAlreadyRunning` only when
+    /// the holder is still there after `slotWaitCeiling` — which, with `releaseSlot` wired to the
+    /// session's terminal transition, means a genuinely stuck analyzer rather than the ordinary
+    /// press-pause-press rhythm.
+    private func claimSlot(module: TranscriptionModule, locale which: UtteranceLocale) async throws -> UInt64 {
+        // A holder whose session has already terminated is a bug in whatever tore it down, not a
+        // race, and making the user press twice for it is the exact symptom this whole change is
+        // about. Reclaim, and log it as the distinct third case: *failed to clear*.
+        if let holder = slotHolder, let session = activeSession, session.isTerminated {
+            Log.stt.error("""
+                slot #\(holder, privacy: .public) FAILED TO CLEAR: \
+                its session is already terminated; reclaiming
+                """)
+            forceReleaseSlot(reason: "stale terminated holder")
+        }
+
+        if let holder = slotHolder {
+            Log.stt.debug("slot busy (#\(holder, privacy: .public)); waiting for it to be handed back")
+            let deadline = ContinuousClock.now + Self.slotWaitCeiling
+            while slotHolder != nil {
+                guard await waitForSlotRelease(until: deadline) else {
+                    Log.stt.error("""
+                        slot #\(self.slotHolder ?? 0, privacy: .public) still held after \
+                        1.5 s; refusing to start a second utterance
+                        """)
+                    throw SpeechEngineError.sessionAlreadyRunning
+                }
+            }
+            Log.stt.debug("slot handed back; starting the next utterance")
+        }
+
+        // No `await` between the check above and this assignment, which is what makes the claim
+        // atomic on the actor.
+        let serial = nextSlotSerial
+        nextSlotSerial += 1
+        slotHolder = serial
+        Log.stt.debug("""
+            slot #\(serial, privacy: .public) claimed \
+            module=\(module.rawValue, privacy: .public) \
+            locale=\(which.rawValue, privacy: .public)
+            """)
+        return serial
+    }
+
+    /// Suspend until the holder releases the slot, or the deadline passes.
+    ///
+    /// A real suspension rather than a poll: the releasing session resumes us directly, so a
+    /// back-to-back press waits exactly as long as the previous finalize takes and not a 20 ms tick
+    /// longer. The timer exists only so a wedged holder cannot pin the caller past the ceiling.
+    ///
+    /// - Returns: `false` if the deadline passed.
+    private func waitForSlotRelease(until deadline: ContinuousClock.Instant) async -> Bool {
+        let remaining = deadline - ContinuousClock.now
+        guard remaining > .zero else { return false }
+
+        let id = nextWaiterID
+        nextWaiterID += 1
+        let timer = Task { [weak self] in
+            try? await Task.sleep(for: remaining)
+            await self?.wakeSlotWaiter(id)
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            // Re-checked in the same actor step that registers the waiter. Registering first and
+            // trusting the earlier check would be a lost wakeup: if the holder released while this
+            // call was getting here, the wake has already been delivered to nobody and this task
+            // would sleep until the ceiling for no reason.
+            if slotHolder == nil {
+                continuation.resume()
+            } else {
+                slotWaiters[id] = continuation
+            }
+        }
+        timer.cancel()
+        return ContinuousClock.now < deadline
+    }
+
+    private func wakeSlotWaiter(_ id: UInt64) {
+        slotWaiters.removeValue(forKey: id)?.resume()
+    }
+
+    /// Hand the slot back. Idempotent, and identity-checked so a late release from a session that
+    /// has already been superseded cannot free somebody else's claim.
+    private func releaseSlot(serial: UInt64, reason: String) {
+        guard slotHolder == serial else {
+            Log.stt.debug("""
+                slot release #\(serial, privacy: .public) ignored \
+                (holder=#\(self.slotHolder ?? 0, privacy: .public)) — \(reason, privacy: .public)
+                """)
+            return
+        }
+        forceReleaseSlot(reason: "#\(serial) \(reason)")
+    }
+
+    private func forceReleaseSlot(reason: String) {
+        slotHolder = nil
+        activeSession = nil
+        Log.stt.debug("slot cleared — \(reason, privacy: .public)")
+        // Wake everyone; the losers see `slotHolder != nil` again and re-suspend.
+        let waiting = slotWaiters
+        slotWaiters.removeAll()
+        for (_, continuation) in waiting { continuation.resume() }
+    }
+
+    /// Gate a secondary-locale utterance on its assets actually being installed.
+    ///
+    /// **This is the one place where falling back would be indefensible.** Transcribing Indonesian
+    /// speech with the English model does not fail — it succeeds, confidently, and returns fluent
+    /// English nonsense that the injection ladder then types into the user's document. There is no
+    /// signal anywhere for the user to notice; RECON §7 records that confidence is discriminative for
+    /// *misheard words*, not for a wholesale language mismatch, and measured Indonesian returning no
+    /// confidence attribute at all. So: install if we can, and otherwise throw a sentence the UI can
+    /// show. Never substitute a model.
+    private func requireSecondaryAssets() async throws {
+        guard let locale = secondaryLocale else {
             throw SpeechEngineError.notPrepared
         }
-        guard let format = await bestAudioFormat(for: module) else { throw SpeechEngineError.noAudioFormat }
+        if secondaryAssetsReady { return }
 
-        let built = Self.build(module: module, locale: locale)
-
-        // Context MUST be supplied at init; `SpeechAnalyzer.setContext(_:)` later is a silent no-op (RECON §2).
-        // Biasing is dropped entirely for `.general`: RECON §1 measured it as a byte-for-byte no-op
-        // there, so paying the ~65 ms + ~1.5 ms/term setup cost would buy literally nothing.
-        let strings = module.supportsBiasing ? (biasing ?? biasingStrings) : []
-        let context = AnalysisContext()
-        if !strings.isEmpty {
-            context.contextualStrings = [.general: strings]
+        // A download is already running from an earlier press. Do not await it — the user is holding a
+        // key right now and a 31 s stall inside an utterance is its own failure.
+        if let secondaryDownload, !secondaryDownload.isCancelled {
+            throw SpeechEngineError.assetInstallFailed(
+                "The \(Self.languageName(locale)) speech model is still downloading. Try again in a moment."
+            )
         }
 
-        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
-        let analyzer = SpeechAnalyzer(
-            inputSequence: stream,
-            modules: [built.module],
-            options: SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .processLifetime),
-            analysisContext: context
-        )
-        try await analyzer.prepareToAnalyze(in: format)
-        if module == .dictation { warmed = true }
+        let probe = Self.makeModule(locale: locale)
+        // Gate on the request being nil, not on `AssetInventory.status` (RECON §6: status reports
+        // `.supported` rather than `.installed` for assets that are on disk but unreserved).
+        //
+        // `try?` is deliberately NOT used here: it flattens `AssetInstallationRequest??` into one
+        // optional, which would make "assets already installed" indistinguishable from "the check
+        // itself failed" — and those two must not take the same branch.
+        let pending: AssetInstallationRequest?
+        do {
+            pending = try await AssetInventory.assetInstallationRequest(supporting: [probe])
+        } catch {
+            throw SpeechEngineError.assetInstallFailed(
+                "The \(Self.languageName(locale)) speech model could not be checked: \(Self.describe(error))"
+            )
+        }
+        guard let request = pending else {
+            secondaryAssetsReady = true
+            secondaryModelState = .ready
+            return
+        }
 
-        let sink = TranscriptSink(onUpdate: onUpdate)
-        // The results consumer is built by `build` rather than here, because the two modules have
-        // *different* `Result` types and no common protocol member carrying `text` —
-        // `SpeechModuleResult` only promises `range` and `resultsFinalizationTime`. Hoisting
-        // `module.results` out of the `Task` still happens, inside `build`: capturing mutable local
-        // state in the task closure is what Swift 6 rejects (RECON §7).
-        sink.attach(built.attach(sink))
-
-        let session = SpeechSession(
-            continuation: continuation,
-            analyzer: analyzer,
-            sink: sink,
-            sampleRate: format.sampleRate,
-            biasingCount: strings.count
+        secondaryModelState = .downloading(0)
+        secondaryDownload = Task { [weak self] in
+            do {
+                try await request.downloadAndInstall()
+                await self?.secondaryDownloadFinished(error: nil)
+            } catch {
+                await self?.secondaryDownloadFinished(error: error)
+            }
+        }
+        throw SpeechEngineError.assetInstallFailed(
+            "Downloading the \(Self.languageName(locale)) speech model. Try again in a moment."
         )
-        activeSession = session
-        return session
+    }
+
+    private func secondaryDownloadFinished(error: Error?) {
+        secondaryDownload = nil
+        if let error {
+            secondaryAssetsReady = false
+            secondaryModelState = .unavailable(Self.describe(error))
+            Log.stt.error("secondary asset install failed: \(Self.describe(error), privacy: .public)")
+        } else {
+            secondaryAssetsReady = true
+            secondaryModelState = .ready
+            Log.stt.info("secondary assets installed")
+        }
+    }
+
+    /// A language name the user will recognise, for the one error string they might actually read.
+    private static func languageName(_ locale: Locale) -> String {
+        Locale(identifier: "en-US").localizedString(forIdentifier: locale.identifier)
+            ?? locale.identifier
     }
 
     /// Run one utterance end to end: forward `input` into the analyzer, then finalize.
@@ -289,14 +720,20 @@ public actor SpeechEngine: TranscriptionEngine {
     public func transcribe(
         input: AsyncStream<AnalyzerInput>,
         module: TranscriptionModule = .dictation,
+        locale: UtteranceLocale = .primary,
         biasing: [String]? = nil,
         onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
     ) async throws -> TranscriptionOutcome {
-        let session = try await beginSession(module: module, biasing: biasing, onUpdate: onUpdate)
-        // Identity-checked so a `cancel()` followed by a fresh `begin()` — which is legal, because cancel
-        // clears `activeSession` while this method is still draining the caller's stream — is not torn down
-        // by this call's cleanup.
-        defer { if activeSession === session { activeSession = nil } }
+        let session = try await beginSession(
+            module: module,
+            locale: locale,
+            biasing: biasing,
+            onUpdate: onUpdate
+        )
+        // No cleanup `defer` here any more, and that is the point: the slot is released by the
+        // session's own terminal transition (`finishAndCommit` / `abort`), so it does not matter
+        // whether a caller goes through this method or drives the session itself. A `defer` could
+        // never have covered both, because the live dictation path does not come through here.
 
         for await item in input {
             // `cancel()` terminates the session underneath us; keep draining the caller's stream so the
@@ -314,9 +751,13 @@ public actor SpeechEngine: TranscriptionEngine {
 
     /// Explicit user abort. RECON §5: `cancelAndFinishNow()` **discards** the pending final (measured 0 events
     /// / 0 finals / empty string), so this must never be on the normal key-release path.
+    ///
+    /// Does not clear the slot itself: `abort()` does that, through the session's terminal hook. A
+    /// claim with no session yet — `begin` is still inside `prepareToAnalyze` — is deliberately left
+    /// alone, because that call's own error path owns it and clearing it here would let a second
+    /// utterance start on top of an analyzer that is still being built.
     public func cancel() async {
         guard let session = activeSession else { return }
-        activeSession = nil
         await session.abort()
     }
 
@@ -324,11 +765,22 @@ public actor SpeechEngine: TranscriptionEngine {
 
     /// Pay the cold model-load cost at launch. Measured ~26–50 ms cold versus ~2.5 ms for every subsequent
     /// utterance, which is the difference between the user's first dictation feeling broken and feeling instant.
+    ///
+    /// **The primary language only.** Warming both would double the launch cost for a second model that
+    /// may not be used today, and the secondary path's first press pays ~50 ms — invisible next to the
+    /// ~0.2–0.5 s the utterance itself takes to finalize.
     public func warmUp() async {
-        guard !warmed, activeSession == nil else { return }
+        guard !warmed, slotHolder == nil else { return }
         do {
-            let session = try await beginSession(module: .dictation, biasing: nil, onUpdate: { _ in })
-            activeSession = nil
+            let session = try await beginSession(
+                module: .dictation,
+                locale: .primary,
+                biasing: nil,
+                onUpdate: { _ in }
+            )
+            // `abort()` hands the slot back on its own. Clearing `activeSession` by hand first — which
+            // is what this used to do — would have made the release a no-op on the identity check and
+            // left the warm-up's claim held for the user's very first press.
             await session.abort()
             Log.stt.info("warm-up complete")
         } catch {
@@ -497,11 +949,21 @@ public actor SpeechEngine: TranscriptionEngine {
 /// A class rather than a struct so the terminal-state flag is shared between the transcribe loop and a
 /// concurrent `cancel()`; `@unchecked Sendable` covers exactly one lock-guarded `Bool`.
 final class SpeechSession: TranscriptionSession, @unchecked Sendable {
+    /// Identifies this session's claim on the engine's analyzer slot, for the release and for logs.
+    let serial: UInt64
+
     private let continuation: AsyncStream<AnalyzerInput>.Continuation
     private let analyzer: SpeechAnalyzer
     private let sink: TranscriptSink
     private let sampleRate: Double
     private let biasingCount: Int
+    /// Hands the engine's analyzer slot back. Called exactly once, on whichever terminal path runs,
+    /// and awaited before that path returns — so "`finishAndCommit`/`abort` has returned" and "the
+    /// engine is free" are the same moment, with no window for a following press to be refused.
+    ///
+    /// A closure rather than a reference to the engine so this stays a leaf object with no cycle
+    /// back into the actor that owns it.
+    private let onTerminate: @Sendable (String) async -> Void
 
     private let stateLock = NSLock()
     private var terminated = false
@@ -510,17 +972,21 @@ final class SpeechSession: TranscriptionSession, @unchecked Sendable {
     private var endOfAudio: Date?
 
     init(
+        serial: UInt64,
         continuation: AsyncStream<AnalyzerInput>.Continuation,
         analyzer: SpeechAnalyzer,
         sink: TranscriptSink,
         sampleRate: Double,
-        biasingCount: Int
+        biasingCount: Int,
+        onTerminate: @escaping @Sendable (String) async -> Void
     ) {
+        self.serial = serial
         self.continuation = continuation
         self.analyzer = analyzer
         self.sink = sink
         self.sampleRate = sampleRate
         self.biasingCount = biasingCount
+        self.onTerminate = onTerminate
     }
 
     var isTerminated: Bool { stateLock.withLock { terminated } }
@@ -542,35 +1008,51 @@ final class SpeechSession: TranscriptionSession, @unchecked Sendable {
             endOfAudio = Date()
             return false
         }
+        // Not a release: whoever set `terminated` already released, and releasing again here could
+        // free a *later* utterance's claim if the identity check ever loosened.
         if alreadyDone { throw CancellationError() }
 
-        // Exactly the order RECON §5 verified. Any other ordering either deadlocks or drops the final result.
-        continuation.finish()
-        try await analyzer.finalizeAndFinishThroughEndOfInput()
-        await sink.drain()
+        do {
+            // Exactly the order RECON §5 verified. Any other ordering either deadlocks or drops the
+            // final result.
+            continuation.finish()
+            try await analyzer.finalizeAndFinishThroughEndOfInput()
+            await sink.drain()
 
-        if let failure = sink.consumerFailure { throw failure }
+            if let failure = sink.consumerFailure { throw failure }
 
-        let latency = stateLock.withLock { endOfAudio }.map { -$0.timeIntervalSinceNow } ?? 0
-        let audioDuration = sink.audioDuration(sampleRate: sampleRate)
-        let outcome = TranscriptionOutcome(
-            text: sink.committed,
-            confidence: sink.meanConfidence,
-            latency: latency,
-            audioDuration: audioDuration,
-            words: sink.allWords,
-            lowConfidenceWords: sink.lowConfidenceWords
-        )
-        Log.stt.info(
-            """
-            utterance committed chars=\(outcome.text.count, privacy: .public) \
-            audio=\(String(format: "%.2f", audioDuration), privacy: .public)s \
-            latency=\(String(format: "%.3f", latency), privacy: .public)s \
-            biasing=\(self.biasingCount, privacy: .public) \
-            lowConf=\(outcome.lowConfidenceWords.count, privacy: .public)
-            """
-        )
-        return outcome
+            let latency = stateLock.withLock { endOfAudio }.map { -$0.timeIntervalSinceNow } ?? 0
+            let audioDuration = sink.audioDuration(sampleRate: sampleRate)
+            let outcome = TranscriptionOutcome(
+                text: sink.committed,
+                confidence: sink.meanConfidence,
+                latency: latency,
+                audioDuration: audioDuration,
+                words: sink.allWords,
+                lowConfidenceWords: sink.lowConfidenceWords
+            )
+            // Before the return, so the caller cannot observe a committed utterance and a held slot
+            // at the same time. That combination is precisely the reported bug: the controller logged
+            // "utterance done" while the engine still refused the next press.
+            await onTerminate("committed")
+            Log.stt.info(
+                """
+                utterance committed slot=#\(self.serial, privacy: .public) \
+                chars=\(outcome.text.count, privacy: .public) \
+                audio=\(String(format: "%.2f", audioDuration), privacy: .public)s \
+                latency=\(String(format: "%.3f", latency), privacy: .public)s \
+                biasing=\(self.biasingCount, privacy: .public) \
+                lowConf=\(outcome.lowConfidenceWords.count, privacy: .public)
+                """
+            )
+            return outcome
+        } catch {
+            // `finalizeAndFinishThroughEndOfInput` throwing, or a results-consumer failure. The
+            // analyzer is finished either way and the slot must not outlive it. `defer` cannot do
+            // this — it cannot await — which is why this is spelled out twice.
+            await onTerminate("commit failed: \(error)")
+            throw error
+        }
     }
 
     func abort() async {
@@ -584,5 +1066,8 @@ final class SpeechSession: TranscriptionSession, @unchecked Sendable {
         // Discards the pending final on purpose — this is the Esc path.
         await analyzer.cancelAndFinishNow()
         await sink.drain()
+        // Same contract as the commit path. Esc, a lost permission, a chord cancellation and
+        // `warmUp()` all land here, and every one of them used to leave the slot held.
+        await onTerminate("aborted")
     }
 }

@@ -76,6 +76,18 @@ private enum M {
     /// The glyph inside a `.icon` cap. Small and semibold so it survives the engraving shadow.
     static let iconGlyphSize: CGFloat = 9
     static let flagSize: CGFloat = 6
+    /// The alert stripe down the leading edge of a row whose text never reached the cursor. A 6pt
+    /// square in the flag column is correct as a *classifier* and useless as an alarm — measured on
+    /// the rendered log, a `clipboardOnly` row was indistinguishable at a glance from a clean one.
+    static let rowStripeWidth: CGFloat = 3
+
+    // ---- Reporting controls ---------------------------------------------------------
+
+    /// How long a key shows its own outcome before springing back to its legend. Long enough to read
+    /// two words without looking for it, short enough that it is gone before the next action. In the
+    /// same family as `M.faultHold`, and deliberately far longer than any `D.motion` curve — the
+    /// transition is motion, the dwell is behaviour.
+    static let reportDwell: Duration = .milliseconds(1400)
     /// Column degradation thresholds, widest first.
     static let rowWide: CGFloat = 620
     static let rowMedium: CGFloat = 480
@@ -98,6 +110,13 @@ private enum M {
     /// The longest fixed condition string; it sets the reserved width so the channel never
     /// resizes as the condition changes.
     static let statusTemplate = "Transcribing"
+
+    // ---- Language tag ---------------------------------------------------------------
+
+    /// The tag is the same channel height as `StatusReadout` beside it, because they are one row of
+    /// instrument windows and a half-height sibling reads as a mistake.
+    static let languageTagMin: CGFloat = 24
+    static let languageTagCompactMin: CGFloat = 20
 
     // ---- Record lamp ----------------------------------------------------------------
 
@@ -1371,6 +1390,226 @@ private struct OptionalAccessibilityHint: ViewModifier {
     }
 }
 
+// MARK: - ActionReport
+
+/// What a control did, in the control's own words.
+///
+/// Every interactive key in Edict is supposed to state its outcome. The reason is a real hour lost:
+/// the RESTART key on the permissions pane worked, said nothing, and the only reasonable reading of a
+/// silent control is that it failed. A key that reports is not a nicety — it is the difference between
+/// a working app and an app that looks broken.
+///
+/// The text is a *result*, not an acknowledgement. "Restarted" is weak; "Live" and "Still inactive" are
+/// the two things the user needs to know. Keep it to one or two words: it is printed on a key cap.
+public struct ActionReport: Sendable, Hashable {
+
+    public let text: String
+    /// True when the outcome was not the one the user wanted. Drives a tell-tale beside the key —
+    /// never the legend's colour, because a cap is matte black in both appearances and `D.color.alert`
+    /// is unreadable on it (the same rule `StatusReadout` and the permissions rows follow).
+    public let isFault: Bool
+
+    public init(text: String, isFault: Bool) {
+        self.text = text
+        self.isFault = isFault
+    }
+
+    /// It did the thing. Pass what actually happened, e.g. `"12 erased"`.
+    public static func done(_ text: String) -> ActionReport { .init(text: text, isFault: false) }
+    /// It did not. Pass why, briefly.
+    public static func failed(_ text: String) -> ActionReport { .init(text: text, isFault: true) }
+}
+
+// MARK: - ReportingButton
+
+/// A `TapeButton` that reports its own outcome on its own cap.
+///
+/// Press it, the cap latches for as long as the work takes, then the legend is replaced by the result
+/// for `M.reportDwell` and springs back. Nothing is stacked, nothing has to be dismissed, and nothing
+/// moves: the cap's width is reserved for `template`, which the caller sets to the longest legend the
+/// key can ever show.
+///
+/// `action` is `async` on purpose. Most of the outcomes worth reporting are not knowable synchronously
+/// — whether the hotkey tap actually came back live, which rung of the injection ladder worked — and a
+/// key that reports before the answer exists is the same lie in a new costume.
+public struct ReportingButton: View {
+
+    private let title: String
+    private let template: String?
+    private let role: TapeButtonStyle.Role
+    private let minWidth: CGFloat?
+    private let externalReport: ActionReport?
+    private let action: () async -> ActionReport?
+
+    @State private var report: ActionReport?
+    @State private var reportToken = 0
+    @State private var isRunning = false
+
+    /// - Parameters:
+    ///   - title: the resting legend, natural case (`D.type.buttonCap` uppercases it).
+    ///   - template: the longest legend this key can show — resting or reported. The cap reserves its
+    ///     width so a report never resizes the key or nudges its neighbours. Defaults to `title`.
+    ///   - report: an outcome produced *somewhere else*, for a key whose effect finishes outside its
+    ///     own action — the one real case being a key that opens a sheet, where "the sheet opened" is
+    ///     not an outcome and "an entry was saved" is only known when the sheet closes. Setting it to a
+    ///     new value prints it on the cap exactly as a returned one would.
+    ///   - action: performs the work and returns what happened, or nil to say nothing (a cancelled
+    ///     panel, an armed first press, a sheet that will report for itself).
+    public init(
+        _ title: String,
+        template: String? = nil,
+        role: TapeButtonStyle.Role = .neutral,
+        minWidth: CGFloat? = nil,
+        report: ActionReport? = nil,
+        action: @escaping () async -> ActionReport?
+    ) {
+        self.title = title
+        self.template = template
+        self.role = role
+        self.minWidth = minWidth
+        self.externalReport = report
+        self.action = action
+        // A report handed in at construction has to be shown, not waited for: `.onChange` fires on
+        // *changes*, so an outcome that is already present when the key appears would be dropped
+        // silently — the exact class of bug this component exists to remove.
+        self._report = State(initialValue: report)
+    }
+
+    public var body: some View {
+        HStack(spacing: D.space.xs) {
+            // Reserved always, so a fault does not shunt the key sideways.
+            Rectangle()
+                .strokeBorder(D.color.alert, lineWidth: D.border.thin)
+                .frame(width: D.size.troughHeight, height: D.size.troughHeight)
+                .opacity(report?.isFault == true ? 1 : 0)
+                .animation(D.motion.readout, value: report)
+                .accessibilityHidden(true)
+
+            TapeButton(role: role, isLatched: isRunning, minWidth: minWidth, action: press) {
+                legend
+            }
+            .disabled(isRunning)
+            .accessibilityLabel(title)
+            .accessibilityValue(report?.text ?? "")
+        }
+        // Keyed on the report *and* a counter. The report alone is not enough — pressing a key twice
+        // to the same outcome must restart the dwell, and an equal value would not change the id. The
+        // counter alone is not enough either: it is zero for a report present at construction, which
+        // would then never time out.
+        .task(id: Dwell(report: report, token: reportToken)) {
+            guard report != nil else { return }
+            try? await Task.sleep(for: M.reportDwell)
+            guard !Task.isCancelled else { return }
+            report = nil
+        }
+        .onChange(of: externalReport) { _, new in
+            guard let new else { return }
+            show(new)
+        }
+    }
+
+    private var legend: some View {
+        // The hidden template is what fixes the width; the same trick `StatusReadout` uses to stop its
+        // channel resizing as the condition changes.
+        ZStack {
+            Text(template ?? title)
+                .hidden()
+                .accessibilityHidden(true)
+            Text(report?.text ?? title)
+                .id(report?.text ?? title)
+                .transition(.opacity)
+        }
+        .animation(D.motion.readout, value: report)
+    }
+
+    private func press() {
+        guard !isRunning else { return }
+        isRunning = true
+        Task {
+            let outcome = await action()
+            isRunning = false
+            guard let outcome else { return }
+            show(outcome)
+        }
+    }
+
+    /// The dwell's identity. Two facts, because neither is sufficient alone — see the `.task` above.
+    private struct Dwell: Equatable {
+        var report: ActionReport?
+        var token: Int
+    }
+
+    private func show(_ outcome: ActionReport) {
+        report = outcome
+        reportToken += 1
+        // A confirmation the user cannot see must still reach them: the whole point of this component
+        // is that the outcome is stated, and a 1.4 s printed word states it to exactly one kind of user.
+        var message = AttributedString(outcome.text)
+        message.accessibilitySpeechAnnouncementPriority = .high
+        AccessibilityNotification.Announcement(message).post()
+    }
+}
+
+// MARK: - ReportingIconButton
+
+/// A glyph key that reports by *changing glyph* — a tick for done, a bar for refused.
+///
+/// The icon size (`D.size.iconButton`, 22pt) has no room for a word or for a tell-tale beside it, so
+/// the report has to be the glyph itself. Shape, not colour: the cap is matte black in both
+/// appearances, so a green tick and a red bar would be the same near-black smudge.
+public struct ReportingIconButton: View {
+
+    private let systemImage: String
+    private let label: String
+    private let action: () -> ActionReport?
+
+    @State private var report: ActionReport?
+    @State private var reportToken = 0
+
+    /// - Parameters:
+    ///   - systemImage: the resting SF Symbol.
+    ///   - label: the accessible name. A glyph has none of its own.
+    ///   - action: synchronous, because every icon key in the app is (copy, retry-arm, nudge).
+    public init(systemImage: String, label: String, action: @escaping () -> ActionReport?) {
+        self.systemImage = systemImage
+        self.label = label
+        self.action = action
+    }
+
+    public var body: some View {
+        TapeButton(role: .neutral, size: .icon, action: press) {
+            Image(systemName: glyph)
+                .font(.system(size: M.iconGlyphSize, weight: .semibold))
+                .id(glyph)
+                .transition(.opacity)
+        }
+        .animation(D.motion.readout, value: report)
+        .accessibilityLabel(label)
+        .accessibilityValue(report?.text ?? "")
+        .help(report?.text ?? label)
+        .task(id: reportToken) {
+            guard reportToken > 0, report != nil else { return }
+            try? await Task.sleep(for: M.reportDwell)
+            guard !Task.isCancelled else { return }
+            report = nil
+        }
+    }
+
+    private var glyph: String {
+        guard let report else { return systemImage }
+        return report.isFault ? "exclamationmark" : "checkmark"
+    }
+
+    private func press() {
+        guard let outcome = action() else { return }
+        report = outcome
+        reportToken += 1
+        var message = AttributedString(outcome.text)
+        message.accessibilitySpeechAnnouncementPriority = .high
+        AccessibilityNotification.Announcement(message).post()
+    }
+}
+
 // MARK: - TranscriptRow
 
 /// One row of the history table — the densest component in the app and the one the user reads
@@ -1391,6 +1630,9 @@ public struct TranscriptRow: View {
     private let transcript: Transcript
     private let isSelected: Bool
     private let onCopy: () -> Void
+    private let outcome: InjectionOutcome
+    private let onRetry: (() -> Void)?
+    private let isRetrying: Bool
 
     @Environment(\.edictInkOnDark) private var inkOnDark
     @Environment(\.edictIncreasedContrast) private var increasedContrast
@@ -1403,10 +1645,25 @@ public struct TranscriptRow: View {
     ///     flag column.
     ///   - isSelected: driven by the pane's selection, never by a tap the row handled itself.
     ///   - onCopy: copies `transcript.text`. The row does not touch `NSPasteboard`.
-    public init(_ transcript: Transcript, isSelected: Bool, onCopy: @escaping () -> Void) {
+    ///   - outcome: the injection result to *display*, which is not always `transcript.injection` — a
+    ///     row the user has retried shows the retry's result. Defaults to the stored one.
+    ///   - onRetry: re-inject this text. Supplying it puts a retry key on the row, but only when the
+    ///     outcome actually needs recovery: a key offering to fix a row that worked is noise.
+    ///   - isRetrying: latches the retry key while its work is in flight.
+    public init(
+        _ transcript: Transcript,
+        isSelected: Bool,
+        onCopy: @escaping () -> Void,
+        outcome: InjectionOutcome? = nil,
+        isRetrying: Bool = false,
+        onRetry: (() -> Void)? = nil
+    ) {
         self.transcript = transcript
         self.isSelected = isSelected
         self.onCopy = onCopy
+        self.outcome = outcome ?? transcript.injection
+        self.isRetrying = isRetrying
+        self.onRetry = onRetry
     }
 
     public var body: some View {
@@ -1440,12 +1697,14 @@ public struct TranscriptRow: View {
                 .truncationMode(.tail)
                 .frame(minWidth: M.colTextMin, maxWidth: .infinity, alignment: .leading)
                 .help(transcript.text)
+            retryKey
             copyKey
         }
         .padding(.horizontal, D.space.rowInset)
         // Exactly `D.size.rowHeight` in every state — collapsed *and* selected.
         .frame(height: D.size.rowHeight)
         .background(rowFill)
+        .overlay(alignment: .leading) { failureStripe }
         .overlay(selectionRules)
         .onHover { isHovering = $0 }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { measuredWidth = $0 }
@@ -1480,6 +1739,22 @@ public struct TranscriptRow: View {
         }
     }
 
+    /// A solid alert-ink stripe down the leading edge of a row whose text never landed.
+    ///
+    /// The 6pt flag square stays — it is what distinguishes *which* of the three conditions this row
+    /// has — but on its own it is a classifier and not a signal. Scanning a log of forty rows, a
+    /// `clipboardOnly` row read exactly like a clean one, which is precisely the complaint. The stripe
+    /// runs the full row height at the edge, where nothing else in this table ever paints, so a failed
+    /// row is visible without reading anything.
+    @ViewBuilder
+    private var failureStripe: some View {
+        if outcome.needsRecovery {
+            D.color.alert
+                .frame(width: increasedContrast ? M.rowStripeWidth * 1.5 : M.rowStripeWidth)
+                .allowsHitTesting(false)
+        }
+    }
+
     @ViewBuilder
     private var selectionRules: some View {
         if isSelected {
@@ -1494,7 +1769,15 @@ public struct TranscriptRow: View {
     }
 
     private var primaryInk: Color {
-        isSelected ? D.color.selectionText : (inkOnDark ? D.color.displayInk : D.color.textPrimary)
+        if isSelected { return D.color.selectionText }
+        // Alert ink on the transcript itself, not only in the flag column. Measured on the rendered
+        // log: the 6pt flag square and the 3pt edge stripe both read clearly when you are looking *at*
+        // a row, and neither catches the eye when you are scanning a tray of them — the stripe in
+        // particular sits against the well's own rim shadow. The text is the thing the eye lands on, so
+        // it is the thing that has to change. A selected row keeps `selectionText`: the selection has
+        // already singled it out, and the stripe and flag are still there.
+        if outcome.needsRecovery { return D.color.alert }
+        return inkOnDark ? D.color.displayInk : D.color.textPrimary
     }
 
     private var secondaryInk: Color {
@@ -1509,14 +1792,34 @@ public struct TranscriptRow: View {
     /// Present but invisible on non-hovered rows: it occupies its column always, so nothing in
     /// the row shifts when the pointer arrives.
     private var copyKey: some View {
-        TapeButton(role: .neutral, size: .icon, action: onCopy) {
-            Image(systemName: "square.on.square")
-                .font(.system(size: M.iconGlyphSize, weight: .semibold))
+        ReportingIconButton(systemImage: "square.on.square", label: "Copy transcript") {
+            onCopy()
+            return .done("Copied")
         }
-        .accessibilityLabel("Copy transcript")
         .opacity(isHovering ? 1 : 0)
         .allowsHitTesting(isHovering)
         .animation(reduceMotion ? nil : D.motion.readout, value: isHovering)
+    }
+
+    // MARK: Retry key
+
+    /// Re-inject this row's text. Unlike the copy key this is **not** hover-revealed: a row that failed
+    /// is the one row in the table the user came here to act on, so hiding its only remedy behind a
+    /// hover would be the same silence this whole pass is about. The column is reserved on every row so
+    /// nothing shifts between a failed row and a clean one.
+    @ViewBuilder
+    private var retryKey: some View {
+        if let onRetry, outcome.needsRecovery {
+            TapeButton(role: .neutral, size: .icon, isLatched: isRetrying, action: onRetry) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: M.iconGlyphSize, weight: .semibold))
+            }
+            .disabled(isRetrying)
+            .accessibilityLabel("Insert this text again")
+            .help("Insert this text again, into the app you were last working in.")
+        } else if onRetry != nil {
+            Color.clear.frame(width: D.size.iconButton, height: D.size.iconButton)
+        }
     }
 
     // MARK: Flag column
@@ -1552,7 +1855,7 @@ public struct TranscriptRow: View {
     private enum FlagKind { case notInserted, incomplete, corrected, none }
 
     private var flagKind: FlagKind {
-        if transcript.injection == .failed || transcript.injection == .clipboardOnly { return .notInserted }
+        if outcome.needsRecovery { return .notInserted }
         if transcript.droppedBuffers > 0 { return .incomplete }
         if !transcript.corrections.isEmpty { return .corrected }
         return .none
@@ -1937,6 +2240,136 @@ public struct StatusReadout: View {
     }
 }
 
+// MARK: - LanguageTag
+
+/// The lit window that says which language is being transcribed.
+///
+/// ## Why this exists at all
+///
+/// Edict's dictation locale is fixed for the whole utterance — `DictationTranscriber` takes one
+/// `Locale` and there is no way to change it mid-stream — and it is chosen by a modifier the user
+/// pressed a tenth of a second before they started speaking. A modifier that did not register is
+/// therefore silent: an English model handed Indonesian speech does not fail, it returns confident
+/// English nonsense. The only moment the mistake is free to fix is *while the user is still talking*,
+/// which is the moment this tag exists for.
+///
+/// ## Why the two-letter subtag rather than a language name
+///
+/// `EN` / `ID`, not `English` / `Indonesian`, and not `en-US` / `id-ID`:
+///
+/// * The reader is **speaking** while they read this. That is peripheral vision and one glance, so
+///   what matters is how quickly two states can be told apart, not how much either one says. Two
+///   tracked uppercase glyphs differ at the *first* letter and in overall shape; `English` and
+///   `Indonesian` share a capital-then-lowercase silhouette and both start with a vowel-ish stem, so
+///   telling them apart needs actual reading.
+/// * A full BCP-47 tag spends three of its five glyphs on the region, which is the half that never
+///   differs between the two languages a user has configured. `EN-US` and `ID-ID` are *harder* than
+///   `EN` and `ID`, not clearer.
+/// * At 10 pt condensed there is no room beside the record lamp in a 360 pt HUD for a word.
+///
+/// The caller decides the string, which is what lets it fall back to the full tag in the one case
+/// where the subtag is ambiguous — a primary and secondary that share a language and differ only by
+/// region (`en-US` / `en-GB`). See `AppModel.languageTag`.
+///
+/// The full identifier and the language's real name are still carried, for VoiceOver and for the
+/// tooltip: nothing is *only* two letters.
+public struct LanguageTag: View {
+
+    private let code: String
+    private let spoken: String
+    private let compact: Bool
+
+    @Environment(\.controlActiveState) private var controlActiveState
+
+    /// - Parameters:
+    ///   - code: what is printed. Two letters normally; a full BCP-47 tag when two letters would be
+    ///     ambiguous. `D.type.silkscreen` uppercases it, so pass it in whatever case you have.
+    ///   - spoken: the language's name, in the user's own language, for the screen reader and the
+    ///     tooltip. Never the code: VoiceOver spells `EN` out letter by letter.
+    ///   - compact: `D.type.silkscreenTiny` and a shorter channel. For the HUD and the popover, the
+    ///     same way `StatusReadout` does it.
+    public init(_ code: String, spoken: String, compact: Bool = false) {
+        self.code = code
+        self.spoken = spoken
+        self.compact = compact
+    }
+
+    public var body: some View {
+        RecessedWell(fill: .display, radius: D.radius.tight, inset: D.space.xs) {
+            Text(code)
+                .typeStyle(compact ? D.type.silkscreenTiny : D.type.silkscreen)
+                .foregroundStyle(D.color.displayInk)
+                .lineLimit(1)
+                // Fixed, not truncating: this is a two-glyph readout, and a truncated language is
+                // worse than a tag two points wider than nominal.
+                .fixedSize()
+                .dynamicTypeSize(.large)
+        }
+        .frame(minWidth: compact ? M.languageTagCompactMin : M.languageTagMin)
+        .frame(minHeight: compact ? M.statusCompactHeight : M.statusHeight)
+        .opacity(controlActiveState == .inactive ? D.opacity.ghost : 1)
+        .help(spoken)
+        // One element, and it announces the *name*. The tag is never the only place the language
+        // appears — the status line says it in words and the history detail keeps it — so this is a
+        // readout, not the sole channel.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Language")
+        .accessibilityValue(spoken)
+    }
+}
+
+// MARK: - LanguageReadout
+
+/// A silkscreened legend over a language name and its BCP-47 tag, for a detail block.
+///
+/// The counterpart to `LanguageTag` for the places where the reader is *not* speaking and has all
+/// the time they want: a history row they have opened to work out why a transcript came back wrong.
+/// Here the full name is the fast read and the tag is the unambiguous one, so it prints both — the
+/// opposite trade from the tag, for the opposite reading conditions.
+public struct LanguageReadout: View {
+
+    private let identifier: String
+    private let label: String
+
+    /// - Parameters:
+    ///   - identifier: a BCP-47 identifier as stored on the transcript, e.g. `id-ID`.
+    ///   - label: the silkscreened legend above it.
+    public init(_ identifier: String, label: String = "Language") {
+        self.identifier = identifier
+        self.label = label
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: D.space.xxs) {
+            SilkscreenLabel(label, weight: .tiny)
+                .silkscreenDecorative()
+            HStack(spacing: D.space.xs) {
+                Text(name)
+                    .typeStyle(D.type.caption)
+                    .foregroundStyle(D.color.textPrimary)
+                    .lineLimit(1)
+                Text(identifier)
+                    .typeStyle(D.type.silkscreenTiny)
+                    .foregroundStyle(D.color.textSilkscreen)
+                    .lineLimit(1)
+            }
+        }
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue("\(name), \(identifier)")
+    }
+
+    /// Named in the *user's* language, not its own: `bahasa Indonesia` is the right answer for a
+    /// speaker of it, but this label sits in an English UI beside English legends, and the BCP-47 tag
+    /// printed next to it is the part that is unambiguous either way. Same reasoning as the locale
+    /// tray in Settings — and unrelated to RECON §7, which forbids deriving the *acoustic model*
+    /// from `Locale.current`, not a display string.
+    private var name: String {
+        Locale.current.localizedString(forIdentifier: identifier) ?? identifier
+    }
+}
+
 // MARK: - Previews
 //
 // Previews are the only verification this layer gets before the views agent starts, so a state
@@ -2102,6 +2535,36 @@ private enum PreviewData {
         StatusReadout(.fault("Microphone busy"))
         StatusReadout(.needsPermission("Accessibility"))
         StatusReadout(.listening, compact: true)
+    }
+}
+
+#Preview("LanguageTag") {
+    Bench {
+        // The row as it is actually assembled: lamp, language, status. Both languages side by side,
+        // because the only thing that matters about this component is whether the two states are
+        // told apart at a glance.
+        HStack(spacing: D.space.xxs) {
+            RecordLamp(.recording)
+            LanguageTag("en", spoken: "English")
+            StatusReadout(.listening)
+        }
+        HStack(spacing: D.space.xxs) {
+            RecordLamp(.recording)
+            LanguageTag("id", spoken: "Indonesian")
+            StatusReadout(.listening)
+        }
+        HStack(spacing: D.space.xxs) {
+            RecordLamp(.recording, fitting: .compact)
+            LanguageTag("id", spoken: "Indonesian", compact: true)
+            StatusReadout(.listening, compact: true)
+        }
+        // The disambiguated form: two locales that share a language and differ only by region.
+        HStack(spacing: D.space.xxs) {
+            LanguageTag("en-GB", spoken: "English (United Kingdom)")
+            LanguageTag("en-US", spoken: "English (United States)")
+        }
+        LanguageReadout("id-ID")
+        LanguageReadout("en-US", label: "Dictated in")
     }
 }
 

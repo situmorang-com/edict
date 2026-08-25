@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 // MARK: - Clipboard
@@ -25,8 +26,16 @@ struct HistoryPane: View {
 
     let model: AppModel
 
-    init(model: AppModel, initialSelection: UUID? = nil) {
+    /// Render-harness escape hatch, exactly as `SettingsWindow.unbounded` and
+    /// `PermissionsPane.unbounded` are: `ImageRenderer` does not rasterise a `ScrollView`'s contents,
+    /// so the offline proof sheet comes out with an empty log tray and an empty transcript panel —
+    /// measured, twice. When true the two scroll containers are dropped and the content lays out at its
+    /// natural size. Never true in the app.
+    var unbounded: Bool = false
+
+    init(model: AppModel, initialSelection: UUID? = nil, unbounded: Bool = false) {
         self.model = model
+        self.unbounded = unbounded
         self._selection = State(initialValue: initialSelection)
     }
 
@@ -34,6 +43,18 @@ struct HistoryPane: View {
     @State private var selection: UUID?
     @State private var armedClear = false
     @State private var draft: EntryDraft?
+    /// The dictionary's size when the add sheet was opened, so its dismissal can be reported as
+    /// "added" or "nothing added". The sheet itself hands back no result and is another agent's file.
+    @State private var entryCountAtOpen = 0
+    /// Which word's TEACH key is waiting for the sheet, and what the sheet turned out to have done.
+    /// Carried as a pair so the report lands on the key that was pressed and not on all three.
+    @State private var teachingWord: String?
+    @State private var teachOutcome: TeachOutcome?
+
+    struct TeachOutcome: Equatable {
+        var word: String
+        var report: ActionReport
+    }
     /// The pane's own height, so the detail block can be capped as a fraction of it rather than at
     /// an invented number.
     @State private var paneHeight: CGFloat = D.size.windowMin.height
@@ -54,7 +75,20 @@ struct HistoryPane: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { paneHeight = $0 }
         .sheet(item: $draft) { draft in
-            DictionaryEntrySheet(store: model.dictionary, draft: draft) { self.draft = nil }
+            DictionaryEntrySheet(store: model.dictionary, draft: draft) {
+                // The sheet closing is not the same event as an entry being saved, and the user needs
+                // to know which one happened: a cancelled sheet closes exactly like a saved one.
+                if let word = teachingWord {
+                    teachOutcome = TeachOutcome(
+                        word: word,
+                        report: model.dictionary.entries.count > entryCountAtOpen
+                            ? .done("Added")
+                            : .failed("Not added")
+                    )
+                    teachingWord = nil
+                }
+                self.draft = nil
+            }
         }
         .animation(D.motion.panel, value: selection)
         .task(id: armedClear) {
@@ -62,6 +96,11 @@ struct HistoryPane: View {
             try? await Task.sleep(for: Self.clearArmWindow)
             if !Task.isCancelled { armedClear = false }
         }
+        // Re-read the learned policy whenever a row is opened. The *dictation* path demotes apps by
+        // itself while this window is open, so a policy read once at launch would let the recovery
+        // block print a sentence that stopped being true — which is the same silence as an inert
+        // control, just quieter.
+        .task(id: selection) { await model.refreshLearnedPolicies() }
     }
 
     private func detail(for transcript: Transcript) -> some View {
@@ -71,10 +110,16 @@ struct HistoryPane: View {
             // Half the pane: enough for the whole comparison in the common case, never enough to
             // squeeze the log tray below its four-row floor.
             contentCap: paneHeight * 0.5,
+            unbounded: unbounded,
             onDelete: { delete(transcript.id) },
             onSuggest: { word in
+                entryCountAtOpen = model.dictionary.entries.count
+                teachingWord = word
+                teachOutcome = nil
                 draft = EntryDraft(isCorrection: true, heard: word)
-            }
+            },
+            teachOutcome: teachOutcome,
+            model: model
         )
     }
 
@@ -98,18 +143,22 @@ struct HistoryPane: View {
             // Two-stage rather than a system confirmation dialog: an `NSAlert` in the middle of a
             // machined panel is exactly the macOS chrome this app is built to avoid, and a key that
             // must be pressed twice is how a tape deck guards an erase.
-            TapeButton(
+            ReportingButton(
                 armedClear ? "Confirm" : "Clear log",
-                isLatched: armedClear,
+                template: "9999 erased",
                 minWidth: D.size.buttonHeight * 3
             ) {
-                if armedClear {
-                    model.history.removeAll()
-                    selection = nil
-                    armedClear = false
-                } else {
+                guard armedClear else {
                     armedClear = true
+                    // Nothing has happened yet, so nothing is reported. The latched cap *is* the
+                    // report of an arming press.
+                    return nil
                 }
+                let erased = model.history.transcripts.count
+                model.history.removeAll()
+                selection = nil
+                armedClear = false
+                return .done("\(erased) erased")
             }
             .disabled(model.history.transcripts.isEmpty)
             .accessibilityLabel(armedClear ? "Confirm erasing the whole log" : "Erase the whole log")
@@ -124,13 +173,16 @@ struct HistoryPane: View {
     private var table: some View {
         PanelSurface("Log", inset: D.space.wellInset) {
             RecessedWell(fill: .list, inset: 0) {
-                ScrollView {
+                MaybeScroll(scrolls: !unbounded) {
                     LazyVStack(spacing: 0) {
                         ForEach(rows) { transcript in
                             TranscriptRow(
                                 transcript,
                                 isSelected: selection == transcript.id,
-                                onCopy: { ViewClipboard.put(transcript.text) }
+                                onCopy: { ViewClipboard.put(transcript.text) },
+                                outcome: model.displayOutcome(for: transcript),
+                                isRetrying: model.retryingTranscriptID == transcript.id,
+                                onRetry: { Task { await model.retryInjection(transcript) } }
                             )
                             // Not a `Button` wrapper: the row already contains one (the copy key),
                             // and nesting buttons swallows the inner key's hits.
@@ -140,12 +192,16 @@ struct HistoryPane: View {
                             }
                             .contextMenu {
                                 Button("Copy") { ViewClipboard.put(transcript.text) }
+                                if model.displayOutcome(for: transcript).needsRecovery {
+                                    Button("Insert again") {
+                                        Task { await model.retryInjection(transcript) }
+                                    }
+                                }
                                 Button("Delete") { delete(transcript.id) }
                             }
                         }
                     }
                 }
-                .scrollContentBackground(.hidden)
             }
         }
         .frame(minHeight: D.size.rowHeight * 4, maxHeight: .infinity)
@@ -166,6 +222,35 @@ struct HistoryPane: View {
     }
 }
 
+// MARK: - Render-harness helpers
+
+/// A `ScrollView`, or its content bare. Only the render harness ever asks for bare — see
+/// `HistoryPane.unbounded`.
+private struct MaybeScroll<Content: View>: View {
+    let scrolls: Bool
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        if scrolls {
+            ScrollView { content() }
+                .scrollContentBackground(.hidden)
+        } else {
+            content()
+        }
+    }
+}
+
+/// Applies a definite height, or none at all. `TranscriptDetail` needs a definite one in the app (an
+/// ideal proposal makes its `ScrollView` measure as zero) and none in the harness, where there is no
+/// scroll view to measure.
+private struct DefiniteHeight: ViewModifier {
+    let height: CGFloat?
+
+    func body(content: Content) -> some View {
+        if let height { content.frame(height: height) } else { content }
+    }
+}
+
 // MARK: - TranscriptDetail
 
 /// What the machine heard, what it wrote, and every rule that fired in between.
@@ -177,8 +262,16 @@ private struct TranscriptDetail: View {
     /// panel's own edge and contact shadow are never cut — a clipped panel border reads as a
     /// rendering bug, where a scrolled interior reads as a scrolled interior.
     let contentCap: CGFloat
+    /// See `HistoryPane.unbounded`.
+    let unbounded: Bool
     let onDelete: () -> Void
     let onSuggest: (String) -> Void
+    /// The outcome of the last TEACH press, printed on that key. Owned by the pane because the sheet
+    /// that produces it outlives this view's identity (`.id(transcript.id)`).
+    let teachOutcome: HistoryPane.TeachOutcome?
+    /// Needed for the recovery block: the injector's learned policy and the retry path both live on
+    /// the model. Nothing else in this view reads it.
+    let model: AppModel
 
     /// The content's ideal height. A vertical `ScrollView` proposes nil in its scroll axis, so the
     /// content inside it lays out at its natural size and this measures that.
@@ -188,10 +281,11 @@ private struct TranscriptDetail: View {
         PanelSurface("Transcript") {
             // A *definite* height: given only a maximum a `ScrollView` is greedy and eats the log
             // tray, and given an ideal proposal it measures as zero and disappears entirely.
-            ScrollView {
+            MaybeScroll(scrolls: !unbounded) {
                 VStack(alignment: .leading, spacing: D.space.md) {
                     header
                     if transcript.mayBeIncomplete { incompleteNotice }
+                    if outcome.needsRecovery { recovery }
                     textBlock(label: transcript.isImported ? "Transcript" : "Inserted", body: transcript.text)
                     if transcript.didCorrect {
                         textBlock(label: "As heard", body: transcript.rawText)
@@ -202,7 +296,9 @@ private struct TranscriptDetail: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
             }
-            .frame(height: min(max(contentHeight, D.size.rowHeight * 2), contentCap))
+            .modifier(DefiniteHeight(height: unbounded
+                ? nil
+                : min(max(contentHeight, D.size.rowHeight * 2), contentCap)))
         }
         // A fresh measurement per transcript: a stale height would size the new block for a frame.
         .id(transcript.id)
@@ -232,7 +328,7 @@ private struct TranscriptDetail: View {
                     // An imported transcript was never *meant* to be inserted, so the alert ink
                     // would be a false alarm — the only fault here is a failed injection.
                     .foregroundStyle(
-                        transcript.isImported || transcript.injection.isSuccess
+                        transcript.isImported || outcome.isSuccess
                             ? D.color.textPrimary
                             : D.color.alert
                     )
@@ -250,9 +346,18 @@ private struct TranscriptDetail: View {
             TranscriptExportKeys(transcript)
             SeamDivider(.vertical)
                 .frame(height: D.size.buttonHeight)
-            TapeButton("Copy") { ViewClipboard.put(transcript.text) }
-            TapeButton("Delete", action: onDelete)
-                .help("Deletes this recording of your speech. There is no undo.")
+            ReportingButton("Copy", template: "Copied") {
+                ViewClipboard.put(transcript.text)
+                return .done("Copied")
+            }
+            ReportingButton("Delete", template: "Deleted") {
+                onDelete()
+                // The block this key lives in is torn down by its own success, so the report is only
+                // ever seen when something went wrong. Reporting it anyway costs nothing and means the
+                // key is not a special case in the pass.
+                return .done("Deleted")
+            }
+            .help("Deletes this recording of your speech. There is no undo.")
         }
     }
 
@@ -262,6 +367,116 @@ private struct TranscriptDetail: View {
         return transcript.audioDuration / transcript.transcribeDuration
     }
 
+    /// The outcome to *show*: a retry's result when there was one, else what was recorded.
+    private var outcome: InjectionOutcome { model.displayOutcome(for: transcript) }
+
+    /// Where a retry would aim, and how it is described. Nil when there is nowhere to aim yet.
+    private var retryTarget: String? { model.lastForegroundApp?.name }
+
+    // MARK: Recovery
+
+    /// What to do about a transcript whose text never reached the cursor.
+    ///
+    /// The ladder used to end here — `.clipboardOnly`, the text sitting on the clipboard, and nothing
+    /// further offered. This is the exact failure the app exists to handle well, so it gets a block of
+    /// its own rather than a footnote: re-run the ladder, or teach Edict to stop trying the rung that
+    /// failed. Nothing is re-transcribed; this is the stored string going through `TextInjector` again.
+    @ViewBuilder
+    private var recovery: some View {
+        VStack(alignment: .leading, spacing: D.space.sm) {
+            SilkscreenLabel("Did not land", weight: .tiny)
+                .silkscreenDecorative()
+            Text(explanation)
+                .typeStyle(D.type.explain)
+                .foregroundStyle(D.color.alert)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: D.space.sm) {
+                ReportingButton(
+                    "Insert again",
+                    template: "Clipboard only",
+                    minWidth: D.size.buttonHeight * 4
+                ) {
+                    guard let outcome = await model.retryInjection(transcript) else {
+                        return .failed("Nowhere to aim")
+                    }
+                    return outcome.isSuccess
+                        ? .done(outcome.displayName)
+                        : .failed(outcome.displayName)
+                }
+                .disabled(model.retryingTranscriptID != nil || retryTarget == nil)
+                .help(retryHelp)
+
+                if let bundleID = transcript.targetBundleID {
+                    policyKeys(bundleID)
+                }
+                Spacer(minLength: D.space.xs)
+            }
+
+            if let bundleID = transcript.targetBundleID {
+                policyReadout(bundleID)
+            }
+        }
+        .padding(D.space.sm)
+        .background(RoundedRectangle(cornerRadius: D.radius.tight, style: .continuous)
+            .strokeBorder(D.color.alert, lineWidth: D.border.hairline))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Recovery")
+    }
+
+    private var explanation: String {
+        let app = transcript.targetAppName ?? transcript.targetBundleID ?? "the app you were in"
+        let landed = model.retryOutcomes[transcript.id]
+        if let landed, landed.outcome.isSuccess {
+            return "Edict could not put this into \(app), so it was left on your clipboard. "
+                + "It has since been inserted into \(landed.appName)."
+        }
+        return "Edict could not put this into \(app), so it was left on your clipboard."
+    }
+
+    private var retryHelp: String {
+        guard let retryTarget else {
+            return "Click the app you want the text in, come back here, then press this — Edict aims at "
+                + "the app you were last working in, because while you are reading this the app in "
+                + "front is Edict."
+        }
+        return "Runs the whole insertion ladder again, into \(retryTarget)."
+    }
+
+    // MARK: Learned policy
+
+    /// The per-bundle policy `TextInjector` already keeps, made visible and editable.
+    ///
+    /// It is surfaced rather than left implicit because the injector demotes apps *by itself* — an app
+    /// that accepts an Accessibility write and ignores it is permanently switched to paste-only — and a
+    /// system that silently changes its own behaviour is indistinguishable from a flaky one.
+    private func policyReadout(_ bundleID: String) -> some View {
+        let learned = model.learnedPolicy(for: bundleID)
+        let app = transcript.targetAppName ?? bundleID
+        return Text(learned.map { "Edict has learned to use \($0.displayName.lowercased()) in \(app)." }
+                    ?? "Edict has learned nothing about \(app) yet; it tries the full ladder there.")
+            .typeStyle(D.type.explain)
+            .foregroundStyle(D.color.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder
+    private func policyKeys(_ bundleID: String) -> some View {
+        if model.learnedPolicy(for: bundleID) == nil {
+            ReportingButton("Paste only here", template: "Learned", minWidth: D.size.buttonHeight * 4.6) {
+                await model.setPasteOnly(for: bundleID)
+                return .done("Learned")
+            }
+            .help("Skip the Accessibility rung in this app from now on, and go straight to a paste.")
+        } else {
+            ReportingButton("Forget", template: "Forgotten", minWidth: D.size.buttonHeight * 3) {
+                await model.forgetPolicy(for: bundleID)
+                return .done("Forgotten")
+            }
+            .help("Clear what Edict has learned about this app so it tries the full ladder again.")
+        }
+    }
+
     private var target: String {
         // Imported transcripts have no target app by construction — nothing was injected, which is
         // the whole behavioural difference from a dictation.
@@ -269,7 +484,7 @@ private struct TranscriptDetail: View {
             return filename.isEmpty ? "Imported file" : filename
         }
         let app = transcript.targetAppName ?? transcript.targetBundleID
-        switch (app, transcript.injection) {
+        switch (app, outcome) {
         case (let app?, .notAttempted): return "\(app) — not inserted"
         case (let app?, let outcome): return "\(app) — \(outcome.displayName)"
         case (nil, let outcome): return outcome.displayName
@@ -388,8 +603,17 @@ private struct TranscriptDetail: View {
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        TapeButton("Teach") { onSuggest(word) }
-                            .accessibilityLabel("Add a correction for \(word)")
+                        ReportingButton(
+                            "Teach",
+                            template: "Not added",
+                            report: teachOutcome?.word == word ? teachOutcome?.report : nil
+                        ) {
+                            onSuggest(word)
+                            // Opening the sheet is not an outcome. The pane watches the dictionary
+                            // across the sheet's lifetime and hands the real one back above.
+                            return nil
+                        }
+                        .accessibilityLabel("Add a correction for \(word)")
                     }
                 }
             }
@@ -438,6 +662,146 @@ private struct CorrectionLine: View {
         .frame(height: D.size.rowHeight)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(hit.from) became \(hit.to)")
+    }
+}
+
+// MARK: - Render fixtures
+
+/// Sheets for the offscreen renderer, covering the three things this pass changed: the login-item
+/// switch in every state it can reach, a history row whose text never landed together with its
+/// recovery block, and a control caught mid-report.
+///
+/// A parallel of `PreviewFixtures` rather than an addition to it, for the same reason
+/// `DualLocaleFixtures` and `ImportPreviewFixtures` are: `MainWindow.swift` — where `PreviewFixtures`
+/// lives — is not this agent's file to edit.
+@MainActor
+public enum RecoveryFixtures {
+
+    /// A login-item service pinned to one status, so a sheet can show a state that cannot be produced
+    /// on demand. `.requiresApproval` in particular: on this machine `register()` goes straight to
+    /// `.enabled` (verified with a signed probe bundle in `/Applications`), so the approval path can
+    /// only be *seen* through a stub — and it is the state most worth seeing, since it is the one where
+    /// a naive implementation would claim the login item was on.
+    public struct FixedLoginItemService: LoginItemService {
+        public let status: SMAppService.Status
+        public init(status: SMAppService.Status) { self.status = status }
+        public func register() throws {}
+        public func unregister() throws {}
+    }
+
+    static func model(loginItemStatus: SMAppService.Status) -> AppModel {
+        AppModel(
+            settings: Settings(defaults: EphemeralDefaults()),
+            dictionary: PreviewFixtures.model().dictionary,
+            history: PreviewFixtures.model().history,
+            loginItem: LoginItem(service: FixedLoginItemService(status: loginItemStatus))
+        )
+    }
+
+    /// A model with a bundle-less launch, where the switch is inapplicable rather than off.
+    static func unavailableModel() -> AppModel {
+        AppModel(
+            settings: Settings(defaults: EphemeralDefaults()),
+            loginItem: LoginItem(service: nil)
+        )
+    }
+
+    /// A history holding the real failure from the brief: four words that Ghostty provably did not
+    /// take, left on the clipboard.
+    static func failedInjectionModel(retried: Bool = false) -> AppModel {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("edict-render-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let history = HistoryStore(fileURL: dir.appendingPathComponent("history.json"), limit: { 100 })
+
+        let failed = Transcript(
+            createdAt: Date(timeIntervalSinceNow: -60),
+            rawText: "run the migration now",
+            text: "run the migration now",
+            audioDuration: 2.1,
+            transcribeDuration: 0.18,
+            targetBundleID: "com.mitchellh.ghostty",
+            targetAppName: "Ghostty",
+            injection: .clipboardOnly,
+            lowConfidenceWords: ["migration"]
+        )
+        history.append(Transcript(
+            createdAt: Date(timeIntervalSinceNow: -20),
+            rawText: "that one landed fine",
+            text: "that one landed fine",
+            audioDuration: 1.6,
+            transcribeDuration: 0.14,
+            targetBundleID: "com.apple.TextEdit",
+            targetAppName: "TextEdit",
+            injection: .accessibility
+        ))
+        history.append(failed)
+
+        let model = AppModel(
+            settings: Settings(defaults: EphemeralDefaults()),
+            history: history,
+            loginItem: LoginItem(service: nil)
+        )
+        if retried { model.recordRetryForRender(failed.id, outcome: .paste, appName: "Ghostty") }
+        model.noteForegroundAppForRender(name: "Ghostty", bundleID: "com.mitchellh.ghostty")
+        return model
+    }
+
+    public static func renderSheets() -> [PreviewFixtures.RenderSheet] {
+        let switchSize = CGSize(width: 560, height: 210)
+        let pane = CGSize(width: D.size.windowMin.width - D.size.railWidth, height: 620)
+        let keys = CGSize(width: 620, height: 110)
+
+        func sheet(_ id: String, _ size: CGSize, _ view: some View) -> PreviewFixtures.RenderSheet {
+            PreviewFixtures.RenderSheet(
+                id: id,
+                size: size,
+                view: AnyView(
+                    view
+                        .frame(width: size.width, height: size.height, alignment: .top)
+                        .background(D.surface.deckPaint)
+                )
+            )
+        }
+
+        func switchPanel(_ model: AppModel) -> some View {
+            PanelSurface("Behaviour") { LoginItemRow(loginItem: model.loginItem) }
+                .padding(D.space.md)
+        }
+
+        func historyPane(_ model: AppModel, selecting id: UUID?) -> some View {
+            HistoryPane(model: model, initialSelection: id, unbounded: true)
+        }
+
+        let failed = failedInjectionModel()
+        let failedID = failed.history.transcripts.first { $0.injection.needsRecovery }?.id
+        let retried = failedInjectionModel(retried: true)
+        let retriedID = retried.history.transcripts.first { $0.injection.needsRecovery }?.id
+
+        return [
+            sheet("login-off", switchSize, switchPanel(model(loginItemStatus: .notRegistered))),
+            sheet("login-on", switchSize, switchPanel(model(loginItemStatus: .enabled))),
+            sheet("login-approval", switchSize, switchPanel(model(loginItemStatus: .requiresApproval))),
+            sheet("login-unavailable", switchSize, switchPanel(unavailableModel())),
+            sheet("history-failed", pane, historyPane(failed, selecting: failedID)),
+            sheet("history-retried", pane, historyPane(retried, selecting: retriedID)),
+            sheet("history-collapsed", pane, historyPane(failedInjectionModel(), selecting: nil)),
+            sheet("reports", keys, reportBank()),
+        ]
+    }
+
+    /// Keys frozen mid-report. `ReportingButton` shows a report handed to it at construction, so the
+    /// dwell can be photographed rather than described.
+    static func reportBank() -> some View {
+        PanelSurface("Mid-report") {
+            HStack(spacing: D.space.md) {
+                ReportingButton("Restart", template: "Still dead", report: .done("Live")) { nil }
+                ReportingButton("Restart", template: "Still dead", report: .failed("Still dead")) { nil }
+                ReportingButton("Clear log", template: "9999 erased", report: .done("42 erased")) { nil }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(D.space.md)
     }
 }
 

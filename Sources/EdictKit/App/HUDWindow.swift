@@ -157,6 +157,55 @@ public final class HUDWindowController {
     }
 }
 
+// MARK: - The live language indicator
+
+extension AppModel {
+
+    /// What `LanguageTag` should print while an utterance is in flight, or `nil` when nothing is.
+    ///
+    /// Declared here rather than on `AppModel` itself only because `AppModel.swift` is not this
+    /// agent's file to edit; it belongs beside `lampMode` and `statusCondition`, which are the same
+    /// kind of thing — a published model value shaped for one design component so no view re-derives
+    /// it. Move it there when the files next merge.
+    struct LanguageTagContent: Sendable, Hashable {
+        /// The two letters (or the full tag) the readout prints.
+        let code: String
+        /// The language's name, for VoiceOver and the tooltip.
+        let spoken: String
+        /// True when the modifier chose this language. Not currently drawn — the *code* is the
+        /// signal, and a second visual channel for "this is the unusual one" would be the coloured
+        /// badge the spec rules out — but carried so a future affordance does not need a new seam.
+        let isSecondary: Bool
+    }
+
+    /// Live only. A tag that is lit at idle is panel nomenclature; a tag that lights up when
+    /// recording starts is an instrument. The idle case is already covered in words by `statusLine`,
+    /// which names the modifier and the language it selects.
+    var languageTag: LanguageTagContent? {
+        guard phase.isActive, let identifier = activeLocaleIdentifier else { return nil }
+        return LanguageTagContent(
+            code: Self.tagCode(for: identifier,
+                               primary: settings.localeIdentifier,
+                               secondary: settings.effectiveSecondaryLocaleIdentifier),
+            spoken: Locale.current.localizedString(forIdentifier: identifier) ?? identifier,
+            isSecondary: activeLocaleIsSecondary
+        )
+    }
+
+    /// Two letters normally; the whole tag when two letters could not tell the two languages apart.
+    ///
+    /// `EN` and `ID` are the fastest possible read (see `LanguageTag`), but they are only a read at
+    /// all while the two configured languages differ in their *language* subtag. A user who sets
+    /// `en-US` against `en-GB` would otherwise get `EN` for both — a live indicator that indicates
+    /// nothing, which is worse than none, because it looks like it is working.
+    static func tagCode(for identifier: String, primary: String, secondary: String?) -> String {
+        guard let secondary, badge(secondary) == badge(primary) else { return badge(identifier) }
+        // Hyphenated, always: the framework hands back `id_ID` and Edict stores `id-ID`, and a
+        // readout that prints an underscore one day and a hyphen the next reads as a bug.
+        return identifier.replacingOccurrences(of: "_", with: "-")
+    }
+}
+
 // MARK: - HUDContent
 
 /// The HUD's contents: record lamp, status, elapsed counter, live level, and the live text with a
@@ -186,9 +235,19 @@ struct HUDContent: View {
 
     // MARK: rows
 
+    /// Lamp, language, status, elapsed — in that order, and the language is second on purpose.
+    ///
+    /// Beside the record lamp is the one place the eye is already going: the lamp is what tells the
+    /// user recording started, so the language rides the same glance. Putting it at the trailing end
+    /// beside the counter would make it a number among numbers, and it would be read after the fact
+    /// or not at all — which is the same as not having it, because the whole value of this tag is
+    /// that it is seen *before* the sentence is finished.
     private var instrumentRow: some View {
         HStack(spacing: D.space.sm) {
             RecordLamp(model.lampMode, fitting: .compact)
+            if let language = model.languageTag {
+                LanguageTag(language.code, spoken: language.spoken, compact: true)
+            }
             StatusReadout(model.statusCondition, compact: true)
             Spacer(minLength: D.space.xs)
             SegmentCounter(.elapsed(model.elapsed), scale: .tiny, seated: false)

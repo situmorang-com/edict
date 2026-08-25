@@ -102,8 +102,16 @@ struct PermissionsPane: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: D.space.sm)
-                TapeButton("Restart", action: model.retryHotkey)
-                    .accessibilityLabel("Restart the dictation key watcher")
+                // This key is the reason the whole confirmation pass exists. It worked, it said
+                // nothing, and an hour went into debugging a watcher that was already live. It now
+                // waits for `hotkeyLive` to settle and prints the answer on its own cap.
+                ReportingButton("Restart", template: "Still dead") {
+                    let live = await model.restartHotkey()
+                    return live ? .done("Live") : .failed("Still dead")
+                }
+                .accessibilityLabel("Restart the dictation key watcher")
+                .help("Destroys and re-creates the key watcher. RECON §11: a tap created while Input "
+                      + "Monitoring was denied is permanently dead and cannot be re-enabled.")
             }
         }
     }
@@ -158,15 +166,23 @@ private struct PermissionRow: View {
         case .notDetermined:
             // Only `notDetermined` can produce a prompt. Once TCC has recorded a deny, requesting
             // again is a silent no-op, which is why the other cases go straight to Settings.
-            TapeButton("Allow") {
+            // The prompt is macOS's, so the outcome is only knowable afterwards — and "Denied" is
+            // exactly the outcome a user needs told, since TCC will never prompt for this again.
+            ReportingButton("Allow", template: "Denied") {
                 isRequesting = true
-                Task {
-                    await permissions.request(kind)
-                    isRequesting = false
+                await permissions.request(kind)
+                isRequesting = false
+                switch permissions.state(of: kind) {
+                case .granted: return .done("Granted")
+                case .denied: return .failed("Denied")
+                case .notDetermined, .unknown: return .failed("No answer")
                 }
             }
             .disabled(isRequesting)
         case .denied, .unknown:
+            // Nothing to report: the outcome of this key is System Settings appearing in front of the
+            // user, which is its own confirmation. A "Opened" badge on a key whose whole effect is a
+            // window arriving would be noise, and the row's own state readout is already polling.
             TapeButton("Open") { permissions.openSettings(for: kind) }
                 .accessibilityLabel("Open System Settings for \(kind.title)")
         }

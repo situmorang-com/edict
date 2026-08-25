@@ -72,9 +72,17 @@ public final class DictationController {
     /// Cached so key-down does not pay an actor round-trip for a value that changes only when the
     /// locale changes.
     private var analyzerFormat: AVAudioFormat?
+    /// The same answer for the secondary language. Held separately rather than reused: the format is a
+    /// property of the module, which is built per locale, and `AudioCapture`'s converter is configured
+    /// from it. They agree in practice; assuming so is not the same as checking.
+    private var secondaryAnalyzerFormat: AVAudioFormat?
 
     private var appliedHotkey: HotkeyChoice?
+    private var appliedAlternateModifier: HotkeyModifier?
     private var appliedLocale: String?
+    /// The secondary identifier the engine currently holds a reservation for, or `nil` when the
+    /// shortcut is off or its locale could not be prepared.
+    private var appliedSecondaryLocale: String?
 
     /// Press-to-start / press-to-stop bookkeeping for `Settings.pushToTalk == false`.
     private var toggleLatched = false
@@ -162,6 +170,10 @@ public final class DictationController {
 
     private func prewarm() async {
         await prepareEngine(localeIdentifier: settings.localeIdentifier)
+        // Reserve the second language now, not at key-down. Reservations persist across launches, are
+        // keyed to the bundle id, and cap at 5; doing this inside an utterance would put a reservation
+        // — and possibly an eviction round — in front of audio the user is already speaking.
+        await prepareSecondary()
 
         // RECON §26: retain a CGEventSource, build and discard one CGEvent, touch AXIsProcessTrusted
         // and do one throwaway system-wide AX read. Without this the *first* dictation of a session
@@ -195,6 +207,55 @@ public final class DictationController {
         }
     }
 
+    /// Resolve, validate and reserve the secondary dictation language.
+    ///
+    /// Validation happens here rather than in `Settings` because this is where the framework's own
+    /// answer is available: a stale identifier — one an OS update dropped, or a hand-written
+    /// `defaults write` — would otherwise make the modifier throw on every press with nothing in the
+    /// UI to fix. `reconcileSecondaryLocale` resets it, or turns the shortcut off, and the primary
+    /// language keeps working either way.
+    private func prepareSecondary() async {
+        let supported = await engine.supportedLocales.map(\.identifier)
+        settings.reconcileSecondaryLocale(supportedIdentifiers: supported)
+
+        if let identifier = settings.effectiveSecondaryLocaleIdentifier {
+            if identifier != appliedSecondaryLocale {
+                do {
+                    try await engine.prepareSecondary(localeIdentifier: identifier)
+                    appliedSecondaryLocale = identifier
+                    secondaryAnalyzerFormat = await engine.bestAudioFormat(secondary: true)
+                    model?.apply(secondaryLocaleReady: true)
+                } catch {
+                    appliedSecondaryLocale = nil
+                    secondaryAnalyzerFormat = nil
+                    model?.apply(secondaryLocaleReady: false)
+                    Log.engine.error("""
+                        secondary locale \(identifier, privacy: .public) unavailable: \
+                        \(Self.describe(error), privacy: .public)
+                        """)
+                }
+            }
+        } else if appliedSecondaryLocale != nil {
+            await engine.clearSecondary()
+            appliedSecondaryLocale = nil
+            secondaryAnalyzerFormat = nil
+            model?.apply(secondaryLocaleReady: false)
+        } else {
+            model?.apply(secondaryLocaleReady: false)
+        }
+
+        // Hand back anything Edict is no longer using. Unconditional, and specifically NOT guarded on
+        // having just prepared something: the leak this closes is the one where a *previous* launch
+        // reserved a locale the current settings no longer want, which no amount of in-process
+        // bookkeeping can see. Reservations persist across launches and cap at 5.
+        await engine.pruneReservations()
+
+        // Logged at `notice` so it survives in the system log: a reservation leak is invisible until
+        // reservation starts failing outright, and RECON's probe leaked slots during exploration.
+        let reserved = await engine.reservedLocaleIdentifiers()
+        Log.engine.notice("reserved locales: \(reserved.joined(separator: ","), privacy: .public)")
+    }
+
     /// Opt-in low-latency mode. Costs a permanently lit orange microphone indicator, which RECON §22
     /// calls out as the single likeliest reason a dictation app gets uninstalled — hence opt-in.
     private func startMicrophonePrewarm() async {
@@ -222,14 +283,19 @@ public final class DictationController {
 
     // MARK: - Hotkey
 
-    private func startHotkey() {
-        hotkeyEventsTask?.cancel()
-        hotkeyDiagnosticsTask?.cancel()
+    /// The modifier the monitor should treat as the language switch, or `nil` when the shortcut is off
+    /// — in which case every modifier goes back to cancelling the hold.
+    private var alternateModifier: HotkeyModifier? {
+        settings.secondaryLocaleEnabled ? settings.secondaryLocaleModifier : nil
+    }
 
+    private func startHotkey() {
         let key = settings.hotkey
+        let alternate = alternateModifier
         do {
-            try hotkey.start(key: key)
+            try hotkey.start(key: key, alternate: alternate)
             appliedHotkey = key
+            appliedAlternateModifier = alternate
             model?.apply(hotkeyLive: true)
             Log.hotkey.info("monitor live on \(key.rawValue, privacy: .public)")
         } catch {
@@ -238,8 +304,26 @@ public final class DictationController {
             Log.hotkey.error("monitor failed to start: \(Self.describe(error), privacy: .public)")
         }
 
-        // Consume both streams unconditionally, even when start() failed: a later permission grant
-        // re-creates the tap and these consumers must already be in place.
+        startHotkeyConsumersIfNeeded()
+    }
+
+    /// Created exactly ONCE, and deliberately never cancelled by a restart.
+    ///
+    /// `HotkeyMonitor.events` hands back a single *stored* `AsyncStream`, and an `AsyncStream`
+    /// supports only one iterator. Cancelling the consumer and starting a second one over that same
+    /// stream leaves the replacement receiving nothing, for ever — which is exactly what pressing
+    /// RESTART used to do. The symptom was thoroughly misleading: the monitor went on arming and
+    /// releasing correctly (its own log lines proved the tap, the keycode and the device bit were all
+    /// fine) while the controller sat permanently deaf behind a dead iterator, so the key simply did
+    /// nothing and there was no error anywhere to find.
+    ///
+    /// A single long-lived consumer is safe across any number of tap stop/start cycles, because the
+    /// continuations are finished only in the monitor's `deinit`. Consume unconditionally, even when
+    /// `start()` threw: a later permission grant re-creates the tap, and the consumer must already be
+    /// in place when it does.
+    private func startHotkeyConsumersIfNeeded() {
+        guard hotkeyEventsTask == nil, hotkeyDiagnosticsTask == nil else { return }
+
         let events = hotkey.events
         hotkeyEventsTask = Task { [weak self] in
             for await event in events {
@@ -266,14 +350,14 @@ public final class DictationController {
 
     private func handle(_ event: HotkeyEvent) {
         switch event {
-        case .pressed:
+        case .pressed(let alternate):
             if settings.pushToTalk {
-                begin(origin: .hotkey)
+                begin(origin: .hotkey, alternate: alternate)
             } else if toggleLatched {
                 toggleLatched = false
                 end()
             } else {
-                begin(origin: .hotkey)
+                begin(origin: .hotkey, alternate: alternate)
                 // Latched only if the utterance actually started. Otherwise a refused `begin`
                 // would leave the toggle armed and the *next* press would stop nothing.
                 toggleLatched = utterance != nil
@@ -333,6 +417,9 @@ public final class DictationController {
             _ = settings.hotkey
             _ = settings.localeIdentifier
             _ = settings.prewarmMicrophone
+            _ = settings.secondaryLocaleEnabled
+            _ = settings.secondaryLocaleIdentifier
+            _ = settings.secondaryLocaleModifier
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -343,12 +430,19 @@ public final class DictationController {
     }
 
     private func settingsChanged() {
-        if settings.hotkey != appliedHotkey {
+        // The modifier is part of the binding, so a change to it is a rebind even when the key is the
+        // same — without this, turning the shortcut on would leave Shift still cancelling the hold.
+        if settings.hotkey != appliedHotkey || alternateModifier != appliedAlternateModifier {
             let key = settings.hotkey
+            let alternate = alternateModifier
             appliedHotkey = key
+            appliedAlternateModifier = alternate
             if hotkey.isRunning {
-                hotkey.update(key: key)
-                Log.hotkey.info("rebound to \(key.rawValue, privacy: .public)")
+                hotkey.update(key: key, alternate: alternate)
+                Log.hotkey.info("""
+                    rebound to \(key.rawValue, privacy: .public) \
+                    + \(alternate?.rawValue ?? "none", privacy: .public)
+                    """)
             } else {
                 startHotkey()
             }
@@ -356,7 +450,15 @@ public final class DictationController {
 
         if settings.localeIdentifier != appliedLocale {
             let locale = settings.localeIdentifier
-            Task { [weak self] in await self?.prepareEngine(localeIdentifier: locale) }
+            Task { [weak self] in
+                await self?.prepareEngine(localeIdentifier: locale)
+                // The primary moving can make the secondary redundant (both `en-US`) or newly
+                // meaningful, so re-resolve it against the new primary rather than leaving a stale
+                // reservation behind.
+                await self?.prepareSecondary()
+            }
+        } else if settings.effectiveSecondaryLocaleIdentifier != appliedSecondaryLocale {
+            Task { [weak self] in await self?.prepareSecondary() }
         }
 
         if settings.prewarmMicrophone {
@@ -385,7 +487,10 @@ public final class DictationController {
     // MARK: - Transport
 
     /// Key-down. Reads the dictionary *here* and nowhere else (RECON §2).
-    public func begin(origin: Origin) {
+    ///
+    /// - Parameter alternate: the language modifier was held when the hotkey armed. Maps to the
+    ///   secondary locale here, and nowhere else — `HotkeyMonitor` knows only about modifier bits.
+    public func begin(origin: Origin, alternate: Bool = false) {
         guard utterance == nil else {
             Log.engine.debug("begin ignored: an utterance is already in flight")
             return
@@ -400,6 +505,31 @@ public final class DictationController {
         // a long list both costs more and biases *worse* (a 9-term list fixed "Wispr Flow" where a
         // 200-term list fixed neither). `biasingStrings(limit:)` ranks and caps; `effectiveBiasingLimit`
         // is 0 when the user turned biasing off.
+        // ── Which language this one utterance runs in ────────────────────────────────────────────
+        // Requested only if the shortcut is on AND the engine actually holds a reservation for the
+        // language. `secondaryLocale` being nil here means the modifier is inert for this press,
+        // which is right: the alternative is throwing on a gesture the user cannot un-learn.
+        let wantsSecondary = alternate && settings.effectiveSecondaryLocaleIdentifier != nil
+        let useSecondary = wantsSecondary && appliedSecondaryLocale != nil
+        if wantsSecondary && !useSecondary {
+            Log.engine.error("""
+                the language modifier was held but \
+                \(self.settings.secondaryLocaleIdentifier, privacy: .public) is not prepared; \
+                dictating in \(self.settings.localeIdentifier, privacy: .public)
+                """)
+        }
+        let localeIdentifier = useSecondary
+            ? (appliedSecondaryLocale ?? settings.localeIdentifier)
+            : settings.localeIdentifier
+
+        // Biasing is the SAME list for both languages, deliberately.
+        //
+        // The dictionary holds proper nouns — Vercel, Supabase, Claude Code, Obsidian — not English
+        // words, and this user code-switches inside single sentences: the jargon is identical whether
+        // the surrounding grammar is English or Indonesian. Splitting it would need a per-entry locale
+        // field on `DictionaryEntry` (a data-layer schema change) to buy a benefit nobody has measured,
+        // and would silently stop fixing "Supabase" the moment the user pressed Shift. Layer 2, the
+        // correction pass, is likewise language-independent and runs unchanged.
         let biasing = dictionary.biasingStrings(limit: settings.effectiveBiasingLimit)
         // Layer 2 of the two-layer dictionary: the guaranteed find-and-replace pass. Compiled now
         // so a dictionary edit mid-utterance cannot change the rules under the transcript.
@@ -416,12 +546,15 @@ public final class DictationController {
             target: target,
             biasing: biasing,
             corrector: corrector,
-            localeIdentifier: settings.localeIdentifier,
+            localeIdentifier: localeIdentifier,
+            engineLocale: useSecondary ? .secondary : .primary,
+            analyzerFormat: useSecondary ? secondaryAnalyzerFormat : analyzerFormat,
             droppedBaseline: capture.statsSnapshot.dropped
         )
         utterance = unit
 
         model?.clearLiveText()
+        model?.apply(activeLocale: localeIdentifier, isSecondary: useSecondary)
         model?.apply(phase: .arming)
         playFeedback(.start)
 
@@ -472,7 +605,10 @@ public final class DictationController {
             let sink = LiveTextRelay { [weak self] committed, volatile in
                 self?.model?.apply(committed: committed, volatile: volatile)
             }
-            let started = try await engine.begin(onUpdate: { update in
+            // Throws rather than falling back if the secondary language's assets are missing. That is
+            // the whole point: an English model handed Indonesian speech does not fail, it returns
+            // confident English nonsense and the injection ladder types it into the user's document.
+            let started = try await engine.begin(locale: unit.engineLocale, onUpdate: { update in
                 sink.publish(committed: update.finalText, volatile: update.volatileText)
             })
             session = started
@@ -482,7 +618,7 @@ public final class DictationController {
             // microphone is ever opened.
             try unit.checkCancelled()
 
-            let stream = try await capture.start(targetFormat: analyzerFormat)
+            let stream = try await capture.start(targetFormat: unit.analyzerFormat ?? analyzerFormat)
             audioStarted = true
             model?.apply(phase: .listening)
 
@@ -534,8 +670,13 @@ public final class DictationController {
             watchdog?.cancel()
             // Invariant 2. Unconditional, and before anything that could itself fail.
             if audioStarted { await capture.stop() }
+            // `abort()` is what hands the engine's analyzer slot back, and it does it for *this*
+            // session only. There used to be an `await engine.cancel()` after this line as a
+            // belt-and-braces; it is gone deliberately. `cancel()` aborts whatever the engine
+            // currently holds, which after this session released is either nothing or a *different*
+            // utterance — a file import, or the next press that was already waiting for the slot —
+            // so on the one path where it did anything at all, what it did was wrong.
             await session?.abort()
-            await engine.cancel()
 
             let message = Self.friendlyMessage(for: error)
             Log.engine.error("utterance failed: \(Self.describe(error), privacy: .public)")
@@ -838,7 +979,16 @@ private final class Utterance {
     let target: InjectionTarget
     let biasing: [String]
     let corrector: Corrector
+    /// The language actually used, recorded on the `Transcript` so history can show it.
     let localeIdentifier: String
+    /// Which of the engine's two prepared locales runs this utterance. Frozen at key-down for the same
+    /// reason as everything else here: the framework takes one `Locale` per analyzer and there is no
+    /// way to change it mid-stream.
+    let engineLocale: SpeechEngine.UtteranceLocale
+    /// The analyzer-compatible format for `engineLocale`. Carried on the utterance rather than read at
+    /// use time so the converter and the analyzer cannot end up disagreeing if the locale changes
+    /// while this utterance is in flight.
+    let analyzerFormat: AVAudioFormat?
     /// `CaptureStats` is cumulative for the process, so per-utterance drops are a delta.
     let droppedBaseline: Int
 
@@ -853,6 +1003,8 @@ private final class Utterance {
         biasing: [String],
         corrector: Corrector,
         localeIdentifier: String,
+        engineLocale: SpeechEngine.UtteranceLocale,
+        analyzerFormat: AVAudioFormat?,
         droppedBaseline: Int
     ) {
         self.origin = origin
@@ -860,6 +1012,8 @@ private final class Utterance {
         self.biasing = biasing
         self.corrector = corrector
         self.localeIdentifier = localeIdentifier
+        self.engineLocale = engineLocale
+        self.analyzerFormat = analyzerFormat
         self.droppedBaseline = droppedBaseline
     }
 
