@@ -1,114 +1,221 @@
+<div align="center">
+
 # Edict
 
-A push-to-talk dictation app for macOS. Hold a key, talk, release, and the text lands where your
-cursor already is — in any app. Transcription runs entirely on your machine: nothing you say leaves
-the computer, there is no API to call, and there is nothing to pay for.
+**Push-to-talk dictation for macOS. Hold a key, talk, and the words land where your cursor already is.**
 
-Built with Apple's on-device `DictationTranscriber` (macOS 26+), so there is no model to download
-and no third-party dependency anywhere in the tree.
+Runs entirely on your machine. Nothing you say leaves the computer, there is no API to call,
+and there is nothing to pay for.
+
+[![macOS 26+](https://img.shields.io/badge/macOS-26%2B-1d1d1f?style=flat-square)](https://www.apple.com/macos/)
+[![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?style=flat-square&logo=swift&logoColor=white)](https://swift.org)
+[![Zero dependencies](https://img.shields.io/badge/dependencies-0-4C8A3A?style=flat-square)](Package.swift)
+[![7 MB](https://img.shields.io/badge/app%20size-7%20MB-4C8A3A?style=flat-square)](#how-it-stays-small)
+[![185 tests](https://img.shields.io/badge/tests-185-4C8A3A?style=flat-square)](Tests)
+[![MIT](https://img.shields.io/badge/licence-MIT-blue?style=flat-square)](LICENSE)
+
+![Edict's main window](docs/images/history.png)
+
+</div>
+
+---
 
 ## What it does
 
-- **Hold-to-talk.** Right Option by default, rebindable. Release ends the utterance.
-- **Text at your cursor.** A verified fallback ladder — Accessibility insert, then pasteboard and a
-  layout-correct Cmd-V, then synthetic keystrokes, then leaving it on the clipboard. Every rung is
-  *verified*, never trusted, because the Accessibility API returns success on elements that silently
-  ignore it.
-- **A dictionary you can teach.** Two mechanisms at once: your terms are fed to the speech engine as
-  contextual strings so it leans toward producing them, and a guaranteed correction pass runs
-  afterwards. It catches the forms these models glue together — a `cloud code` rule matches
-  `CloudCode` and `Cloud-Code` — without ever corrupting `Cloudflare`.
-- **Searchable history**, with the raw-versus-corrected diff so you can see what the dictionary
-  actually did, and per-word confidence surfacing likely mishearings as one-click dictionary entries.
-- **A real app.** Dock icon, app menu, resizable window, Settings on `Cmd+,`, and a menu-bar extra as
-  a secondary surface. Not a menu-bar utility.
+Hold **⌥** (Right Option), say something, let go. The text is inserted at your cursor in whatever
+app has focus — editor, terminal, browser, chat.
 
-## Build
+Transcription is Apple's on-device `DictationTranscriber`, so there is no model to download, no
+network round trip, and no subscription. **7 MB, zero third-party dependencies.**
 
-Requires macOS 26+ and Xcode 26+. No Xcode project, no Developer ID, no sudo.
-
-```bash
-./scripts/build-app.sh          # -> build/Edict.app
-./scripts/build-app.sh install  # -> ~/Applications
-```
-
-The script bootstraps a local self-signed code-signing identity into its own keychain. That matters:
-macOS keys Accessibility and Input Monitoring grants to the code signature, and an ad-hoc signature's
-designated requirement is a bare `cdhash` — so the grants would be dropped on **every rebuild**. A
-stable certificate makes the requirement `identifier + certificate root`, and the grants survive.
-
-`swift run` is not a valid way to run this app: it has no bundle identifier, no `Info.plist`, and
-lands in `.accessory` activation policy. Always go through the script.
-
-## Permissions
-
-Three, granted once, all with a plain-language explanation in the app's Permissions pane:
-
-| Permission | Why |
+| | |
 |---|---|
-| Microphone | To hear you. Prompted on first recording |
-| Input Monitoring | To see the hold-to-talk key while you are in another app |
-| Accessibility | To read the focused text field, so it can confirm the text actually landed |
+| **Hold to talk** | ⌥ for English, **⇧⌥ for Indonesian** — the language is chosen per utterance, not by a mode you can forget you are in |
+| **Text at your cursor** | A verified fallback ladder. Every insertion is *confirmed*, never assumed |
+| **A dictionary you teach** | Two mechanisms at once: the engine is biased toward your terms, and a guaranteed correction pass runs afterwards |
+| **File transcription** | Drop in audio or video — m4a, mp3, wav, aiff, caf, **mp4, mov**. Batch queue, per-word timestamps, TXT/SRT/VTT export |
+| **Searchable history** | With the raw-versus-corrected diff, so you can see what the dictionary actually did |
+| **54 languages** | Including Indonesian and Malay |
+| **A real app** | Dock icon, app menu, resizable window, Settings on ⌘, and a menu-bar extra |
 
 ## Transcribing files
 
-Drop an audio or video file on the window, pick one with `Cmd+O`, or open it from Finder. Audio and video
-containers both work — m4a, mp3, wav, aiff, caf, mp4, mov — because the reader pulls the audio track out of the
-container rather than assuming an audio file. Multiple files queue and run one at a time.
+Drop a file on the window, press ⌘O, or open it from Finder. The audio track is pulled out of the
+container, so a video costs nothing extra.
 
-Imports land in **history with per-word timestamps**, exportable as **TXT, SRT or VTT**. They are never injected at
-your cursor — that is the difference between dictating and transcribing.
+![Importing a nine-minute recording](docs/images/import.gif)
 
-Measured on this machine: about 9–27x realtime warm, and 75x on a six-minute file. Word error against the source
-script was 4.1% on that file.
+*A nine-minute recording, transcribed in about eight seconds.*
 
-**Edict does not identify speakers.** Apple's on-device speech framework has no module that separates one voice from
-another, so a meeting or interview arrives as one block of text with no names and no turn breaks. If you need who
-said what, Edict cannot give you that, and the app says so where you would look for it.
+Measured on an M5 Pro: **9–27× realtime** warm, **75×** on a six-minute file, with **4.1% word error**
+against the source script. Imports land in history with timestamps and never touch your cursor —
+that is the line between dictating and transcribing.
 
-Imports use `SpeechTranscriber`, which measured 4.2% word error at 66x realtime against `DictationTranscriber`'s
-10.1% at 15x on identical audio. Live dictation keeps `DictationTranscriber`, because vocabulary biasing only works
-there — and so does Indonesian, which imports fall back to it for.
+## The dictionary is the interesting part
 
-## Languages
+Every dictation tool mangles proper nouns. Edict attacks that from two directions, because neither
+alone is enough.
 
-54 locales, including **Indonesian (`id_ID`)** and Malay (`ms_MY`). Pick one in Settings; the on-device model
-for a new locale downloads on first use (~30 s). Verified: a spoken Indonesian sentence transcribed word-perfect
-in 0.36 s.
+**Before transcription**, your terms are passed to the speech engine as contextual strings, so it
+leans toward producing them. This genuinely works — `"Visa and soup base and anthropic"` became
+`"Vercel and Supabase and Anthropic"`.
 
-Note that `SpeechTranscriber` and `DictationTranscriber` expose *different* locale sets — 45 versus 54, and
-Indonesian is only in the latter. Edict uses `DictationTranscriber`.
+**After transcription**, a guaranteed pass rewrites what biasing missed. It is a single
+left-to-right scan, earliest-then-longest across all rules, emitting into a buffer — so a rule can
+never fire on another rule's output. It catches the forms these models glue together:
 
-macOS reserves at most 5 locales per app at a time; Edict evicts the least recently used when it needs a slot.
+```
+cloud code · cloud-code · cloud_code · CloudCode · Cloud Code   →   Claude Code
+```
 
-## Documentation
+...while never touching `Cloudflare`, `clouds`, `iCloud`, or `CloudCodeBase`. There are 30 tests on
+that behaviour alone, because it is the difference between a useful feature and one that quietly
+corrupts your prose.
 
-- [`docs/RECON.md`](docs/RECON.md) — empirical findings from probing these APIs. Most are
-  counter-intuitive, several are undocumented, and all of them were established by compiling and
-  running code rather than by reading the docs.
-- [`docs/CONTRACTS.md`](docs/CONTRACTS.md) — interfaces, plus the amendments that override them.
-- [`docs/DESIGN-TOKENS.md`](docs/DESIGN-TOKENS.md) and
-  [`docs/DESIGN-COMPONENTS.md`](docs/DESIGN-COMPONENTS.md) — the design system.
+The history view shows when a rule fired and what it changed, so you can tell whether the dictionary
+is earning its place.
 
-The design direction is a 1980s portable field recorder — Sony TC-D5, Marantz PMD, Nakamichi, Braun.
-Brushed aluminium and matte plastic, warm greys and cream, one red for the record lamp, amber and
-green for level. The recording indicator is a VU meter with a needle, not a progress bar.
+## Install
+
+Requires macOS 26 or later and Xcode 26+. No Xcode project, no Developer ID, no `sudo`.
+
+```bash
+git clone https://github.com/situmorang-com/edict.git
+cd edict
+./scripts/build-app.sh install     # → ~/Applications/Edict.app
+```
+
+The script bootstraps a **local self-signed identity** into its own keychain. That detail matters
+more than it sounds: macOS keys Accessibility and Input Monitoring grants to the *code signature*,
+and an ad-hoc signature's designated requirement is a bare `cdhash` — so your permissions would be
+dropped on **every rebuild**. A stable certificate makes the requirement `identifier + certificate`,
+and the grants survive.
+
+> `swift run` is not a valid way to run this app: no bundle identifier, no `Info.plist`, and it lands
+> in `.accessory` activation policy. Always go through the script.
+
+### Permissions
+
+Three, granted once, each explained in plain language in the app's own Permissions pane.
+
+| Permission | Why |
+|---|---|
+| **Microphone** | To hear you. Prompted on first recording |
+| **Input Monitoring** | To notice the hold-to-talk key while you are in another app |
+| **Accessibility** | To read the focused text field, so it can confirm your words actually landed |
+
+After granting Input Monitoring, press **RESTART** in the Permissions pane. This is not optional: a
+`CGEventTap` created while permission was denied comes back **non-nil but permanently dead**, and no
+amount of re-enabling revives it. The tap has to be rebuilt.
+
+## Two languages, one key
+
+Hold **⌥** for your primary language. Hold **⇧⌥** for your second.
+
+The modifier is sampled at *arm* time, so either press order works. Either Shift counts. The
+HUD shows which language is live while you speak — mid-utterance is the only moment a mis-registered
+chord is free to redo.
+
+Configure both in Settings (⌘,). The model for a new language downloads on first use, about 30
+seconds. If it is missing, the first press says so rather than transcribing Indonesian with an
+English model, which produces confident nonsense.
 
 ## Notable findings
 
-Two are worth stating up front, because they contradict what the documentation implies:
+Building this meant probing APIs that are new and thinly documented. Several results contradict what
+the documentation implies, and all of them were established by compiling and running code rather
+than by reading. The full set is in [`docs/RECON.md`](docs/RECON.md); these are the ones that changed
+the design.
 
-- **`AnalysisContext.contextualStrings` is a no-op on `SpeechTranscriber`.** Measured byte-identical
-  output across four audio files and four configurations. It works on `DictationTranscriber`, which
-  is why this app uses that module. The entire dictionary-biasing feature depends on the distinction.
-- **Vocabulary biasing degrades with list length.** A 9-term list fixed proper nouns that a 200-term
-  list did not, and setup cost scales from 6 ms to 577 ms. Hence the 50-term cap, and hence the
-  second correction pass — biasing is a nudge, not a promise.
+**`contextualStrings` is a no-op on `SpeechTranscriber`.** Measured byte-identical output across four
+audio files and four configurations. It works on `DictationTranscriber` — which is why Edict uses
+that module, and why the dictionary's biasing layer exists at all. The distinction is undocumented.
 
-## Status
+**Vocabulary biasing gets *worse* with more terms.** A 9-term list fixed proper nouns that a
+200-term list did not, and analyzer setup grows from 6 ms to 577 ms. Hence the 50-term cap, and hence
+the second correction pass behind it. Biasing is a nudge, not a promise.
 
-The engine, dictionary, history and UI all work. Injection into other apps is implemented against a
-verified strategy ladder but has not yet been exercised end-to-end with permissions granted.
+**The Accessibility API reports success on writes it silently ignores.** Electron apps return
+`kAXErrorSuccess` and do nothing. So every insertion is verified by reading back, and an app that
+cannot be verified is demoted to paste-only and *remembered*. That turns a hardcoded blocklist into
+something self-healing.
+
+**Volatile results replace, finals append.** Naive concatenation produced 7,310 characters where 412
+was correct — a 17.7× bloat.
+
+**One analyzer per utterance, never reused.** `finalize` deadlocks forever while the input stream is
+open, and `start()` on a finished analyzer silently no-ops, losing the utterance with no error.
+
+**The two modules have different locale sets** — 45 versus 54. Indonesian exists only in
+`DictationTranscriber`. Imports prefer `SpeechTranscriber` (4.2% word error at 66× realtime, against
+10.1% at 15×) and fall back when the locale is uncovered.
+
+## What it deliberately does not do
+
+**Speaker identification.** Apple's Speech framework ships three modules — `SpeechTranscriber`,
+`DictationTranscriber`, `SpeechDetector` — and none separates voices. A multi-person recording
+arrives as one block of text with no names and no turn breaks. The app states this where you would
+look for it rather than letting you find out on a meeting recording. Doing it properly needs Whisper
+plus pyannote, which is gigabytes of weights against this app's 7 MB.
+
+**Automatic language detection.** `DictationTranscriber` takes a fixed locale and has no
+language-identification head. The only multilingual entry in the framework is `mul_IN`, on the module
+that has no Indonesian. Hence the ⇧⌥ shortcut instead.
+
+Both would fit behind the `TranscriptionEngine` seam in
+[`Engine/Transcriber.swift`](Sources/EdictKit/Engine/Transcriber.swift), which exists for exactly
+that reason.
+
+## How it stays small
+
+| | |
+|---|---|
+| Executable | 6.0 MB |
+| Icon | 0.9 MB |
+| **Total bundle** | **7.0 MB** |
+| Embedded frameworks | **none** |
+
+Every dependency resolves to `/System` — AppKit, SwiftUI, AVFoundation, Speech, CoreGraphics, IOKit.
+The speech models are the OS's, shared by every app that asks, and managed by it.
+
+For comparison: MacWhisper ships Whisper weights measured in gigabytes.
+
+## Repo layout
+
+```
+Sources/EdictKit/
+  App/       scene graph, app model, the dictation controller
+  Engine/    hotkey tap, audio capture, speech, text injection, file import
+  Data/      settings, dictionary, corrector, history, export
+  Design/    tokens, components, VU meter, waveform
+  Views/     main window, history, dictionary, import, settings, permissions
+Sources/Edict/          thin launcher; calls EdictApp.main()
+Tests/EdictKitTests/    185 tests in 17 suites
+docs/                   RECON.md, CONTRACTS.md, design system
+scripts/build-app.sh    swift build → signed, launchable .app
+```
+
+Everything real lives in the `EdictKit` library so the corrector, stores and exporters are unit
+testable; the executable only calls `EdictApp.main()`.
+
+## Design
+
+The direction is a **1980s portable field recorder** — Sony TC-D5, Marantz PMD, Nakamichi, Braun.
+Brushed aluminium and matte plastic, warm greys and cream, one red for the record lamp, amber and
+green for level. Buttons that look pressed rather than tinted. The recording indicator is a VU meter
+with a needle on a printed arc, not a progress bar.
+
+It is defined as tokens before any view exists — colour, type, spacing, radius, border, shadow,
+motion — and no view is permitted a one-off value. The needle's ballistics are the measured ANSI
+C16.5 integration time, not an invented animation curve. See
+[`docs/DESIGN-TOKENS.md`](docs/DESIGN-TOKENS.md) and
+[`docs/DESIGN-COMPONENTS.md`](docs/DESIGN-COMPONENTS.md).
+
+## Documentation
+
+- [`docs/RECON.md`](docs/RECON.md) — empirical findings from probing these APIs
+- [`docs/CONTRACTS.md`](docs/CONTRACTS.md) — interfaces, and the amendments that override them
+- [`docs/DESIGN-TOKENS.md`](docs/DESIGN-TOKENS.md) · [`docs/DESIGN-COMPONENTS.md`](docs/DESIGN-COMPONENTS.md)
 
 ## Licence
 
