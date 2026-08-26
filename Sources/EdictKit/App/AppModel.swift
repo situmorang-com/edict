@@ -534,9 +534,23 @@ public final class AppModel {
                 duration: item.info?.duration,
                 isVideo: item.info?.hasVideo ?? false,
                 state: rowState(for: item),
+                note: note(for: item),
                 warning: item.warning
             )
         }
+    }
+
+    /// The neutral progress aside, when there is one to give.
+    ///
+    /// Only a dual pass has one, and only because only a dual pass can *measure* its position: it
+    /// knows how many sections there are before it starts. The single-pass route deliberately says
+    /// nothing here, because everything it could say would be the elapsed-time estimate the bar is
+    /// already showing (`ImportQueue.progressNote`).
+    private func note(for item: ImportQueue.Item) -> String? {
+        guard item.id == importQueue.runningItemID,
+              case .transcribingSections(let done, let total) = importQueue.runningPhase,
+              total > 0 else { return nil }
+        return "Two languages per section — \(done) of \(total) passes done"
     }
 
     private func rowState(for item: ImportQueue.Item) -> ImportQueueRow.State {

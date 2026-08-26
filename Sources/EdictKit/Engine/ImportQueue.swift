@@ -72,6 +72,11 @@ public final class ImportQueue {
         case reading(Double)
         /// Everything is queued; the model is working through it.
         case transcribing
+        /// A dual pass, which unlike the single pass can say where it actually is: `done` of `total`
+        /// transcription passes finished, two per section. Reported separately from `transcribing`
+        /// because the number is a measurement rather than an estimate — see
+        /// `DualPassImporter.progressNote`.
+        case transcribingSections(done: Int, total: Int)
     }
 
     /// One row of the queue.
@@ -121,10 +126,41 @@ public final class ImportQueue {
         /// Wall clock for the whole file: open, decode, transcribe, finalize.
         public var wallSeconds: Double
 
+        /// How much of the audio became words, and one sentence about it. Always present — a good
+        /// transcript answers `isConcerning == false` and the UI shows nothing.
+        public var quality: RecognitionQuality
+
+        /// Locales that produced text, by share of recognised audio, descending.
+        ///
+        /// **Empty for a single-pass import**, where the queue has no business knowing the language:
+        /// the caller picked one locale and it is the only one that could have produced anything, so
+        /// repeating it here would be a second source of truth to disagree with the first.
+        public var localeIdentifiers: [String]
+
+        /// Per-section verdicts, empty unless a dual pass ran.
+        public var sections: [DualPassSection]
+
+        /// True when this file went through two passes per section.
+        public var wasDualPass: Bool { !sections.isEmpty }
+
         /// End-to-end speed, e.g. 18.4 means an hour of audio in 3 minutes 15. This is the number
         /// worth quoting, not `ImportStats.realtimeFactor`, which only covers decoding.
         public var realtimeFactor: Double {
             wallSeconds > 0 ? info.duration / wallSeconds : 0
+        }
+    }
+
+    /// One finished dual-pass job, as the injected closure hands it back.
+    public struct DualPassJob: Sendable {
+        public var info: AudioFileInfo
+        public var outcome: DualPassOutcome
+        /// Wall clock for decode + segment + every pass.
+        public var wallSeconds: Double
+
+        public init(info: AudioFileInfo, outcome: DualPassOutcome, wallSeconds: Double) {
+            self.info = info
+            self.outcome = outcome
+            self.wallSeconds = wallSeconds
         }
     }
 
@@ -152,17 +188,30 @@ public final class ImportQueue {
         /// be tested with two closures.
         public var cancelActive: (@Sendable () async -> Void)?
 
+        /// The whole dual-pass job for one file, or `nil` when dual pass is switched off entirely.
+        ///
+        /// It owns the decode as well as the transcription because the two are inseparable there:
+        /// `SpeechSegmenter` needs the whole buffer, and each section is replayed twice, so the
+        /// streaming reader the single-pass route uses is not applicable. Returning `nil` *from the
+        /// closure* means "not this file" — a second language whose model is still downloading, say —
+        /// and the queue quietly runs the ordinary single pass instead rather than failing the file.
+        public var dualPass: (
+            @Sendable (URL, DualPassImporter.Reporting) async throws -> DualPassJob?
+        )?
+
         public init(
             analyzerFormat: @Sendable @escaping () async -> AVAudioFormat?,
             transcribe: @Sendable @escaping (
                 AsyncStream<AnalyzerInput>,
                 @escaping @Sendable (TranscriptionUpdate) -> Void
             ) async throws -> TranscriptionOutcome,
-            cancelActive: (@Sendable () async -> Void)? = nil
+            cancelActive: (@Sendable () async -> Void)? = nil,
+            dualPass: (@Sendable (URL, DualPassImporter.Reporting) async throws -> DualPassJob?)? = nil
         ) {
             self.analyzerFormat = analyzerFormat
             self.transcribe = transcribe
             self.cancelActive = cancelActive
+            self.dualPass = dualPass
         }
     }
 
@@ -224,6 +273,10 @@ public final class ImportQueue {
     /// merely ends the audio stream — the engine then finalizes normally and hands back the partial
     /// text, which for an explicit cancel must be thrown away rather than saved.
     private var cancelledIDs: Set<Item.ID> = []
+    /// The dual-pass job in flight, so `cancel` can stop it. A dual pass has no importer of its own
+    /// to reach into — it owns one privately — so cancelling the *task* is the only lever, and
+    /// `DualPassImporter.run` checks for cancellation between sections.
+    private var runningDualTask: Task<DualPassJob?, Error>?
 
     /// Ticks the running item's estimated progress. Cancelled when the item finishes.
     private var ticker: Task<Void, Never>?
@@ -311,6 +364,7 @@ public final class ImportQueue {
             // finalized audio nobody wanted.
             let importer = runningImporter
             let abort = environment.cancelActive
+            runningDualTask?.cancel()
             Task { [weak self] in
                 await importer?.cancel()
                 // Re-check ownership before touching the shared engine. The item's `transcribe`
@@ -379,6 +433,7 @@ public final class ImportQueue {
         ticker = nil
         runningItemID = nil
         runningImporter = nil
+        runningDualTask = nil
         runningPhase = nil
         runningStartedAt = nil
         runningText = ""
@@ -397,22 +452,36 @@ public final class ImportQueue {
         runningStartedAt = ContinuousClock.now
         runningDuration = items[index].info?.duration ?? 0
         items[index].state = .running(progress: 0)
-        startTicker(for: id)
 
         let began = ContinuousClock.now
-        let importer = AudioFileImporter(url: url, analyzerFormat: await environment.analyzerFormat())
-        runningImporter = importer
 
+        // Registered before either route runs, so an early `return` out of the dual-pass branch
+        // still tears the running-item state down.
         defer {
             ticker?.cancel()
             ticker = nil
             runningImporter = nil
+            runningDualTask = nil
             runningItemID = nil
             runningPhase = nil
             runningStartedAt = nil
             runningDuration = 0
             runningText = ""
         }
+
+        // Dual pass owns its own decode, so it has to be offered the file before the streaming
+        // reader is built. It declines — returns nil — for a file it cannot serve, and the ordinary
+        // single pass then runs as though the switch had been off.
+        if let dualPass = environment.dualPass,
+           await runDualPass(id, url: url, filename: filename, began: began, job: dualPass) {
+            return
+        }
+
+        // Only the single pass needs the elapsed-time estimate: a dual pass reports measured
+        // progress and a ticker fighting it would only make the bar less honest.
+        startTicker(for: id)
+        let importer = AudioFileImporter(url: url, analyzerFormat: await environment.analyzerFormat())
+        runningImporter = importer
 
         do {
             let info = try await importer.open()
@@ -443,16 +512,29 @@ public final class ImportQueue {
             // throwing away nine minutes of a ten-minute transcript.
             let warning = readFailure?.errorDescription
             let elapsed = ContinuousClock.now - began
+            let segments = Self.segments(from: outcome.words)
+            // Taken before the importer is released, and released straight after: the probe is the
+            // decoded audio, so it is the one thing in this method with a real memory cost.
+            let probe = await importer.speechProbe
+            await importer.releaseProbe()
             let result = Result(
                 itemID: id,
                 url: url,
                 info: info,
                 outcome: outcome,
-                segments: Self.segments(from: outcome.words),
+                segments: segments,
                 stats: stats,
                 incompleteReason: warning,
                 wallSeconds: Double(elapsed.components.seconds)
-                    + Double(elapsed.components.attoseconds) / 1e18
+                    + Double(elapsed.components.attoseconds) / 1e18,
+                quality: await Self.assess(
+                    text: outcome.text,
+                    audioDuration: info.duration > 0 ? info.duration : outcome.audioDuration,
+                    probe: probe,
+                    segments: segments
+                ),
+                localeIdentifiers: [],
+                sections: []
             )
 
             if outcome.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let readFailure {
@@ -494,6 +576,253 @@ public final class ImportQueue {
             finish(id, state: .failed(reason: reason), stats: await importer.statistics)
             Log.data.error("import failed: \(filename, privacy: .public): \(reason, privacy: .public)")
         }
+    }
+
+    // MARK: - The dual-pass route
+
+    /// Offer one file to the dual-pass job.
+    ///
+    /// - Returns: true when the item reached a terminal state here — done, failed or cancelled — and
+    ///   false when the file must go the ordinary single-pass route instead. The second answer is not
+    ///   a failure: the injected closure returns `nil` for a file it cannot serve (no second language
+    ///   configured, a model still downloading, a format mismatch between the two modules), and the
+    ///   user gets a transcript from one model rather than an error about two.
+    private func runDualPass(
+        _ id: Item.ID,
+        url: URL,
+        filename: String,
+        began: ContinuousClock.Instant,
+        job: @Sendable @escaping (URL, DualPassImporter.Reporting) async throws -> DualPassJob?
+    ) async -> Bool {
+        let reporting = DualPassImporter.Reporting(
+            onProgress: { [weak self] fraction in
+                Task { @MainActor [weak self] in self?.setDualProgress(id, fraction) }
+            },
+            onText: { [weak self] text in
+                Task { @MainActor [weak self] in
+                    guard self?.runningItemID == id else { return }
+                    self?.runningText = text
+                }
+            },
+            onSections: { [weak self] done, total in
+                Task { @MainActor [weak self] in
+                    guard self?.runningItemID == id else { return }
+                    self?.runningPhase = .transcribingSections(done: done, total: total)
+                }
+            }
+        )
+
+        // Wrapped in a `Task` purely so `cancel(_:)` has something to cancel: the dual pass owns its
+        // decode privately, so there is no importer for the queue to reach into, and
+        // `DualPassImporter.run` checks for cancellation between sections.
+        let task = Task { try await job(url, reporting) }
+        runningDualTask = task
+
+        let outcome: DualPassJob?
+        do {
+            outcome = try await task.value
+        } catch is CancellationError {
+            finish(id, state: .cancelled, stats: nil)
+            return true
+        } catch {
+            let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            // A dual pass that failed outright is not a reason to refuse the file: fall through and
+            // let one model have a go. The user asked for a transcript, not for a language contest.
+            Log.data.error("""
+                dual pass failed, falling back to a single pass: \
+                \(filename, privacy: .public): \(reason, privacy: .public)
+                """)
+            runningDualTask = nil
+            return false
+        }
+        runningDualTask = nil
+
+        guard let outcome else { return false }
+        if cancelledIDs.contains(id) {
+            finish(id, state: .cancelled, stats: outcome.outcome.stats)
+            Log.data.info("import cancelled: \(filename, privacy: .public)")
+            return true
+        }
+
+        update(id) { $0.info = outcome.info }
+        let info = outcome.info
+        let dual = outcome.outcome
+        let warning = dual.failure?.errorDescription
+
+        if dual.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let failure = dual.failure {
+            finish(
+                id,
+                state: .failed(reason: failure.errorDescription ?? "the file could not be read"),
+                stats: dual.stats
+            )
+            return true
+        }
+
+        let elapsed = ContinuousClock.now - began
+        let result = Result(
+            itemID: id,
+            url: url,
+            info: info,
+            // A dual pass has no single `TranscriptionOutcome` — it has one per section per language —
+            // so this is the stitched equivalent, assembled so every existing reader of `Result`
+            // keeps working unchanged.
+            outcome: TranscriptionOutcome(
+                text: dual.text,
+                confidence: dual.meanConfidence,
+                // The whole job, as for a single-pass import: for a file this is the number that
+                // makes the realtime factor legible, not an end-of-speech latency.
+                latency: outcome.wallSeconds,
+                audioDuration: info.duration,
+                words: dual.segments.map {
+                    WordConfidence(
+                        text: $0.text,
+                        confidence: $0.confidence,
+                        startSeconds: $0.start,
+                        endSeconds: $0.end
+                    )
+                },
+                lowConfidenceWords: dual.lowConfidenceWords
+            ),
+            segments: dual.segments,
+            stats: dual.stats,
+            incompleteReason: warning,
+            wallSeconds: Double(elapsed.components.seconds)
+                + Double(elapsed.components.attoseconds) / 1e18,
+            quality: Self.assess(
+                text: dual.text,
+                audioDuration: info.duration,
+                speechDuration: dual.speechDuration,
+                segments: dual.segments
+            ),
+            localeIdentifiers: dual.localeIdentifiers,
+            sections: dual.sections
+        )
+
+        let transcriptID = onFinish?(result)
+        update(id) {
+            $0.transcriptID = transcriptID
+            $0.warning = warning
+            $0.stats = dual.stats
+            $0.state = .done
+        }
+        Log.data.info(
+            """
+            dual-pass import done: \(filename, privacy: .public) \
+            \(String(format: "%.1f", info.duration), privacy: .public)s audio in \
+            \(String(format: "%.1f", result.wallSeconds), privacy: .public)s \
+            (\(String(format: "%.1f", result.realtimeFactor), privacy: .public)x) \
+            sections=\(dual.sections.count, privacy: .public) \
+            passes=\(dual.passesRun, privacy: .public) \
+            locales=\(dual.localeIdentifiers.joined(separator: "+"), privacy: .public) \
+            quality=\(result.quality.verdict.rawValue, privacy: .public)\
+            \(warning == nil ? "" : " INCOMPLETE", privacy: .public)
+            """
+        )
+        return true
+    }
+
+    /// Measured dual-pass progress, straight onto the bar. Monotonic for the same reason `tick` is.
+    private func setDualProgress(_ id: Item.ID, _ fraction: Double) {
+        guard id == runningItemID else { return }
+        let clamped = min(0.99, max(0, fraction))
+        update(id) { item in
+            guard case .running(let current) = item.state else { return }
+            if clamped > current { item.state = .running(progress: clamped) }
+        }
+    }
+
+    // MARK: - Recognition quality
+
+    /// Words in a transcript, counted the same way `Transcript.wordCount` does so the number the
+    /// warning quotes and the number the history row shows cannot disagree.
+    nonisolated static func wordCount(_ text: String) -> Int {
+        text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+    }
+
+    /// Assess a finished import against both denominators, and pick between them on evidence.
+    ///
+    /// `RecognitionQuality` takes one denominator and both candidates are wrong in a different
+    /// direction, which is why this is a decision and not a parameter:
+    ///
+    /// * **Wall clock** over-flags a recording that is mostly silence. A two-minute memo with ninety
+    ///   seconds of thinking-pauses reads as 40 words a minute and gets warned about, which is the
+    ///   false alarm that teaches users to ignore the real ones.
+    /// * **Detected speech** over-*forgives* far-field audio, and does so systematically: the same
+    ///   quiet distant voices that the recogniser cannot read also sit near `SpeechSegmenter`'s
+    ///   energy gate, so the denominator shrinks by roughly the amount the numerator did.
+    ///
+    /// Measured, on the 300-second slice of the real 70-minute meeting, transcribed per section:
+    ///
+    ///     basis            wpm    verdict     mean word confidence   share of words under 0.30
+    ///     detected speech  112    good                        0.288                       57 %
+    ///     wall clock        49    sparse                      0.288                       57 %
+    ///
+    /// against the two recordings that are genuinely fine:
+    ///
+    ///     clean bilingual, 17 s    158 wpm  good   confidence 0.941   0 % under 0.30
+    ///     English script,  377 s   188 wpm  good   confidence 0.929   0 % under 0.30
+    ///
+    /// So confidence is what separates the two failures the rate cannot. A recording is let off only
+    /// when detected speech explains the shortfall **and** the words that did come back are words the
+    /// engine was sure of; otherwise the wall-clock verdict stands. `Threshold.lowConfidence` is the
+    /// gate, not a number invented here — RECON measured a misheard "Visa" at 0.05 against 0.998 for
+    /// a correct word.
+    ///
+    /// A `nil` confidence — which is every Indonesian transcript, since `DictationTranscriber` on
+    /// `id_ID` reports none — is treated as passing. That follows `RecognitionQuality`'s own stance
+    /// that no verdict may *require* this number, and it fails in the quiet direction: a
+    /// hard-to-read Indonesian recording is judged on detected speech alone.
+    public nonisolated static func assess(
+        text: String,
+        audioDuration: TimeInterval,
+        speechDuration: TimeInterval?,
+        segments: [TranscriptSegment]
+    ) -> RecognitionQuality {
+        let words = wordCount(text)
+        let byWallClock = RecognitionQuality.assess(
+            wordCount: words,
+            audioDuration: audioDuration,
+            speechDuration: nil,
+            segments: segments
+        )
+        guard let speechDuration else { return byWallClock }
+        let bySpeech = RecognitionQuality.assess(
+            wordCount: words,
+            audioDuration: audioDuration,
+            speechDuration: speechDuration,
+            segments: segments
+        )
+        let confident = (bySpeech.meanConfidence ?? 1) > RecognitionQuality.Threshold.lowConfidence
+        return (bySpeech.verdict == .good && confident) ? bySpeech : byWallClock
+    }
+
+    /// The same assessment for the streaming single-pass route, which has to run `SpeechSegmenter`
+    /// over its probe first.
+    ///
+    /// Off the main actor: cheap — 39 ms for the whole 70-minute meeting, so ~15 ms at the probe's
+    /// 25-minute ceiling — but a main-actor hitch of even that size while a queue is drawing has no
+    /// business being synchronous. A `nil` probe means the file was longer than the budget, and the
+    /// wall-clock verdict then stands on its own.
+    nonisolated static func assess(
+        text: String,
+        audioDuration: TimeInterval,
+        probe: SpeechProbe?,
+        segments: [TranscriptSegment]
+    ) async -> RecognitionQuality {
+        let speech: TimeInterval? = await {
+            guard let probe else { return nil }
+            return await Task.detached(priority: .utility) {
+                probe.samples.withUnsafeBufferPointer {
+                    SpeechSegmenter().speechDuration(inPCM: $0, sampleRate: probe.sampleRate)
+                }
+            }.value
+        }()
+        return assess(
+            text: text,
+            audioDuration: audioDuration,
+            speechDuration: speech,
+            segments: segments
+        )
     }
 
     /// Run the stream through the engine, tolerating the engine being momentarily busy.

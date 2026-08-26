@@ -197,6 +197,73 @@ public enum AudioImportError: Error, Sendable, Hashable, LocalizedError {
     }
 }
 
+// MARK: - Decoded audio
+
+/// A whole file decoded into the analyzer's own format and held in memory.
+///
+/// Only the dual-pass import asks for this, and only because it has no alternative: `SpeechSegmenter`
+/// takes a whole buffer (its gate is a percentile of the file's own energy distribution, so it cannot
+/// be computed from a sliding window), and each section then has to be handed to the analyzer twice,
+/// which means the samples must still be there after the reader has finished.
+///
+/// **The cost is linear and worth stating plainly.** 16 kHz mono Int16 is 32 KB per second of audio:
+/// 0.5 MB for the 17-second bilingual fixture, 12 MB for a ten-minute call, about 134 MB for the
+/// 70-minute meeting. That is the main reason dual pass is off by default. The ordinary single-pass
+/// import is unchanged and still streams with a flat ~8-second window.
+public struct DecodedAudio: Sendable {
+    /// Interleaved — which for one channel means plain — Int16 at `sampleRate`.
+    public var samples: [Int16]
+    public var sampleRate: Double
+    /// Read counters for the decode, so a caller can report throughput and spot dropped audio.
+    public var stats: ImportStats
+    /// Why the decode stopped early, or `nil` when the whole file was read. The samples up to that
+    /// point are real.
+    public var failure: AudioImportError?
+
+    public init(samples: [Int16], sampleRate: Double, stats: ImportStats, failure: AudioImportError? = nil) {
+        self.samples = samples
+        self.sampleRate = sampleRate
+        self.stats = stats
+        self.failure = failure
+    }
+
+    public var duration: TimeInterval {
+        sampleRate > 0 ? Double(samples.count) / sampleRate : 0
+    }
+
+    /// Frames for `[start, end)` in seconds, clamped to what was actually decoded.
+    public func range(from start: TimeInterval, to end: TimeInterval) -> Range<Int> {
+        guard sampleRate > 0, !samples.isEmpty else { return 0..<0 }
+        let lo = min(samples.count, max(0, Int((start * sampleRate).rounded(.down))))
+        let hi = min(samples.count, max(lo, Int((end * sampleRate).rounded(.up))))
+        return lo..<hi
+    }
+}
+
+/// Enough decoded audio to ask `SpeechSegmenter` how many seconds of it are speech, and nothing else.
+///
+/// **Why the single-pass path collects this at all.** `RecognitionQuality` measures words per minute,
+/// and the denominator decides whether a quiet recording is *badly recognised* or merely *quiet*. Its
+/// preferred denominator is detected speech; its fallback is wall clock. On wall clock a two-minute
+/// voice memo with ninety seconds of thinking-pauses in it reads as 40 wpm and gets flagged, which is
+/// exactly the false alarm that teaches users to ignore the real ones.
+///
+/// **Why it is capped.** Accumulating the samples costs 32 KB per second, so the budget is a real
+/// ceiling and past it this comes back `nil` and the assessment falls back to wall clock. That is the
+/// right way round: the wall-clock estimate is *most* wrong on short files (where a single silent
+/// stretch is a large share of the timeline) and converges on long ones (an hour-long meeting with
+/// 40 % dead air still reads about 90 wpm, comfortably unflagged). So the accurate basis is spent
+/// where it changes the answer.
+public struct SpeechProbe: Sendable {
+    public var samples: [Int16]
+    public var sampleRate: Double
+
+    public init(samples: [Int16], sampleRate: Double) {
+        self.samples = samples
+        self.sampleRate = sampleRate
+    }
+}
+
 // MARK: - Importer
 
 /// One file, read once. Create an instance per file and throw it away afterwards.
@@ -247,17 +314,28 @@ public actor AudioFileImporter {
     private var lastProgressAt: ContinuousClock.Instant?
     private var lastProgressValue: Double = -1
 
+    /// Ceiling on the speech probe, in samples. See `SpeechProbe`.
+    private let probeBudgetSamples: Int
+    /// Target-format samples kept for the probe. Discarded the moment the budget is exceeded, so the
+    /// high-water mark is the budget and not one chunk more.
+    private var probeSamples: [Int16] = []
+    private var probeOverflowed = false
+
     /// - Parameters:
     ///   - analyzerFormat: `SpeechEngine.bestAudioFormat()`. `nil` falls back to 16 kHz mono Int16,
     ///     which is what that call has always returned on this machine.
     ///   - chunkSeconds: size of the buffers handed to the analyzer.
     ///   - bufferedSeconds: read-ahead window. The reader runs this far in front of the analyzer and
     ///     then waits, which is what keeps memory flat on an hour-long file.
+    ///   - speechProbeBudgetBytes: how much decoded audio may be retained for the recognition-quality
+    ///     probe. 48 MB is 25 minutes at 16 kHz mono Int16; past it the probe is abandoned and
+    ///     `RecognitionQuality` falls back to wall clock. Zero disables the probe entirely.
     public init(
         url: URL,
         analyzerFormat: AVAudioFormat?,
         chunkSeconds: Double = 0.100,
-        bufferedSeconds: Double = 8
+        bufferedSeconds: Double = 8,
+        speechProbeBudgetBytes: Int = 48 << 20
     ) {
         self.url = url
         self.filename = url.lastPathComponent
@@ -270,6 +348,7 @@ public actor AudioFileImporter {
         self.target = format
         self.chunkFrames = max(160, AVAudioFrameCount((format.sampleRate * max(0.010, chunkSeconds)).rounded()))
         self.bufferedSeconds = max(0.5, bufferedSeconds)
+        self.probeBudgetSamples = max(0, speechProbeBudgetBytes) / MemoryLayout<Int16>.size
         self.stats.sampleRate = format.sampleRate
     }
 
@@ -599,6 +678,7 @@ public actor AudioFileImporter {
     }
 
     private func deliver(chunk: AVAudioPCMBuffer) async -> Bool {
+        collectProbe(from: chunk)
         guard let channel else { return false }
         // `AnalyzerInput` is `Sendable` and `chunk` is a buffer we allocated, so nothing the reader
         // owns ever crosses the isolation boundary — the same rule the microphone path follows
@@ -618,6 +698,131 @@ public actor AudioFileImporter {
             }
         }
         return false
+    }
+
+    // MARK: - Recognition-quality probe
+
+    /// Keep a copy of the target-format samples until the budget runs out. See `SpeechProbe`.
+    private func collectProbe(from chunk: AVAudioPCMBuffer) {
+        guard probeBudgetSamples > 0, !probeOverflowed else { return }
+        let frames = Int(chunk.frameLength)
+        guard frames > 0, let data = chunk.int16ChannelData else { return }
+        guard probeSamples.count + frames <= probeBudgetSamples else {
+            // Freed rather than truncated: a prefix of the file would give the segmenter a noise
+            // floor and a speech level measured over the wrong material, and a *wrong* denominator
+            // is worse than the honest wall-clock fallback.
+            probeOverflowed = true
+            probeSamples = []
+            Log.audio.debug("import \(self.filename, privacy: .public): speech probe over budget, dropped")
+            return
+        }
+        probeSamples.append(contentsOf: UnsafeBufferPointer(start: data[0], count: frames))
+    }
+
+    /// Decoded audio for the recognition-quality measurement, or `nil` when there is none to give —
+    /// nothing read yet, or the file was longer than the probe budget.
+    public var speechProbe: SpeechProbe? {
+        guard !probeOverflowed, !probeSamples.isEmpty else { return nil }
+        return SpeechProbe(samples: probeSamples, sampleRate: target.sampleRate)
+    }
+
+    /// Release the probe's memory once the caller has taken what it needs.
+    public func releaseProbe() {
+        probeSamples = []
+    }
+
+    // MARK: - Whole-file decode
+
+    /// Decode the entire file into memory in the analyzer's format.
+    ///
+    /// This is the dual-pass entry point and the *alternative* to `start()`, not a companion to it —
+    /// an `AVAssetReader` cannot be rewound, so an instance does one or the other. Never throws for
+    /// a partial read: a reader that fails halfway leaves real audio behind, and `DecodedAudio.failure`
+    /// says so while the samples stay usable. It throws only when there is nothing at all — the file
+    /// could not be opened, or the caller already started a read.
+    ///
+    /// See `DecodedAudio` for the memory cost, which is why this is not the default path.
+    public func decodeAll(
+        onProgress: @Sendable @escaping (Double) -> Void
+    ) async throws -> DecodedAudio {
+        if channel != nil || producer != nil {
+            throw AudioImportError.readFailed(filename: filename, reason: "already started")
+        }
+        let info = try await open()
+        guard let reader, let output = trackOutput else {
+            throw AudioImportError.unreadable(filename: filename, reason: "the reader was not configured")
+        }
+        if isCancelled { throw AudioImportError.cancelled(filename: filename) }
+
+        let began = ContinuousClock.now
+        var samples: [Int16] = []
+        // Pre-sized from the asset's own duration so an hour-long file is not grown by doubling from
+        // empty, which would transiently need 1.5x the final allocation at the worst moment.
+        if info.duration > 0, info.duration.isFinite {
+            samples.reserveCapacity(Int(min(info.duration + 1, 6 * 3600) * target.sampleRate))
+        }
+
+        while !isCancelled, !Task.isCancelled {
+            guard let sample = output.copyNextSampleBuffer() else { break }
+            stats.readerBuffers += 1
+            report(progress: Self.fraction(of: sample, duration: info.duration), onProgress: onProgress)
+
+            guard let decoded = pcmBuffer(from: sample) else {
+                stats.conversionFailures += 1
+                continue
+            }
+            guard let converted = convertToTarget(decoded) else {
+                stats.conversionFailures += 1
+                continue
+            }
+            let frames = Int(converted.frameLength)
+            guard frames > 0, let data = converted.int16ChannelData else { continue }
+            samples.append(contentsOf: UnsafeBufferPointer(start: data[0], count: frames))
+            stats.chunks += 1
+            stats.frames += frames
+        }
+
+        switch reader.status {
+        case .failed:
+            let reason = reader.error?.localizedDescription ?? "unknown reader failure"
+            if failure == nil { failure = .readFailed(filename: filename, reason: reason) }
+            Log.audio.error("import \(self.filename, privacy: .public): decode failed: \(reason, privacy: .public)")
+        case .cancelled:
+            if failure == nil { failure = .cancelled(filename: filename) }
+        default:
+            break
+        }
+        if isCancelled, failure == nil { failure = .cancelled(filename: filename) }
+
+        // Same unconditional teardown as `pump`: a reader left in `.reading` holds its decoder and
+        // file descriptor open for as long as the object lives.
+        reader.cancelReading()
+        self.reader = nil
+        self.trackOutput = nil
+        self.converter = nil
+        self.accumulator = nil
+
+        let elapsed = ContinuousClock.now - began
+        stats.readWallSeconds = Double(elapsed.components.seconds)
+            + Double(elapsed.components.attoseconds) / 1e18
+        if failure == nil { onProgress(1.0) }
+
+        Log.audio.info(
+            """
+            import \(self.filename, privacy: .public) decoded \
+            \(String(format: "%.2f", Double(samples.count) / self.target.sampleRate), privacy: .public)s in \
+            \(String(format: "%.2f", self.stats.readWallSeconds), privacy: .public)s \
+            (\(String(format: "%.1f", self.stats.realtimeFactor), privacy: .public)x) \
+            \(samples.count * 2 / 1_048_576, privacy: .public)MB
+            """
+        )
+
+        return DecodedAudio(
+            samples: samples,
+            sampleRate: target.sampleRate,
+            stats: stats,
+            failure: failure
+        )
     }
 
     // MARK: - CMSampleBuffer → AVAudioPCMBuffer

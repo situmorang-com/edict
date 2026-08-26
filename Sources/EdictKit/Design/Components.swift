@@ -1839,6 +1839,15 @@ public struct TranscriptRow: View {
                 .strokeBorder(D.color.alert, lineWidth: increasedContrast ? D.border.thin : D.border.hairline)
                 .frame(width: M.flagSize, height: M.flagSize)
                 .help(Self.flagPhrase(.incomplete, corrections: 0))
+        case .underRead:
+            // A hollow *triangle*, because both square flags are already spent — filled for "not
+            // inserted", hollow for "may be incomplete" — and a third square would be
+            // indistinguishable from either at 6pt. Shape carries the meaning here; colour only
+            // carries severity (spec §0.4).
+            FlagTriangle()
+                .stroke(D.color.alert, lineWidth: increasedContrast ? D.border.thin : D.border.hairline)
+                .frame(width: M.flagSize, height: M.flagSize)
+                .help(Self.flagPhrase(.underRead, corrections: 0))
         case .corrected:
             // Amber-ink family, deliberately *not* `D.color.alert`: the dictionary firing is the
             // feature working, not a warning — and deliberately not red.
@@ -1852,11 +1861,19 @@ public struct TranscriptRow: View {
         }
     }
 
-    private enum FlagKind { case notInserted, incomplete, corrected, none }
+    private enum FlagKind { case notInserted, incomplete, underRead, corrected, none }
 
+    /// Priority order, and it is an argument rather than an ordering.
+    ///
+    /// `underRead` sits above `corrected` because a transcript that is missing passages is a worse
+    /// problem than one the dictionary edited, and below `incomplete` because dropped buffers name a
+    /// specific mechanical fault where an under-read is a judgement about the audio. It stays out of
+    /// the way of a good transcript entirely: `hasQualityConcern` is false at any plausible speaking
+    /// rate — see `RecognitionQuality` — and a flag most rows carry is a flag nobody reads.
     private var flagKind: FlagKind {
         if outcome.needsRecovery { return .notInserted }
         if transcript.droppedBuffers > 0 { return .incomplete }
+        if transcript.hasQualityConcern { return .underRead }
         if !transcript.corrections.isEmpty { return .corrected }
         return .none
     }
@@ -1865,8 +1882,23 @@ public struct TranscriptRow: View {
         switch kind {
         case .notInserted: "not inserted"
         case .incomplete: "may be incomplete"
+        case .underRead: "far fewer words than speech — select the row for the measurement"
         case .corrected: corrections == 1 ? "1 dictionary correction" : "\(corrections) dictionary corrections"
         case .none: ""
+        }
+    }
+
+    /// An upward hollow triangle. Drawn geometry rather than an SF Symbol for the same reason the two
+    /// squares are: at `M.flagSize` a symbol renders as a blur with a different optical weight from
+    /// the flags beside it.
+    private struct FlagTriangle: Shape {
+        func path(in rect: CGRect) -> Path {
+            var path = Path()
+            path.move(to: CGPoint(x: rect.midX, y: rect.minY))
+            path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+            path.closeSubpath()
+            return path
         }
     }
 

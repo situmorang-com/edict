@@ -79,18 +79,29 @@ public struct TranscriptSegment: Codable, Hashable, Sendable, Identifiable {
     /// indicative of a mishearing.
     public var confidence: Double?
 
+    /// Which locale actually produced this text, when that differs from segment to segment.
+    ///
+    /// `nil` for every transcript made in one pass, which is the overwhelming majority: there the
+    /// transcript's own `localeIdentifier` is the whole truth and repeating it on a thousand
+    /// segments would be a thousand copies of one fact. Non-nil only where a dual-pass import chose
+    /// per section, and *that* is the case where the transcript-level field cannot be the whole
+    /// truth — see `Transcript.localeIdentifiers`.
+    public var locale: String?
+
     public init(
         id: UUID = UUID(),
         start: TimeInterval,
         end: TimeInterval,
         text: String,
-        confidence: Double? = nil
+        confidence: Double? = nil,
+        locale: String? = nil
     ) {
         self.id = id
         self.start = start
         self.end = end
         self.text = text
         self.confidence = confidence
+        self.locale = locale
     }
 
     public var duration: TimeInterval { max(0, end - start) }
@@ -104,7 +115,7 @@ public struct TranscriptSegment: Codable, Hashable, Sendable, Identifiable {
     /// per entry with ids and 72 KB without. `init(from:)` mints a fresh one on load.
     // Spelled out because supplying `encode(to:)` suppresses the synthesised `CodingKeys`.
     // `id` stays in the enum so `init(from:)` can still read a file written by an older build.
-    enum CodingKeys: String, CodingKey { case id, start, end, text, confidence }
+    enum CodingKeys: String, CodingKey { case id, start, end, text, confidence, locale }
 
     public func encode(to encoder: any Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -112,6 +123,9 @@ public struct TranscriptSegment: Codable, Hashable, Sendable, Identifiable {
         try c.encode(end, forKey: .end)
         try c.encode(text, forKey: .text)
         try c.encodeIfPresent(confidence, forKey: .confidence)
+        // Omitted when nil, which is the single-pass case, so the 130 KB-per-entry measurement that
+        // justified dropping `id` is not quietly undone for every existing import.
+        try c.encodeIfPresent(locale, forKey: .locale)
     }
 
     // Lenient for the same reason as `Transcript`: a segment missing its id or confidence is worth
@@ -123,6 +137,7 @@ public struct TranscriptSegment: Codable, Hashable, Sendable, Identifiable {
         end = try c.decodeIfPresent(TimeInterval.self, forKey: .end) ?? start
         text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
         confidence = try c.decodeIfPresent(Double.self, forKey: .confidence)
+        locale = try? c.decodeIfPresent(String.self, forKey: .locale)
     }
 }
 
@@ -140,7 +155,25 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
     public var audioDuration: TimeInterval
     /// Wall clock from end-of-speech to final result. The number the blog post benchmarks.
     public var transcribeDuration: TimeInterval
+    /// The single locale this transcript is attributed to.
+    ///
+    /// For a dual-pass import that landed on more than one language this is the locale that won the
+    /// most *seconds of recognised audio*, and `localeIdentifiers` carries the rest. Dominant-by-audio
+    /// rather than by section count or word count on purpose: sections vary in length, and word
+    /// counts are exactly the quantity a weaker acoustic model deflates, so counting words would let
+    /// the language that transcribed *worse* look like the smaller share of the recording.
     public var localeIdentifier: String
+
+    /// Every locale that contributed text, ordered by that same share, descending — and **empty
+    /// whenever there is only one**, which is every single-pass transcript.
+    ///
+    /// This field exists because `localeIdentifier` alone would be a false claim about a mixed
+    /// transcript: a recording that is two-thirds Indonesian and one-third English is not an
+    /// Indonesian recording, and writing `id-ID` there and stopping would say it was. So the
+    /// dominant locale stays in the field every existing reader already understands, and the full
+    /// truth sits beside it where the UI can show "id-ID + en-US".
+    public var localeIdentifiers: [String]
+
     public var engine: String
     public var targetBundleID: String?
     public var targetAppName: String?
@@ -162,6 +195,15 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
     /// ones so they can be exported as subtitles.
     public var segments: [TranscriptSegment]
 
+    /// How much of the audio actually became words, and one sentence about it — or `nil` when the
+    /// transcript predates the measurement or there was nothing measurable to say.
+    ///
+    /// Stored rather than recomputed on read because the honest denominator is not recoverable
+    /// later: `RecognitionQuality` prefers *detected speech* from `SpeechSegmenter`, which needs the
+    /// decoded audio, and by the time a history row is drawn the file may not even exist. See
+    /// `RecognitionQuality` for the 70-minute meeting that made this necessary.
+    public var quality: RecognitionQuality?
+
     /// The engine identifier written into new transcripts. RECON §1: `DictationTranscriber`, not
     /// `SpeechTranscriber` — contextual-string biasing is a measured no-op on the latter.
     public static let currentEngine = "apple.dictationtranscriber"
@@ -180,6 +222,7 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         audioDuration: TimeInterval = 0,
         transcribeDuration: TimeInterval = 0,
         localeIdentifier: String = Settings.Default.localeIdentifier,
+        localeIdentifiers: [String] = [],
         engine: String = Transcript.currentEngine,
         targetBundleID: String? = nil,
         targetAppName: String? = nil,
@@ -187,7 +230,8 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         droppedBuffers: Int = 0,
         lowConfidenceWords: [String] = [],
         source: TranscriptSource = .dictated,
-        segments: [TranscriptSegment] = []
+        segments: [TranscriptSegment] = [],
+        quality: RecognitionQuality? = nil
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -197,6 +241,10 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         self.audioDuration = audioDuration
         self.transcribeDuration = transcribeDuration
         self.localeIdentifier = localeIdentifier
+        // Normalised here rather than trusted: a single-element list is the same fact as
+        // `localeIdentifier`, and `isMixedLanguage` reading `count > 1` must not depend on callers
+        // remembering that.
+        self.localeIdentifiers = localeIdentifiers.count > 1 ? localeIdentifiers : []
         self.engine = engine
         self.targetBundleID = targetBundleID
         self.targetAppName = targetAppName
@@ -205,6 +253,7 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         self.lowConfidenceWords = lowConfidenceWords
         self.source = source
         self.segments = segments
+        self.quality = quality
     }
 
     public var wordCount: Int {
@@ -222,6 +271,20 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
 
     /// True when there is timing information, i.e. when subtitle export is possible.
     public var hasSegments: Bool { !segments.isEmpty }
+
+    /// True when more than one language produced text — i.e. when `localeIdentifier` is a summary
+    /// rather than the whole story.
+    public var isMixedLanguage: Bool { localeIdentifiers.count > 1 }
+
+    /// Every locale that contributed, always non-empty: the mixed list where there is one, otherwise
+    /// the single attributed locale.
+    public var contributingLocales: [String] {
+        localeIdentifiers.isEmpty ? [localeIdentifier] : localeIdentifiers
+    }
+
+    /// True when the recogniser plainly under-read this audio and the UI owes the user a sentence.
+    /// A good transcript answers `false` and shows nothing — see `RecognitionQuality`.
+    public var hasQualityConcern: Bool { quality?.isConcerning == true }
 
     // Lenient decoding: `droppedBuffers` and `lowConfidenceWords` were added after the first schema,
     // `source` and `segments` after the second, and a history file is far too valuable to fail to
@@ -247,6 +310,11 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         // malformed or future-shaped value should degrade to the old behaviour, not lose the entry.
         source = (try? c.decode(TranscriptSource.self, forKey: .source)) ?? .dictated
         segments = (try? c.decode([TranscriptSegment].self, forKey: .segments)) ?? []
+        let locales = (try? c.decodeIfPresent([String].self, forKey: .localeIdentifiers)) ?? []
+        localeIdentifiers = locales.count > 1 ? locales : []
+        // `try?` for the same reason as the two above: a malformed quality block must cost the
+        // warning, never the entry. `RecognitionQuality`'s own decoder is lenient in the same way.
+        quality = try? c.decodeIfPresent(RecognitionQuality.self, forKey: .quality)
     }
 }
 

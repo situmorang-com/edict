@@ -370,6 +370,8 @@ private struct SecondLanguageSection: View {
                     modifierRow
                     languageTray
                     explanation
+                    SeamDivider(.horizontal)
+                    dualPass
                 }
             }
         }
@@ -521,6 +523,60 @@ private struct SecondLanguageSection: View {
 
             if let unavailable {
                 notice(unavailable)
+            }
+        }
+    }
+
+    // MARK: Dual pass, for files only
+
+    /// The one place the two languages can be used without the user's hands.
+    ///
+    /// It sits on *this* panel and not on the import panel because it is only meaningful once a
+    /// second language exists — it is the file counterpart of the extra key above, and the sentence
+    /// immediately above it ("Edict cannot tell which language you are speaking") is exactly the fact
+    /// this control has to be read against.
+    ///
+    /// **The wording is the feature.** There is no language identification anywhere in Apple's speech
+    /// framework, and a switch called anything like "detect language automatically" would be a claim
+    /// about the operating system that is not true. What actually happens is mechanical and worth
+    /// saying: the file is cut at its silences, every section is transcribed twice, and the two
+    /// transcripts are compared for the function words and affixes of the language each one claims.
+    /// So the label names what it does and the caption names its nature — a comparison of two
+    /// transcripts, with a stated fallback for when the comparison is not decisive.
+    private var dualPass: some View {
+        VStack(alignment: .leading, spacing: D.space.sm) {
+            RockerSwitch(
+                "Try both languages on imported files",
+                isOn: Binding(get: { settings.importDualPass },
+                              set: { settings.importDualPass = $0 }),
+                caption: "Transcribes each section of a file twice and keeps the closer match. "
+                       + "A comparison of two transcripts, not the model recognising a language."
+            )
+
+            Text("""
+                Live dictation is untouched by this — there, your hands choose. A file has no hands, \
+                so Edict cuts the recording at its pauses, transcribes every section in \
+                \(Self.name(settings.localeIdentifier)) and in \
+                \(Self.name(settings.effectiveSecondaryLocaleIdentifier ?? settings.secondaryLocaleIdentifier)), \
+                then keeps whichever transcript reads more like the language that produced it. Where \
+                the two are too close to call it keeps \(Self.name(settings.localeIdentifier)).
+                """)
+                .typeStyle(D.type.explain)
+                .foregroundStyle(D.color.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if settings.importDualPass {
+                Text("""
+                    It makes a file take about five times as long — measured 4.3x on a 17-second \
+                    clip and 5.1x on a 6-minute one — and holds the whole recording in memory \
+                    while it works — about 130 MB for an hour. It helps on clean bilingual audio: a \
+                    call, a voice memo, one person switching languages. On a distant or crowded \
+                    recording it does not help at all, because there neither model transcribes much \
+                    to choose between — the transcript itself will say so when that happens.
+                    """)
+                    .typeStyle(D.type.explain)
+                    .foregroundStyle(D.color.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -1007,6 +1063,10 @@ public enum DualLocaleFixtures {
             sheet("second-language-same", panel, section(sameLanguage())),
             sheet("second-language-not-ready", panel, section(notReady())),
             sheet("second-language-off", panel, section(disabled())),
+            // Taller than `panel`: the dual-pass block sits below the prose and the whole point of
+            // rendering it is to read the copy.
+            sheet("second-language-dual-off", CGSize(width: S.column, height: 1_020), section(ready())),
+            sheet("second-language-dual-on", CGSize(width: S.column, height: 1_120), section(dualPassOn())),
             sheet("hud-primary", hud, panelHUD(recording(secondary: false))),
             sheet("hud-secondary", hud, panelHUD(recording(secondary: true))),
             sheet("settings-column", CGSize(width: S.column, height: 2_100),
@@ -1018,6 +1078,15 @@ public enum DualLocaleFixtures {
     private static func ready() -> AppModel {
         let model = PreviewFixtures.model()
         model.apply(secondaryLocaleReady: true)
+        return model
+    }
+
+    /// The same panel with the file-import dual pass switched on, which is the state that has to be
+    /// read most carefully: it is the one where the copy has to say what the switch actually does
+    /// without implying the model recognises a language.
+    private static func dualPassOn() -> AppModel {
+        let model = ready()
+        model.settings.importDualPass = true
         return model
     }
 

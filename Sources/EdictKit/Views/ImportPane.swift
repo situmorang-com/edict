@@ -112,9 +112,29 @@ public struct ImportQueueRow: Identifiable, Hashable, Sendable {
         }
 
         /// The sentence to print under the row, or `nil`.
+        ///
+        /// A finished row speaks up only when the recogniser plainly under-read the audio. That is
+        /// the whole point of routing it through `RecognitionQuality.isConcerning` rather than
+        /// printing a rate on every row: a line most rows carry is a line nobody reads, and the one
+        /// recording that needed it would go past unremarked.
         public var detail: String? {
-            if case .failed(let reason) = self { return reason }
-            return nil
+            switch self {
+            case .failed(let reason): return reason
+            case .finished(let transcript):
+                guard let quality = transcript.quality, quality.isConcerning else { return nil }
+                return quality.explanation
+            case .waiting, .reading, .transcribing, .cancelled: return nil
+            }
+        }
+
+        /// True when `detail` is a problem rather than an aside, so the row can pick its ink. A
+        /// failure and an under-read both are; a truncated-but-real transcript (`warning`) is not.
+        public var detailIsAlert: Bool {
+            switch self {
+            case .failed: true
+            case .finished(let transcript): transcript.hasQualityConcern
+            case .waiting, .reading, .transcribing, .cancelled: false
+            }
         }
 
         public var transcript: Transcript? {
@@ -134,6 +154,10 @@ public struct ImportQueueRow: Identifiable, Hashable, Sendable {
     /// came for free.
     public var isVideo: Bool
     public var state: State
+    /// A neutral aside about the running job — "24 of 96 passes" for a dual pass. Never a warning,
+    /// always in the secondary ink, and printed above `warning` so a real problem is never displaced
+    /// by a progress note.
+    public var note: String?
     /// Set when the transcript is real but the read stopped early. Printed under the row in the
     /// secondary ink, not the alert ink: nine minutes of a ten-minute transcript is a result worth
     /// keeping, and the user has to be told which it is.
@@ -145,6 +169,7 @@ public struct ImportQueueRow: Identifiable, Hashable, Sendable {
         duration: TimeInterval? = nil,
         isVideo: Bool = false,
         state: State = .waiting,
+        note: String? = nil,
         warning: String? = nil
     ) {
         self.id = id
@@ -152,6 +177,7 @@ public struct ImportQueueRow: Identifiable, Hashable, Sendable {
         self.duration = duration
         self.isVideo = isVideo
         self.state = state
+        self.note = note
         self.warning = warning
     }
 
@@ -367,10 +393,19 @@ private struct ImportRow: View {
                     .frame(width: M.colKeys, alignment: .trailing)
             }
 
+            if let note = row.note, row.state.isRunning {
+                Text(note)
+                    .typeStyle(D.type.caption)
+                    .foregroundStyle(D.color.textSecondary)
+                    .lineLimit(1)
+                    .padding(.leading, M.colKind + D.space.sm)
+                    .padding(.trailing, M.colKeys + D.space.sm)
+            }
+
             if let detail = row.state.detail ?? row.warning {
                 Text(detail)
                     .typeStyle(D.type.caption)
-                    .foregroundStyle(row.state.isFault ? D.color.alert : D.color.textSecondary)
+                    .foregroundStyle(row.state.detailIsAlert ? D.color.alert : D.color.textSecondary)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                     // Indented to the filename column and stopped short of the key bank, so a long
@@ -435,6 +470,7 @@ private struct ImportRow: View {
     /// Never the uppercased legend: a screen reader spells caps out letter by letter.
     private var spokenState: String {
         if let detail = row.state.detail ?? row.warning { return "\(row.state.legend). \(detail)" }
+        if let note = row.note, row.state.isRunning { return "\(row.state.legend), \(note)" }
         if let progress = row.state.progress, row.state.isRunning {
             return "\(row.state.legend), \(Int(progress * 100)) percent"
         }

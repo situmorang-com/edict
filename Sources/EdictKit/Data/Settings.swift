@@ -118,6 +118,19 @@ public final class Settings {
         /// because it is measurably better at the job — 4.2 % word error against 10.1 % and 66x
         /// realtime against 15x on the same 377 s file. See `SpeechEngine.build`.
         public static let importUsesGeneralModel = true
+        /// **Off**, and it stays off unless the user asks for it.
+        ///
+        /// Measured cost: **4.3–5.1x the wall clock** of a single pass (0.29 s → 1.25 s on a
+        /// 17-second clip, 4.34 s → 22.31 s on a 377-second one — the per-utterance finalize latency
+        /// is paid once per section per language, not once per file), plus the whole decoded file
+        /// held in memory at 32 KB per second of audio, about 128 MB for a 70-minute meeting.
+        ///
+        /// Measured benefit: on clean bilingual audio it is large — 41.5 % word error down to 7.3 %
+        /// on the 17-second four-turn fixture. On the real 70-minute far-field meeting this project
+        /// was diagnosed against it is nil: the Indonesian model produced 18 words in 300 s where the
+        /// English model produced 61, and choosing between two transcripts neither of which contains
+        /// the speech is not a fix. On by default would present it as one.
+        public static let importDualPass = false
         public static let historyLimit = 5000
     }
 
@@ -217,6 +230,28 @@ public final class Settings {
         didSet { write(importUsesGeneralModel, .importUsesGeneralModel) }
     }
 
+    /// Transcribe each section of an imported file in **both** configured languages and keep whichever
+    /// transcript reads more like the language that produced it.
+    ///
+    /// This is a heuristic over two finished transcripts, not language detection. Apple's speech
+    /// framework has no language identification at all: a `DictationTranscriber` is constructed for
+    /// one `Locale` and will transcribe anything you feed it in that language, confidently and
+    /// wrongly. So Edict transcribes twice and `LanguageScorer` reads the two results for function
+    /// words and affixes. Where the margin is not decisive the primary language wins by default,
+    /// which is the cheaper of the two mistakes.
+    ///
+    /// Only has any effect when `effectiveSecondaryLocaleIdentifier` is non-nil — there is nothing
+    /// to compare against otherwise. See `Default.importDualPass` for the costs.
+    public var importDualPass: Bool {
+        didSet { write(importDualPass, .importDualPass) }
+    }
+
+    /// True when an import should actually run two passes: the switch is on *and* there is a second
+    /// language configured to run the second pass in.
+    public var dualPassIsActive: Bool {
+        importDualPass && effectiveSecondaryLocaleIdentifier != nil
+    }
+
     public var historyLimit: Int {
         didSet {
             let clamped = Self.historyLimitRange.clamped(to: historyLimit)
@@ -262,6 +297,7 @@ public final class Settings {
         termCaseNormalisation = bool(.termCaseNormalisation, Default.termCaseNormalisation)
         prewarmMicrophone = bool(.prewarmMicrophone, Default.prewarmMicrophone)
         importUsesGeneralModel = bool(.importUsesGeneralModel, Default.importUsesGeneralModel)
+        importDualPass = bool(.importDualPass, Default.importDualPass)
         historyLimit = Self.historyLimitRange.clamped(to: int(.historyLimit, Default.historyLimit))
     }
 
@@ -281,6 +317,7 @@ public final class Settings {
         termCaseNormalisation = Default.termCaseNormalisation
         prewarmMicrophone = Default.prewarmMicrophone
         importUsesGeneralModel = Default.importUsesGeneralModel
+        importDualPass = Default.importDualPass
         historyLimit = Default.historyLimit
         Log.data.info("Settings reset to defaults")
     }
@@ -354,7 +391,7 @@ public final class Settings {
         case hotkey, localeIdentifier, pushToTalk, autoInject, showHUD, playSounds
         case secondaryLocaleEnabled, secondaryLocaleIdentifier, secondaryLocaleModifier
         case biasingEnabled, biasingLimit, correctionsEnabled, termCaseNormalisation
-        case prewarmMicrophone, importUsesGeneralModel, historyLimit
+        case prewarmMicrophone, importUsesGeneralModel, importDualPass, historyLimit
 
         var storageKey: String { "edict.\(rawValue)" }
     }

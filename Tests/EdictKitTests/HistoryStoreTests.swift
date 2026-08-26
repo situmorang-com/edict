@@ -325,11 +325,15 @@ struct HistoryStoreTests {
 
         for i in 1...50 { store.append(transcript("t\(i)", at: TimeInterval(i))) }
         try store.save()
-        // Rewriting must leave exactly one file behind — no orphaned temp files in the directory.
+        // Rewriting must leave no orphaned temp file behind. The one companion that IS expected is
+        // `history.json.bak`: `AppPaths.writeAtomically` keeps the outgoing version, because atomic
+        // writes protect against a torn file and do nothing about a wrong one — which is the failure
+        // that actually cost a user their transcript history.
         try store.save()
 
-        let contents = try FileManager.default.contentsOfDirectory(atPath: dir.path)
-        #expect(contents == ["history.json"])
+        let contents = try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted()
+        #expect(contents == ["history.json", "history.json.bak"])
+        #expect(!contents.contains { $0.hasSuffix(".tmp") }, "no orphaned temp file")
 
         let reloaded = HistoryStore(fileURL: store.fileURL, limit: { 5000 })
         try reloaded.load()

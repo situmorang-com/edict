@@ -285,8 +285,12 @@ private struct TranscriptDetail: View {
                 VStack(alignment: .leading, spacing: D.space.md) {
                     header
                     if transcript.mayBeIncomplete { incompleteNotice }
+                    // Above the transcript, not below it: the point is to be read *before* the text
+                    // is trusted. Renders to nothing when the recognition rate was plausible.
+                    QualityNotice(transcript.quality)
                     if outcome.needsRecovery { recovery }
                     textBlock(label: transcript.isImported ? "Transcript" : "Inserted", body: transcript.text)
+                    LanguageSpansView(transcript: transcript)
                     if transcript.didCorrect {
                         textBlock(label: "As heard", body: transcript.rawText)
                         corrections
@@ -318,6 +322,26 @@ private struct TranscriptDetail: View {
                 readout("Speed", .count(Int(realtimeFactor.rounded()), unit: "x"))
             } else {
                 readout("Latency", .count(Int((transcript.transcribeDuration * 1000).rounded()), unit: "ms"))
+            }
+
+            if transcript.isMixedLanguage {
+                VStack(alignment: .leading, spacing: D.space.xxs) {
+                    SilkscreenLabel("Languages", weight: .tiny)
+                        .silkscreenDecorative()
+                    // The identifiers, not the language names: this readout sits in a row of
+                    // fixed-width counters with no room to grow, and "Indonesian + English"
+                    // truncated to "Indone…" says less than "id-ID + en-US" says whole. The names
+                    // are spelled out in the per-section table below.
+                    Text(transcript.contributingLocales.map(LocaleNames.short).joined(separator: " + "))
+                        .typeStyle(D.type.mono)
+                        .foregroundStyle(D.color.textPrimary)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .help(
+                            LocaleNames.summary(transcript.contributingLocales)
+                                + " — each section was transcribed in both languages and the closer match kept."
+                        )
+                }
             }
 
             VStack(alignment: .leading, spacing: D.space.xxs) {

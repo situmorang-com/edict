@@ -26,6 +26,51 @@ public actor SpeechEngine: TranscriptionEngine {
         case primary, secondary
     }
 
+    /// One transcription module bound to one prepared locale: everything a single import pass needs.
+    ///
+    /// The dual-pass import needs this shape because the engine's two *dictation* slots — primary and
+    /// secondary — cannot express it. A pass may want `SpeechTranscriber` for English (measured 4.2 %
+    /// word error against 10.1 %, RECON amendment 1) and `DictationTranscriber` for Indonesian, which
+    /// `SpeechTranscriber` does not support at all. Which module a language gets is therefore a
+    /// property of the language, resolved once per identifier and memoised.
+    public struct ImportPass: Sendable, Hashable {
+        /// Which of Apple's two modules will run.
+        public var module: TranscriptionModule
+        /// The identifier the caller asked for — `"id-ID"`. This is what goes in the transcript, so
+        /// history shows the user's own spelling rather than the framework's.
+        public var requestedIdentifier: String
+        /// The identifier the framework resolved it to — `"id_ID"`, underscored. Diagnostics only.
+        public var canonicalIdentifier: String
+
+        public init(module: TranscriptionModule, requestedIdentifier: String, canonicalIdentifier: String) {
+            self.module = module
+            self.requestedIdentifier = requestedIdentifier
+            self.canonicalIdentifier = canonicalIdentifier
+        }
+    }
+
+    /// Whether a language can be transcribed right now, or a sentence saying why not.
+    ///
+    /// Two cases rather than an optional because the failure has to reach the user: a missing
+    /// on-device model is fixable (it downloads) and an unsupported locale is not, and neither may be
+    /// papered over by substituting a different model. Transcribing Indonesian with the English model
+    /// does not fail — it returns fluent English nonsense, with no signal anywhere that it did.
+    public enum ImportPassResolution: Sendable {
+        case ready(ImportPass)
+        /// Already-user-facing text.
+        case unavailable(String)
+
+        public var pass: ImportPass? {
+            if case .ready(let pass) = self { return pass }
+            return nil
+        }
+
+        public var reason: String? {
+            if case .unavailable(let reason) = self { return reason }
+            return nil
+        }
+    }
+
     /// RECON §5: cost is ~65 ms fixed plus ~1.5 ms/term at analyzer init, and hit rate measurably *degrades*
     /// with list length — a 9-term list fixed "Wispr Flow" and "Obsidian" where a 200-term list fixed neither.
     /// `Settings.biasingLimit` already clamps to this; the engine enforces it again so no caller can defeat it.
@@ -61,6 +106,16 @@ public actor SpeechEngine: TranscriptionEngine {
     /// identifier, because that is what the caller has; the resolved canonical form is stored in
     /// `generalLocale`.
     private var importModuleByLocale: [String: TranscriptionModule] = [:]
+    /// Resolved dual-pass import passes, keyed by the *requested* identifier.
+    ///
+    /// Deliberately separate from `generalLocale` / `importModuleByLocale`, which serve the ordinary
+    /// single-pass import and hold exactly one general locale. A dual pass resolves **two** locales,
+    /// and if the second one happened to be another `SpeechTranscriber` language it would overwrite
+    /// the first's `generalLocale` and silently transcribe one of the two passes in the wrong
+    /// language — a failure with no symptom except a nonsense transcript.
+    private var importPasses: [String: ImportPass] = [:]
+    private var importPassLocales: [String: Locale] = [:]
+    private var importPassFormats: [String: AVAudioFormat] = [:]
     /// Staged for the *next* utterance. RECON §2: `setContext` mid-stream is a silent no-op, so context can only
     /// be handed to `SpeechAnalyzer.init(analysisContext:)`. Read the dictionary at key-down.
     private var biasingStrings: [String] = []
@@ -432,10 +487,16 @@ public actor SpeechEngine: TranscriptionEngine {
     ///   - biasing: contextual strings for *this* session only, bypassing the staged list. The
     ///     import path passes its own so a file cannot inherit — or clobber — the list a
     ///     concurrent dictation staged at key-down. `nil` uses the staged list.
+    ///   - explicitLocale: a locale resolved by the caller, overriding `locale`. Used only by the
+    ///     dual-pass import, which resolves and prepares its own two locales (see `ImportPass`)
+    ///     because neither of the engine's two prepared *dictation* slots can express "this module,
+    ///     that language".
     private func beginSession(
         module: TranscriptionModule,
         locale which: UtteranceLocale,
         biasing: [String]?,
+        explicitLocale: Locale? = nil,
+        explicitFormat: AVAudioFormat? = nil,
         onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
     ) async throws -> SpeechSession {
         // Serialised, not raced. A second utterance can arrive while the previous session is still
@@ -447,18 +508,23 @@ public actor SpeechEngine: TranscriptionEngine {
         let serial = try await claimSlot(module: module, locale: which)
 
         do {
-            let secondary = module == .dictation && which == .secondary
+            // An explicitly-resolved locale has already been reserved and asset-checked by
+            // `resolveImportPass`, so the secondary-asset gate below does not apply to it.
+            let secondary = explicitLocale == nil && module == .dictation && which == .secondary
             if secondary { try await requireSecondaryAssets() }
 
-            let resolved: Locale? = switch (module, which) {
+            let prepared: Locale? = switch (module, which) {
             case (.general, _): generalLocale
             case (.dictation, .primary): canonicalLocale
             case (.dictation, .secondary): secondaryLocale
             }
-            guard let locale = resolved else { throw SpeechEngineError.notPrepared }
-            let format = secondary
-                ? await bestAudioFormat(secondary: true)
-                : await bestAudioFormat(for: module)
+            guard let locale = explicitLocale ?? prepared else { throw SpeechEngineError.notPrepared }
+            var format = explicitFormat
+            if format == nil {
+                format = secondary
+                    ? await bestAudioFormat(secondary: true)
+                    : await bestAudioFormat(for: module)
+            }
             guard let format else { throw SpeechEngineError.noAudioFormat }
 
             let built = Self.build(module: module, locale: locale)
@@ -935,6 +1001,172 @@ public actor SpeechEngine: TranscriptionEngine {
         } catch {
             return remember(.dictation, "the transcription model could not be prepared: \(Self.describe(error))")
         }
+    }
+
+    // MARK: - Dual-pass import passes
+
+    /// Resolve, reserve and asset-check one language for a file import.
+    ///
+    /// Memoised by requested identifier, so the dual pass asks twice per file and pays for it once
+    /// per language per app run. The module choice is the same trade `resolveImportModule` makes and
+    /// for the same measured reason — `SpeechTranscriber` halves the word error and runs 4.4x faster
+    /// on a whole file — except that here it is asked *per language* rather than once for the app.
+    ///
+    /// Unlike `resolveImportModule` this can come back `.unavailable`, and must be allowed to.
+    /// `resolveImportModule` can always fall back to the dictation module because it is choosing
+    /// between two models of the *same* language; here the choice is between languages, and there is
+    /// no substitute for a language whose model is not on the disk. A missing model kicks off its own
+    /// download and says so, exactly as the live secondary-language path does.
+    public func resolveImportPass(
+        preferGeneral: Bool,
+        localeIdentifier: String
+    ) async -> ImportPassResolution {
+        if let cached = importPasses[localeIdentifier] { return .ready(cached) }
+
+        func remember(_ pass: ImportPass, _ locale: Locale, _ why: String) -> ImportPassResolution {
+            importPasses[localeIdentifier] = pass
+            importPassLocales[localeIdentifier] = locale
+            Log.stt.info("""
+                import pass \(localeIdentifier, privacy: .public): \
+                \(pass.module.rawValue, privacy: .public) \(locale.identifier, privacy: .public) \
+                — \(why, privacy: .public)
+                """)
+            return .ready(pass)
+        }
+
+        // The general module first where it is wanted and covers the language. Asset state is checked
+        // rather than downloaded: an import the user is watching must not stall on a model download
+        // when a supported model for the same language is already on disk.
+        if preferGeneral,
+           let canonical = await SpeechTranscriber.supportedLocale(
+               equivalentTo: Locale(identifier: localeIdentifier)
+           ) {
+            do {
+                try await reserve(canonical)
+                let probe = Self.build(module: .general, locale: canonical).module
+                if try await AssetInventory.assetInstallationRequest(supporting: [probe]) == nil {
+                    return remember(
+                        ImportPass(
+                            module: .general,
+                            requestedIdentifier: localeIdentifier,
+                            canonicalIdentifier: canonical.identifier
+                        ),
+                        canonical,
+                        "measured 4.2 % word error against 10.1 % on this machine"
+                    )
+                }
+            } catch {
+                Log.stt.warning("""
+                    import pass \(localeIdentifier, privacy: .public): general module unavailable — \
+                    \(Self.describe(error), privacy: .public)
+                    """)
+            }
+        }
+
+        // The dictation module is the fallback and the only route for the 9 locales the general
+        // module does not cover, Indonesian among them (RECON amendment 7).
+        guard let canonical = await DictationTranscriber.supportedLocale(
+            equivalentTo: Locale(identifier: localeIdentifier)
+        ) else {
+            return .unavailable(
+                "\(Self.languageName(Locale(identifier: localeIdentifier))) is not one of the languages "
+                    + "this Mac can transcribe."
+            )
+        }
+        do {
+            try await reserve(canonical)
+        } catch {
+            return .unavailable(
+                "\(Self.languageName(canonical)) could not be prepared: \(Self.describe(error))"
+            )
+        }
+
+        let probe = Self.makeModule(locale: canonical)
+        let pending: AssetInstallationRequest?
+        do {
+            // Gated on the request being nil, never on `AssetInventory.status` — RECON amendment 6
+            // measured that reporting `.supported` for an installed-but-unreserved locale, which
+            // would trigger a pointless download.
+            pending = try await AssetInventory.assetInstallationRequest(supporting: [probe])
+        } catch {
+            return .unavailable(
+                "The \(Self.languageName(canonical)) speech model could not be checked: \(Self.describe(error))"
+            )
+        }
+        guard let request = pending else {
+            return remember(
+                ImportPass(
+                    module: .dictation,
+                    requestedIdentifier: localeIdentifier,
+                    canonicalIdentifier: canonical.identifier
+                ),
+                canonical,
+                "the transcription model does not cover this locale, or its assets are missing"
+            )
+        }
+
+        // Not awaited: the caller has a queue on screen and a model download is minutes, not
+        // milliseconds. Start it, say so, and let the next import find it installed.
+        if secondaryDownload == nil {
+            secondaryDownload = Task { [weak self] in
+                do {
+                    try await request.downloadAndInstall()
+                    await self?.secondaryDownloadFinished(error: nil)
+                } catch {
+                    await self?.secondaryDownloadFinished(error: error)
+                }
+            }
+        }
+        return .unavailable(
+            "Downloading the \(Self.languageName(canonical)) speech model. Try this file again in a moment."
+        )
+    }
+
+    /// The audio format a resolved pass wants. Asked per pass, never assumed shared: the two passes
+    /// of a dual-pass import run different modules built for different locales, and
+    /// `availableCompatibleAudioFormats` is a property of the module.
+    public func bestAudioFormat(for pass: ImportPass) async -> AVAudioFormat? {
+        if let cached = importPassFormats[pass.requestedIdentifier] { return cached }
+        guard let locale = importPassLocales[pass.requestedIdentifier] else { return nil }
+        let format = await SpeechAnalyzer.bestAvailableAudioFormat(
+            compatibleWith: [Self.build(module: pass.module, locale: locale).module]
+        )
+        if let format { importPassFormats[pass.requestedIdentifier] = format }
+        return format
+    }
+
+    /// Run one section of a dual-pass import through one resolved pass.
+    ///
+    /// Goes through the same slot as everything else, which is the whole point: `SpeechEngine` holds
+    /// exactly one analyzer at a time, so the two passes over a section are serialised whether the
+    /// caller asks for that or not. See `DualPassImporter` for the measurement behind not trying to
+    /// beat it.
+    public func transcribe(
+        input: AsyncStream<AnalyzerInput>,
+        pass: ImportPass,
+        biasing: [String] = [],
+        onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
+    ) async throws -> TranscriptionOutcome {
+        guard let locale = importPassLocales[pass.requestedIdentifier] else {
+            throw SpeechEngineError.notPrepared
+        }
+        let session = try await beginSession(
+            module: pass.module,
+            locale: .primary,
+            biasing: biasing,
+            explicitLocale: locale,
+            explicitFormat: await bestAudioFormat(for: pass),
+            onUpdate: onUpdate
+        )
+        for await item in input {
+            if session.isTerminated { break }
+            session.feed(item)
+        }
+        if session.isTerminated {
+            Log.stt.info("import pass aborted")
+            throw CancellationError()
+        }
+        return try await session.finishAndCommit()
     }
 
     private static func describe(_ error: Error) -> String {

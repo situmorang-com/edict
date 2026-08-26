@@ -791,7 +791,116 @@ public final class DictationController {
             // Without this, cancelling a long file only closes the *reader*; the analyzer already
             // holds every remaining chunk in its unbounded input queue and would spend its full run
             // finalizing audio nobody wants. Measured at ~25 s for a 377 s file.
-            cancelActive: { [weak self] in await self?.engine.cancel() }
+            cancelActive: { [weak self] in await self?.engine.cancel() },
+            // Always supplied, never conditional on the setting: the `Environment` is built once at
+            // launch and the switch can be flipped at any time, so the *closure* has to be the thing
+            // that reads it. It returns nil when dual pass is off or unavailable, which the queue
+            // treats as "run the ordinary single pass".
+            dualPass: { [weak self] url, reporting in
+                guard let self else { throw CancellationError() }
+                return try await self.runDualPass(url: url, reporting: reporting)
+            }
+        )
+    }
+
+    /// One file, decoded once and transcribed twice per section.
+    ///
+    /// Returns `nil` — "not this file" — rather than throwing whenever the feature simply does not
+    /// apply: the switch is off, there is no second language configured, or one of the two languages
+    /// has no model on disk yet. Each of those must degrade to a single-pass transcript, because the
+    /// user dropped a file to get a transcript and an error about a language contest is not one.
+    private func runDualPass(
+        url: URL,
+        reporting: DualPassImporter.Reporting
+    ) async throws -> ImportQueue.DualPassJob? {
+        guard settings.dualPassIsActive,
+              let secondaryIdentifier = settings.effectiveSecondaryLocaleIdentifier else { return nil }
+
+        let began = ContinuousClock.now
+        let primary = await engine.resolveImportPass(
+            preferGeneral: settings.importUsesGeneralModel,
+            localeIdentifier: settings.localeIdentifier
+        )
+        let secondary = await engine.resolveImportPass(
+            // The second language is offered the general model on exactly the same terms as the
+            // first. It will usually not get it — Indonesian is one of the 9 locales
+            // `SpeechTranscriber` does not cover (RECON amendment 7) — but hardcoding the dictation
+            // module for "the other language" would make the comparison asymmetric for a pair like
+            // en-US/es-ES, where both are covered and one pass would be handicapped for no reason.
+            preferGeneral: settings.importUsesGeneralModel,
+            localeIdentifier: secondaryIdentifier
+        )
+        guard let primaryPass = primary.pass, let secondaryPass = secondary.pass else {
+            let reason = primary.reason ?? secondary.reason ?? "a language could not be prepared"
+            Log.stt.notice("dual pass unavailable, using one model: \(reason, privacy: .public)")
+            return nil
+        }
+        guard let format = await engine.bestAudioFormat(for: primaryPass) else { return nil }
+        // Both passes are fed the same decoded samples, so a module that wanted a different format
+        // would be handed audio at the wrong rate — which does not fail, it transcribes noise. RECON
+        // §17 records only 16 kHz and 8 kHz mono Int16 as available at all, so this is a guard
+        // against a future OS rather than an expected branch.
+        guard let secondaryFormat = await engine.bestAudioFormat(for: secondaryPass),
+              secondaryFormat.sampleRate == format.sampleRate,
+              secondaryFormat.channelCount == format.channelCount else {
+            Log.stt.notice("dual pass unavailable: the two models want different audio formats")
+            return nil
+        }
+
+        let importer = AudioFileImporter(
+            url: url,
+            analyzerFormat: format,
+            // The dual pass holds the whole decode itself, so the streaming probe would be a second
+            // copy of the same samples for no reason.
+            speechProbeBudgetBytes: 0
+        )
+        let info = try await importer.open()
+        // Decode gets the same fixed 2 % of the bar `DualPassImporter` reserves for it, so the bar
+        // moves during the decode instead of sitting at zero and then jumping.
+        let decoded = try await importer.decodeAll(
+            onProgress: { reporting.onProgress($0 * DualPassImporter.decodeShare) }
+        )
+
+        // Biasing follows the same rule as a single-pass import: layer 1 exists only on the dictation
+        // module (RECON §1 measured contextual strings as a byte-for-byte no-op on the other), and
+        // it is passed explicitly so a file can neither inherit nor clobber the list a live dictation
+        // froze at key-down.
+        let biasing = dictionary.biasingStrings(limit: settings.effectiveBiasingLimit)
+        let engine = self.engine
+        func makePass(_ pass: SpeechEngine.ImportPass) -> DualPassImporter.Pass {
+            DualPassImporter.Pass(
+                localeIdentifier: pass.requestedIdentifier,
+                module: pass.module,
+                transcribe: { stream in
+                    try await engine.transcribe(
+                        input: stream,
+                        pass: pass,
+                        biasing: pass.module.supportsBiasing ? biasing : [],
+                        onUpdate: { _ in }
+                    )
+                }
+            )
+        }
+
+        // `longForm` past ten minutes: on the real 70-minute meeting `standard` produces 1043
+        // sections and `longForm` 374, and 1043 sections is 2086 analyzer builds for a file whose
+        // language barely changes between neighbouring 3-second slices. Under ten minutes `standard`
+        // is right — it is the preset measured to recover all four turns of the 17-second bilingual
+        // fixture, where `longForm` finds one.
+        let options: SpeechSegmenter.Options = info.duration > 600 ? .longForm : .standard
+        let runner = DualPassImporter(segmenter: SpeechSegmenter(options: options))
+        let outcome = try await runner.run(
+            decoded: decoded,
+            format: format,
+            passes: [makePass(primaryPass), makePass(secondaryPass)],
+            reporting: reporting
+        )
+        let elapsed = ContinuousClock.now - began
+        return ImportQueue.DualPassJob(
+            info: info,
+            outcome: outcome,
+            wallSeconds: Double(elapsed.components.seconds)
+                + Double(elapsed.components.attoseconds) / 1e18
         )
     }
 
@@ -860,6 +969,20 @@ public final class DictationController {
             ? CorrectionResult(text: raw, hits: [])
             : corrector.apply(to: raw)
 
+        // A dual-pass transcript is attributed to the language that won the most recognised audio,
+        // with the full list beside it — see `Transcript.localeIdentifiers` for why the single field
+        // alone would be a false claim. A single-pass one keeps the locale the user chose, which is
+        // the only one that could have produced anything.
+        let locales = result.localeIdentifiers
+        let dominant = locales.first ?? settings.localeIdentifier
+        // The module recorded is the one that produced the dominant language's text. For a
+        // single-locale import that is the only module that ran; for a mixed one it is the majority,
+        // and `segments` carry the per-section truth.
+        let module = result.sections
+            .first(where: { $0.chosenLocale == dominant })?
+            .candidates.first(where: { $0.localeIdentifier == dominant })?
+            .module ?? lastImportModule
+
         let transcript = Transcript(
             rawText: raw,
             text: corrected.text,
@@ -871,14 +994,16 @@ public final class DictationController {
             // end-of-speech latency a dictation reports. It is the number that makes the realtime
             // factor legible in the history pane, which for a file is the interesting one.
             transcribeDuration: result.wallSeconds,
-            localeIdentifier: settings.localeIdentifier,
-            engine: lastImportModule.engineIdentifier,
+            localeIdentifier: dominant,
+            localeIdentifiers: locales,
+            engine: module.engineIdentifier,
             // No target and no attempt: see the note above.
             injection: .notAttempted,
             droppedBuffers: result.stats.dropped,
             lowConfidenceWords: Array(result.outcome.lowConfidenceWords.prefix(Self.maxImportSuggestions)),
             source: .imported(filename: result.info.filename),
-            segments: Self.correct(result.segments, with: corrector)
+            segments: Self.correct(result.segments, with: corrector),
+            quality: result.quality
         )
 
         history.append(transcript)
@@ -887,7 +1012,7 @@ public final class DictationController {
         }
 
         Log.data.info("""
-            import saved: \(result.info.filename, privacy: .public)             \(transcript.wordCount, privacy: .public) words,             \(transcript.segments.count, privacy: .public) segments,             \(corrected.hits.count, privacy: .public) corrections,             module \(self.lastImportModule.rawValue, privacy: .public),             \(String(format: "%.1f", result.realtimeFactor), privacy: .public)x realtime\
+            import saved: \(result.info.filename, privacy: .public)             \(transcript.wordCount, privacy: .public) words,             \(transcript.segments.count, privacy: .public) segments,             \(corrected.hits.count, privacy: .public) corrections,             module \(module.rawValue, privacy: .public),             locale \(transcript.contributingLocales.joined(separator: "+"), privacy: .public),             quality \(result.quality.verdict.rawValue, privacy: .public),             \(String(format: "%.1f", result.realtimeFactor), privacy: .public)x realtime\
             \(result.incompleteReason == nil ? "" : " INCOMPLETE", privacy: .public)
             """)
         return transcript.id
