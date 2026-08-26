@@ -149,6 +149,62 @@
 >     during diagnosis and is not shippable. Diagnose window-size complaints by attaching a `didResize`/`didMove`
 >     observer and reading the backtrace before assuming the bug is ours.
 >
+> 31. **Bit-test modifier flags; never compare a raw flag word for equality.** Verified on the real
+>     keyboard: Right Option arrives as `0x00080140`, not the expected `0x00080040`, because Karabiner's
+>     virtual keyboard stamps `0x100` (`kCGEventFlagMaskNonCoalesced`) on **every** event it synthesizes,
+>     release included. The good news from the same measurement: Karabiner *does* preserve the left/right
+>     device bit, which was the project's biggest open unknown.
+>
+> 32. **An `AsyncStream` has exactly one consumer.** `HotkeyMonitor.events` hands back a stored stream;
+>     cancelling its consumer and starting a second one leaves the replacement receiving nothing for ever.
+>     That is what made RESTART appear to do nothing while the monitor logged healthy arms and releases and
+>     no error appeared anywhere. Create such a consumer **once** and never cancel it on a restart — safe
+>     because the continuations are finished only in `deinit`. Never hand a stored `AsyncStream` to a
+>     second iterator.
+>
+> 33. **Claim the session slot before any `await`.** `beginSession` awaits an asset check, a format query
+>     and `prepareToAnalyze`, so a gate on `activeSession == nil` lets two presses both build an analyzer,
+>     the second orphaning the first and wedging the engine. The user saw a recording open and close itself
+>     on alternating presses. The 1.5 s wait ceiling is a safety valve for a wedged analyzer, **not** the
+>     fix; widening it treats a leak as a race.
+>
+> 34. **Use `Window`, not `WindowGroup`.** `WindowGroup` is a template: every `application(_:open:)`
+>     instantiated another copy and SwiftUI restored them all on the next launch, reaching 18 windows.
+>     Purge `~/Library/Saved Application State/<bundleid>.savedState` once when fixing this.
+>
+> 35. **No XML comments in `.entitlements`.** `codesign` parses entitlements with `AMFIUnserializeXML`,
+>     which rejects comments, while `plutil -lint` passes the same file. Nothing gets signed at all. Grep
+>     for `<!--` in the pre-sign check; lint is not sufficient.
+>
+> 36. **Text Input Services is main-thread-only.** `TISGetInputSourceProperty` reaches
+>     `dispatch_assert_queue(main)` and `SIGTRAP`s rather than erroring, which crashed the app on every
+>     injection pre-warm from `TextInjector`'s actor queue.
+>
+> 37. **Apple's models emit nothing rather than guessing, and no amount of audio work changes that.**
+>     A real far-field multi-speaker meeting yielded 16 words per minute against ~150 for speech, with
+>     levels fine, zero dropped buffers and full timeline coverage. Clean audio through the same code path
+>     gives 819 words per 300 s; the meeting gives 61, and conditioning it moves that only to 75.
+>     **Do not build a de-noising pipeline, and never offer the user a setting that claims to fix this.**
+>     This class of recording needs a Whisper-class model, which this app deliberately does not ship.
+>
+> 38. **A word-count quality metric can be fooled by our own features.** Per-section transcription raised
+>     a difficult slice from 91 to 245 words while mean confidence collapsed to 0.288 with 57% of words
+>     under 0.30. Any quality verdict must gate on confidence as well as rate, and must measure rate
+>     against **detected speech** rather than wall clock, or a mostly-silent voice memo gets slandered.
+>
+> 39. **Atomic writes protect against a torn file, not a wrong one.** A verification run wrote to the live
+>     store and a user's transcript history went from thirty entries to two, with no backup anywhere —
+>     not in the support directory, not a temp file, and Time Machine held only OS-update snapshots.
+>     **Anything automated that exercises the real app must set `EDICT_SUPPORT_DIR` before it starts**, and
+>     `AppPaths.writeAtomically` now keeps the outgoing version as `<name>.bak`.
+>
+> 40. **UI cannot be photographed from an automated run.** Screen Recording is denied to any process an
+>     agent starts (`screencapture -l` fails, ScreenCaptureKit returns `-3811`), and `ImageRenderer` does
+>     not rasterise a `ScrollView`'s contents. Proof sheets are offline renders, not live windows, and
+>     views needing offline proof expose an `unbounded` hatch used only by fixtures. When a screenshot of
+>     the running app is genuinely required, it has to come from the user's own session — and must capture
+>     **only the app's window by id**, never a display.
+>
 > ### Amended API surface
 >
 > These supersede the signatures below where they conflict:

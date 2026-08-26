@@ -617,3 +617,219 @@ to be sure both attributes are on.
   dictionary layer an import gets when the general model is in use.
 - One module and one analyzer per file, never reused — §3 applies unchanged, and `ImportQueue` is
   serial partly because of it.
+
+---
+
+## Findings from building and running the app
+
+Everything above came from probes written before the app existed. Everything below was found by
+*running* Edict on a real machine with permissions actually granted — which is where the probes' two
+biggest unknowns finally got answered, and where several things the probes could not have predicted
+turned up.
+
+### The push-to-talk key, finally observed
+
+**Karabiner DOES preserve the left/right device bit.** This was the single highest-risk open question
+in the whole project: the probe could not observe one real keystroke, and if Karabiner's DriverKit
+virtual keyboard normalised the device bits, Right Option could never be distinguished. Measured with
+a tap running from a terminal that holds Input Monitoring:
+
+    press    keyCode=61  raw=0x00080140    <- 0x40 present, right Option
+    release  keyCode=61  raw=0x00000100
+    (left control, for comparison)  keyCode=59  raw=0x00040101
+
+**But every synthesized event carries an extra bit: `0x100`, `kCGEventFlagMaskNonCoalesced`.** Note it
+is present even on release, where all modifiers are otherwise clear. So the expected `0x00080040`
+arrives as `0x00080140`.
+
+> Consequence: **bit-test, never compare raw flag values for equality.** Any code that matches an
+> expected raw word will silently never fire on a machine with a keyboard remapper. `isHeld` is a
+> bit test and was correct; anything new must be too.
+
+**A live tap is diagnosable without any permission.** `CGGetEventTapList` needs nothing, reports every
+tap's owning pid, whether it is enabled, and the mask it was actually granted. On this machine a
+healthy Edict reads:
+
+    pid    enabled  mask      process
+    41381  YES      0x1c00    Edict            <- keyDown|keyUp|flagsChanged, nothing stripped
+    24968  YES      0x4c00    BetterTouchTool
+
+That single call distinguishes "permission denied" (mask stripped to `0x1000`, or a dead port) from
+"permission fine, bug is ours" in about a second. It is the first thing to run on any "the hotkey does
+nothing" report.
+
+### `AsyncStream` has exactly one consumer, and RESTART broke it
+
+`HotkeyMonitor.events` returned a **single stored `AsyncStream`**. `startHotkey()` cancelled the
+existing consumer task and started a new one over that same stream — so after the user pressed RESTART,
+the replacement iterator received nothing, for ever.
+
+The symptom was maximally misleading. The monitor kept working perfectly and logged so:
+
+    hotkey armed
+    hotkey released after 7365 ms
+
+Tap alive, keycode matched, device bit intact, arm and release clean — while the controller sat behind
+a dead iterator, so `begin()` was never reached and **not one error appeared anywhere**. The key simply
+did nothing.
+
+> Fix: create the consumer **once** and never cancel it on a restart. Safe because the continuations
+> are finished only in the monitor's `deinit`, so one long-lived iterator survives any number of tap
+> stop/start cycles. Generally: an `AsyncStream` is not a broadcast channel, and a stored one must
+> never be handed to a second iterator.
+
+### The speech session leaked, and a bounded wait was the wrong fix
+
+Users saw "I press the key, it opens, then closes after a few seconds" — on alternating presses.
+
+    17:24:21.717  utterance done: 3 words, injection paste
+    17:24:23.836  hotkey armed
+    17:24:25.395  previous session still active after 1.5 s; refusing to start a second
+    17:24:27.015  hotkey armed
+    17:24:27.205  capture started              <- the next press works
+
+`activeSession` was still held **3.7 s after `utterance done`**. Root cause: `beginSession` awaits an
+asset check, a format query and `prepareToAnalyze` *between* testing `activeSession == nil` and
+assigning it. Two presses could both pass the gate, both build an analyzer, and the second overwrite
+the first — orphaning a live analyzer and wedging the engine.
+
+> Fix: claim the slot **before** any of those awaits. The 1.5 s ceiling that predated this is a safety
+> valve for a genuinely wedged analyzer, not the fix — finalize measures 0.15–0.53 s, so a healthy
+> hand-back has ~3x headroom. A first attempt that merely widened that ceiling treated a leak as a
+> race and would have delayed the same failure.
+
+### `WindowGroup` multiplies windows; use `Window`
+
+`WindowGroup` is a *template*. Every `application(_:open:)` file-open request instantiated another copy,
+and SwiftUI restored all of them on the next launch, so the count compounded — **18 windows** after a
+handful of test imports. Edict has exactly one main window and is not a document app.
+
+> Fix: a plain `Window` scene. Also purge `~/Library/Saved Application State/<bundleid>.savedState`
+> once, or the accumulated windows come back.
+
+### XML comments in an entitlements file break codesigning
+
+`codesign` parses entitlements with `AMFIUnserializeXML`, **which rejects XML comments**, while
+`plutil -lint` passes the same file happily. The failure is
+`AMFIUnserializeXML: syntax error near line 10` and no `.app` gets signed at all.
+
+> Fix: no comments in `.entitlements`. Put the rationale in the build script. `plutil -lint` is not a
+> sufficient pre-flight check — grep for `<!--` as well.
+
+### Text Input Services must be called on the main thread
+
+`TISGetInputSourceProperty` (used for the layout-correct Cmd-V keycode lookup, RECON §15) reaches
+`dispatch_assert_queue(main)` and **`SIGTRAP`s** rather than returning an error. `TextInjector` is an
+actor on its own queue, so the lookup crashed the app 1.6 s after launch on every pre-warm.
+
+> Fix: mark the keycode lookup `@MainActor` and hop for it.
+
+### `defaults delete` does not reach a running app
+
+`cfprefsd` serves a cached value. This invalidated an experiment and produced a confident wrong
+conclusion: deleting a saved window frame and relaunching gave a byte-identical frame every time, which
+was read as proof that frame restoration was not involved.
+
+> Fix: `killall -HUP cfprefsd` after any `defaults delete`, before measuring.
+
+### An external Accessibility client resizes this app's windows
+
+The window is created at exactly the requested size, and then three AX writes arrive:
+
+    _AXXMIGSetAttributeValue -> SetAttributeValue
+      -> NSAccessibilityEntryPointSetValueForAttribute
+      -> -[NSWindow _setFrameCommon:display:fromServer:]
+
+snapping it to a half-screen strip. A 40-line SwiftUI app reproduces it **only once placed in a signed
+`.app` bundle**, and it beats a hard `.frame(width:height:)`, so no layout change prevents it. This
+machine runs BetterTouchTool with snap areas enabled; the attribution is circumstantial but the
+mechanism is proven.
+
+> **Do not add code that fights the user's window manager** by re-asserting a size on a timer. That was
+> tried during diagnosis and is not shippable. Diagnose window-size complaints by attaching a
+> `didResize` observer and reading the backtrace before assuming the bug is ours.
+
+### `SMAppService` works for a self-signed, non-notarized app
+
+Verified with a signed probe bundle in `/Applications`: `register()` -> `enabled`, persisting across
+process launches (the record lives in launchd), `unregister()` -> `notRegistered`.
+
+> Also: do **not** mirror the state into a stored preference. `SMAppService.mainApp.status` is the truth,
+> and the user can change Login Items behind the app's back, so a cached copy can only go stale.
+
+### A test suite cannot clean up its own `UserDefaults` suites
+
+`removePersistentDomain(forName:)` leaves a 42-byte `{}` plist; `synchronize` plus `removeSuite` changes
+nothing; deleting the file makes it vanish and then **`cfprefsd` rewrites it about 4 s later**. No
+`deinit` or per-test hook wins that race. 85 stray `com.edict.tests.<UUID>.plist` files accumulated in
+`~/Library/Preferences`.
+
+> Fix: a `UserDefaults` subclass holding values in memory that never touches
+> `~/Library/Preferences` at all. A suite never written to leaves no file.
+
+### Apple's on-device models are conservative, not merely worse
+
+The most consequential finding for what this app can honestly claim. A real 70-minute business meeting —
+two-plus speakers, Indonesian and English code-switched, far-field — produced **1,128 words for 4,197
+seconds: about 16 words per minute**, against ~150 for normal speech. The output was largely filler and
+empty runs.
+
+It was not a pipeline fault. `droppedBuffers` 0, segments spanning 131 s to 4,117 s, mean level
+−29.6 dB / −25.9 LUFS. Measured on a 300-second slice:
+
+    clean synthetic speech, SpeechTranscriber en-US ....... 819 words   (the engine is fine)
+    the real meeting, SpeechTranscriber en-US .............. 61 words
+    the real meeting, conditioned +7dB/highpass/compress ... 75 words
+    the real meeting, DictationTranscriber id-ID ........... 18 words   (fluent, CORRECT Indonesian)
+    the real meeting, DictationTranscriber en-US ............ 0 words
+
+> On far-field, overlapping, reverberant audio these models **emit nothing rather than guessing**. That
+> is why a bad transcript is sparse rather than confidently wrong, and why `DictationTranscriber` — tuned
+> for close-mic dictation — returned literally zero. **Audio conditioning does not rescue it** (61 -> 75),
+> so do not build a de-noising pipeline. This class of recording needs a Whisper-class model, which this
+> app deliberately does not ship. Note the Indonesian output, though tiny, was accurate: the models are
+> not broken, they are quiet when unsure.
+
+### Short sections make the model guess, so word count alone is a liar
+
+Transcribing per-section (for language detection) raised a difficult slice from **91 to 245 words** while
+mean confidence collapsed to **0.288 with 57% of words below 0.30** — against 0.94 and 0% on two clean
+files.
+
+> Consequence: more words is not better, and a words-per-minute quality metric can be fooled by the very
+> feature meant to improve quality. Any quality verdict must gate on confidence as well as rate. And rate
+> must be measured against *detected speech*, not wall clock, or a mostly-silent voice memo is slandered.
+
+### Language detection over two transcripts is viable, with a measured margin
+
+Each model is excellent on its own language and turns the other into phonetic mush that is not words in
+either language, which is trivially separable without any ML. Function words and affixes — a few hundred
+entries compiled into the binary — scored **8 of 8** on strings the two models actually produced, with a
+worst true-positive margin of 0.767 against 0.263 for genuinely ambiguous input.
+
+On a clean bilingual fixture, four alternating turns: 4 of 4 sections chose correctly and word error fell
+from 41.5% (en-US alone) and 51.2% (id-ID alone) to **7.3%**. Cost is **4.3–5.1x**, not 2x — the overhead
+is per-utterance finalize latency, not analyzer construction.
+
+> A marker claimed by more than one language must be **discarded outright**. Loanwords are everywhere in
+> this domain (team, revenue, persen) and counting them only dilutes the margin.
+
+### Atomic writes protect against a torn file, not a wrong one
+
+An automated verification run exercised the import path against the installed app — which writes to the
+real `~/Library/Application Support/Edict` — and a user's transcript history came back with two entries
+where there had been thirty. **No backup existed anywhere**: not in the support directory, not a temp
+file, and Time Machine held only OS-update snapshots.
+
+> Two fixes, both in `AppPaths`. `EDICT_SUPPORT_DIR` redirects every path, so automation is isolated by
+> construction rather than by remembering. And `writeAtomically` keeps the outgoing version as
+> `<name>.bak`. Anything automated that exercises the real app must set the override *before* it starts.
+
+### Two things that constrain how UI can be verified
+
+**Screen Recording is denied to any process an agent starts** — `screencapture -l` fails and
+ScreenCaptureKit returns `-3811` even from a locally-signed bundle. Proof sheets are therefore
+`ImageRenderer` output of the real views, not photographs of a live window.
+
+**`ImageRenderer` does not rasterise a `ScrollView`'s contents** — lists and transcript trays come out
+empty. Views that need proving offline expose an `unbounded` hatch used only by fixtures.
