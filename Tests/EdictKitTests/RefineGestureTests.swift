@@ -136,8 +136,8 @@ struct RefineChordTests {
     func defaults() {
         let settings = Settings(defaults: EphemeralDefaults())
         #expect(settings.refineSelectionEnabled)
-        #expect(settings.refineSelectionChord == .fnThenDictationKey)
-        #expect(settings.effectiveRefineChord == .fnThenDictationKey)
+        #expect(settings.refineSelectionChord == .commandOptionSlash)
+        #expect(settings.effectiveRefineChord == .commandOptionSlash)
     }
 
     @Test("effectiveRefineChord is the one answer the tap, the picker and the status line share")
@@ -152,6 +152,7 @@ struct RefineChordTests {
         // Globe as the dictation key cannot also qualify it, so the chord goes quiet rather than
         // staying armed and never firing.
         settings.hotkey = .fn
+        settings.refineSelectionChord = .fnThenDictationKey
         #expect(settings.effectiveRefineChord == nil)
 
         settings.refineSelectionChord = .optionCommandR

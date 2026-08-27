@@ -249,6 +249,48 @@
 >   `confirmedNotInserted` or `cannotVerify` is demoted to paste-only permanently. Seed it with the known-bad list
 >   in `RECON.md`. This turns the blog post's complaint into a self-healing system instead of a hardcoded blocklist.
 >
+> 45. **Sampling the language modifier at arm time is the wrong contract, and the failure is invisible.**
+>     The modifier was read once, ~120 ms after key-down, and the locale could never change afterwards
+>     because `SpeechAnalyzer` is built around one `Locale` (§3). A `⇧` landing a moment late was
+>     therefore silently discarded — and the English model handed Indonesian speech does not fail, it
+>     resolves unfamiliar phoneme runs into English proper nouns. Measured on the same 15.2 s Indonesian
+>     fixture, same code path, locale the only variable:
+>
+>         id-ID   33 words,  0 of 33 low-confidence
+>                 "Dan ada workshop karena sekarang timnya dia itu sangat kecil dan dia interested…"
+>         en-US   23 words, 19 of 23 low-confidence, 90 wpm
+>                 "Then other workshop Karna Saka Ito Sanga Dunia interested in workshop to my DR info…"
+>
+>     The user's own history holds the same shape verbatim ("Dhanya Sanga interested AI Kanaya Sushma
+>     Manga Cheil Danka", 21 of 24 words low-confidence, 45 s of audio for 24 words). **Decide the
+>     locale when the modifier window closes, not when the hold arms**: `.pressed` opens the microphone
+>     at `armDelay` and the audio buffers; `.alternateSettled`, up to `HotkeyMonitor.alternateWindow`
+>     (400 ms) later, is what an analyzer may be built from. A hold shorter than the window settles at
+>     the release instead of waiting for it.
+>
+>     **This costs nothing measurable.** Buffered audio is consumed at **45–48x realtime**, so a 400 ms
+>     head start is ~9 ms of chewing; measured end to end at realtime pace on 8.7 s of speech, key-up →
+>     committed text was **0.049 s with the window against 0.057 s without it** (-9 ms and -5 ms over
+>     two runs — the reordering is, if anything, marginally faster, because `engine.begin` no longer
+>     delays the microphone). The window's real ceiling is legibility, not latency: the HUD's language
+>     tag must settle while the user is still speaking, and the shortest real dictations in the user's
+>     history are 0.9–1.3 s of audio.
+>
+>     **Two preconditions, both enforced in code.** The two prepared locales must accept the same audio
+>     format, because `AudioCapture`'s converter is configured before the language is known
+>     (`DictationController.localeDecisionDeferrable` falls back to the arm-time contract otherwise);
+>     and the capture stream's `.bufferingNewest` capacity must be sized in seconds, because §20's
+>     oldest-first eviction would now delete the head of *every* utterance rather than only a stalled
+>     one. Measured: 243 661 frames captured, 243 661 delivered, 0 dropped.
+>
+> 46. **`AnalyzerInput.buffer` materialises a fresh `AVAudioPCMBuffer` on every access.** It is a
+>     computed property, not a stored one, and `input.buffer !== theBufferYouPassedIn`. So
+>     `input.buffer.int16ChannelData![0][0]` dereferences a pointer into an object destroyed at the end
+>     of that expression — an immediate `EXC_BAD_ACCESS`, reproduced in a four-line probe. Bind the
+>     buffer to a local first and read through that. The app is unaffected because `SpeechSession.feed`
+>     only ever reads `frameLength`, which is a value; anything that reads *samples* back out of the
+>     capture stream must know this.
+>
 > ### One new feature the recon earned us
 >
 > Per-word `transcriptionConfidence` is strongly discriminative — misheard "Visa" scored 0.05 and "claw" 0.31,
@@ -257,6 +299,30 @@
 > better UX than the manual list Wispr Flow ships. Requires an explicit `Preset` with
 > `attributeOptions: [.transcriptionConfidence, .audioTimeRange]` — the named presets carry `attributeOptions == []`
 > and silently yield a single run with no confidence at all.
+>
+> 47. **The refine gesture is `⌘⌥/`, and a trigger must not insert text.** Measured with
+>     `UCKeyTranslate` on this machine's ABC layout: `/`→`/`, `⌥/`→`÷`, `⌃⌥/`→`/`, `⇧⌥/`→`¿`. A trigger
+>     that types **replaces the user's selection before it can be read**, which is the exact failure the
+>     feature exists to prevent. A Command chord is a key equivalent and inserts nothing, so `⌘⌥/`
+>     needs **no consuming tap** — Edict keeps exactly one listen-only tap at idle. Do not add one here.
+>     Control and Shift are *forbidden* rather than ignored, so this user's four-modifier Safari slash
+>     mapping cannot fire it.
+>
+> 48. **`fn` is not a portable modifier.** Third-party keyboards — Logitech, Keychron, Das —
+>     resolve `fn` in their own firmware and macOS never sees the key, so `maskSecondaryFn` is never set
+>     and no application can observe it. It was measured on the built-in keyboard only and shipped as a
+>     default, which was wrong. It survives as an explicitly Apple-keyboard-only option. A stored
+>     `fnThenDictationKey` is **not** migrated: it was a deliberate choice, and rewriting a user's
+>     setting under them is worse than showing the caveat.
+>
+> 49. **Decide the dictation locale when the modifier window closes, not when the hold arms.**
+>     Sampling the language modifier at `armDelay` (~120 ms) is too tight for a two-key gesture, and the
+>     locale cannot change afterwards because the analyzer is built before audio is analysed. Observed
+>     in the user's real history: Indonesian speech ran through the en-US model and came back as
+>     plausible proper nouns — "Kanaya Sushma Manga Cheil Danka" — because an English lexicon is most
+>     permissive around names. The microphone now opens first, audio buffers in a stream sized in
+>     seconds (RECON §20), and the analyzer is built only once `.alternateSettled` fires. A hold shorter
+>     than the window settles from whatever is held at release.
 
 
 Fixed interfaces. Every implementation agent codes against these signatures exactly.

@@ -11,17 +11,24 @@ import Synchronization
 ///
 /// It owns exactly one sequence and nothing else:
 ///
-///     hotkey down → read the dictionary → engine session → microphone → stream audio
+///     hotkey down → read the dictionary → microphone → buffer audio
+///                 → language window closes → engine session → stream the buffered audio
 ///                 → hotkey up → finalize → Corrector.apply → TextInjector.inject
 ///                 → HistoryStore.append → DictionaryStore.recordHits
 ///
-/// Three invariants govern everything below, and each one is a bug that has already been paid for
-/// somewhere in `RECON.md`:
+/// Four invariants govern everything below, and each one is a bug that has already been paid for
+/// somewhere in `RECON.md` or in the user's own transcript history:
 ///
 /// 1. **The dictionary is read at key-down and never again.** `AnalysisContext` can only be handed
 ///    to `SpeechAnalyzer.init`; `setContext(_:)` mid-stream is a measured silent no-op (RECON §2).
 ///    Key-down is therefore the *only* moment biasing can be chosen, and it is also the moment the
 ///    ~65 ms + ~1.5 ms/term setup cost is free, because it hides behind the user's speech onset.
+/// 4. **The language is chosen when the modifier window closes, not when the hold arms.** The
+///    microphone opens first and the audio buffers; only then is an analyzer built. Deciding at arm
+///    time meant a `⇧` that landed 130 ms after the dictation key was invisible, and the cost of
+///    missing it is not a missing feature — the English model handed Indonesian speech returns
+///    fluent English proper nouns, which is what "the model invents names" actually was. Six
+///    consecutive dictations in the user's history show it, and every garbage one is `en-US`.
 /// 2. **The microphone is never left running.** Every exit from `run(_:)` — success, throw, cancel,
 ///    or a hotkey monitor that lost its tap mid-hold — passes through the same unconditional
 ///    `capture.stop()`. There is no `defer` because `defer` cannot `await`.
@@ -95,6 +102,21 @@ public final class DictationController {
     /// property of the module, which is built per locale, and `AudioCapture`'s converter is configured
     /// from it. They agree in practice; assuming so is not the same as checking.
     private var secondaryAnalyzerFormat: AVAudioFormat?
+
+    /// Whether the language may be chosen *after* the microphone has already opened.
+    ///
+    /// The deferred decision — the whole point of the modifier window — needs the two prepared
+    /// languages to accept the same audio format, because `AudioCapture`'s converter is configured
+    /// at `start()` and the buffered head of the utterance is already in that format by the time the
+    /// language is known. Both come back 1 ch / 16 kHz / Int16 / interleaved on this machine, but
+    /// `availableCompatibleAudioFormats` is a property of the *module*, which is built per locale, so
+    /// this is checked rather than assumed (see `SpeechEngine.bestAudioFormat(secondary:)`, which
+    /// makes the same argument for asking twice).
+    ///
+    /// `false` restores the old arm-time contract exactly: the provisional reading becomes the
+    /// decision at key-down and nothing waits. A wrong language is a bad transcript; a mismatched
+    /// converter is silence.
+    private var localeDecisionDeferrable = true
 
     private var appliedHotkey: HotkeyChoice?
     private var appliedAlternateModifier: HotkeyModifier?
@@ -283,6 +305,8 @@ public final class DictationController {
             model?.apply(secondaryLocaleReady: false)
         }
 
+        refreshLocaleDecisionDeferrable()
+
         // Hand back anything Edict is no longer using. Unconditional, and specifically NOT guarded on
         // having just prepared something: the leak this closes is the one where a *previous* launch
         // reserved a locale the current settings no longer want, which no amount of in-process
@@ -293,6 +317,51 @@ public final class DictationController {
         // reservation starts failing outright, and RECON's probe leaked slots during exploration.
         let reserved = await engine.reservedLocaleIdentifiers()
         Log.engine.notice("reserved locales: \(reserved.joined(separator: ","), privacy: .public)")
+    }
+
+    /// Re-answer "can the language wait until after the microphone opens?" against the two formats
+    /// the engine has just resolved.
+    ///
+    /// Called from `prepareSecondary` and nowhere else, because that is the only place either format
+    /// can change. Compares the four properties the converter is built from; `AVAudioFormat`'s own
+    /// `==` also compares `isStandard` and the channel layout object, which would report a spurious
+    /// difference between two formats the converter would treat identically.
+    private func refreshLocaleDecisionDeferrable() {
+        guard let secondary = secondaryAnalyzerFormat, appliedSecondaryLocale != nil else {
+            // With no second language there is nothing to decide, so deferral costs nothing and the
+            // window simply never changes an answer. Left on so the timing path is the same one the
+            // dual-language user exercises, rather than a branch that only runs for some users.
+            localeDecisionDeferrable = true
+            return
+        }
+        guard let primary = analyzerFormat else {
+            localeDecisionDeferrable = true
+            return
+        }
+        let matches = primary.sampleRate == secondary.sampleRate
+            && primary.channelCount == secondary.channelCount
+            && primary.commonFormat == secondary.commonFormat
+            && primary.isInterleaved == secondary.isInterleaved
+        if matches != localeDecisionDeferrable {
+            localeDecisionDeferrable = matches
+        }
+        if !matches {
+            // Loud, and at `error`: the user silently loses the late-modifier window, which is the
+            // difference between an Indonesian transcript and a page of invented English names.
+            Log.engine.error("""
+                the two dictation languages disagree on their analyzer format \
+                (\(primary.sampleRate, format: .fixed(precision: 0), privacy: .public) Hz \
+                \(primary.channelCount, privacy: .public) ch vs \
+                \(secondary.sampleRate, format: .fixed(precision: 0), privacy: .public) Hz \
+                \(secondary.channelCount, privacy: .public) ch); \
+                the language modifier is back to being sampled at arm time
+                """)
+        } else {
+            Log.engine.debug("""
+                both languages accept \(primary.sampleRate, format: .fixed(precision: 0), privacy: .public) Hz \
+                \(primary.channelCount, privacy: .public) ch; the language may be decided after capture opens
+                """)
+        }
     }
 
     /// Opt-in low-latency mode. Costs a permanently lit orange microphone indicator, which RECON §22
@@ -437,11 +506,56 @@ public final class DictationController {
                 toggleLatched = utterance != nil
             }
 
+        case .alternateSettled(let alternate):
+            // The only place a language is chosen for a hotkey-driven utterance. Arrives once per
+            // `.pressed`, always before `.released`, and may disagree with the provisional reading
+            // that came with `.pressed` — which is the entire reason it exists.
+            settleLocale(alternate: alternate)
+
         case .released:
             // In toggle mode the release of the *starting* press must not stop anything.
             guard settings.pushToTalk else { return }
             end()
         }
+    }
+
+    /// Resolve the language modifier into a locale and hand it to the utterance in flight.
+    ///
+    /// Everything about *which* locale lives here and nowhere else — `HotkeyMonitor` knows only
+    /// about modifier bits. Also the place the HUD's tag is corrected: `apply(activeLocale:)` is
+    /// idempotent, so a settle that agrees with the provisional reading redraws nothing.
+    private func settleLocale(alternate: Bool) {
+        guard let unit = utterance, unit.decision == nil else { return }
+        let decision = resolveLocale(alternate: alternate, announce: true)
+        unit.settle(decision)
+        model?.apply(activeLocale: decision.localeIdentifier, isSecondary: decision.isSecondary)
+    }
+
+    /// "Was the modifier held?" → which of the engine's two prepared languages.
+    ///
+    /// Requests the secondary only if the shortcut is on AND the engine actually holds a reservation
+    /// for the language. A missing reservation makes the modifier inert for this press, which is
+    /// right: the alternative is throwing on a gesture the user cannot un-learn.
+    /// - Parameter announce: log the "modifier held but the language is not prepared" case. Only the
+    ///   call that produces the *decision* announces it; the provisional reading at key-down does not,
+    ///   because it is resolved again a few hundred milliseconds later and may well change.
+    private func resolveLocale(alternate: Bool, announce: Bool) -> LocaleDecision {
+        let wantsSecondary = alternate && settings.effectiveSecondaryLocaleIdentifier != nil
+        let useSecondary = wantsSecondary && appliedSecondaryLocale != nil
+        if announce, wantsSecondary, !useSecondary {
+            Log.engine.error("""
+                the language modifier was held but \
+                \(self.settings.secondaryLocaleIdentifier, privacy: .public) is not prepared; \
+                dictating in \(self.settings.localeIdentifier, privacy: .public)
+                """)
+        }
+        return LocaleDecision(
+            localeIdentifier: useSecondary
+                ? (appliedSecondaryLocale ?? settings.localeIdentifier)
+                : settings.localeIdentifier,
+            engineLocale: useSecondary ? .secondary : .primary,
+            isSecondary: useSecondary
+        )
     }
 
     private func handle(_ diagnostic: HotkeyDiagnostic) {
@@ -572,8 +686,10 @@ public final class DictationController {
 
     /// Key-down. Reads the dictionary *here* and nowhere else (RECON §2).
     ///
-    /// - Parameter alternate: the language modifier was held when the hotkey armed. Maps to the
-    ///   secondary locale here, and nowhere else — `HotkeyMonitor` knows only about modifier bits.
+    /// - Parameter alternate: the language modifier was held when the hotkey armed. **Provisional.**
+    ///   It sets what the HUD draws for the first few hundred milliseconds and nothing else; the
+    ///   locale the analyzer is built from comes from `.alternateSettled` by way of `settleLocale`.
+    ///   For a non-hotkey origin there is no window and no settle owed, so it *is* the decision.
     public func begin(origin: Origin, alternate: Bool = false) {
         guard utterance == nil else {
             Log.engine.debug("begin ignored: an utterance is already in flight")
@@ -589,23 +705,7 @@ public final class DictationController {
         // a long list both costs more and biases *worse* (a 9-term list fixed "Wispr Flow" where a
         // 200-term list fixed neither). `biasingStrings(limit:)` ranks and caps; `effectiveBiasingLimit`
         // is 0 when the user turned biasing off.
-        // ── Which language this one utterance runs in ────────────────────────────────────────────
-        // Requested only if the shortcut is on AND the engine actually holds a reservation for the
-        // language. `secondaryLocale` being nil here means the modifier is inert for this press,
-        // which is right: the alternative is throwing on a gesture the user cannot un-learn.
-        let wantsSecondary = alternate && settings.effectiveSecondaryLocaleIdentifier != nil
-        let useSecondary = wantsSecondary && appliedSecondaryLocale != nil
-        if wantsSecondary && !useSecondary {
-            Log.engine.error("""
-                the language modifier was held but \
-                \(self.settings.secondaryLocaleIdentifier, privacy: .public) is not prepared; \
-                dictating in \(self.settings.localeIdentifier, privacy: .public)
-                """)
-        }
-        let localeIdentifier = useSecondary
-            ? (appliedSecondaryLocale ?? settings.localeIdentifier)
-            : settings.localeIdentifier
-
+        //
         // Biasing is the SAME list for both languages, deliberately.
         //
         // The dictionary holds proper nouns — Vercel, Supabase, Claude Code, Obsidian — not English
@@ -625,21 +725,36 @@ public final class DictationController {
             ? InjectionTarget(bundleID: Self.ownBundleID, appName: "Edict")
             : TextInjector.currentTarget()
 
+        // ── Which language this utterance runs in, and WHEN that is decided ─────────────────────
+        // The provisional reading, which exists only so the HUD has something to draw immediately.
+        // The real decision arrives on `.alternateSettled` up to `HotkeyMonitor.alternateWindow`
+        // later, and `run(_:)` will not build an analyzer until it has.
+        let provisional = resolveLocale(alternate: alternate, announce: false)
+
         let unit = Utterance(
             origin: origin,
             target: target,
             biasing: biasing,
             corrector: corrector,
-            localeIdentifier: localeIdentifier,
-            engineLocale: useSecondary ? .secondary : .primary,
-            analyzerFormat: useSecondary ? secondaryAnalyzerFormat : analyzerFormat,
+            captureFormat: analyzerFormat,
+            provisional: provisional,
             droppedBaseline: capture.statsSnapshot.dropped
         )
         utterance = unit
 
+        // Two reasons the decision is closed here and now rather than waited for:
+        //
+        // * Nothing is coming. `.app` is the Start button, the menu bar and the tests — there is no
+        //   hold, no modifier and no `.alternateSettled` owed, so waiting would hang the utterance.
+        // * Deferral is unsafe. The two prepared languages disagree on their analyzer format, so the
+        //   converter cannot be configured before the language is known and the old arm-time
+        //   contract is the only correct one. See `localeDecisionDeferrable`.
         model?.clearLiveText()
-        model?.apply(activeLocale: localeIdentifier, isSecondary: useSecondary)
+        model?.apply(activeLocale: provisional.localeIdentifier, isSecondary: provisional.isSecondary)
         model?.apply(phase: .arming)
+        if origin != .hotkey || !localeDecisionDeferrable {
+            settleLocale(alternate: alternate)
+        }
         playFeedback(.start)
 
         unit.task = Task { [weak self] in
@@ -652,6 +767,12 @@ public final class DictationController {
         guard let unit = utterance, !unit.stopRequested, !unit.cancelRequested else { return }
         unit.stopRequested = true
         toggleLatched = false
+        // Normally a no-op: `HotkeyMonitor` emits `.alternateSettled` before `.released` on the same
+        // stream, handled by the same task, so the decision is already made by the time a key release
+        // reaches here. This is for the paths that never go through a release — the duration
+        // watchdog, the Stop button, a tap that died mid-hold — where the language would otherwise
+        // never arrive and `run(_:)` would stay suspended for ever.
+        fallBackToProvisionalIfUndecided(unit, why: "stop")
         Log.engine.debug("stop requested")
         // Finishing the audio stream is what lets `finalizeAndFinishThroughEndOfInput()` return
         // (RECON §5). The feed loop in `run` ends as a consequence; nothing else is signalled.
@@ -668,9 +789,23 @@ public final class DictationController {
         guard let unit = utterance else { return }
         unit.cancelRequested = true
         toggleLatched = false
+        // Same reason as in `end()`, and it matters more here: Esc must be able to tear an utterance
+        // down even when it is parked waiting for a decision.
+        fallBackToProvisionalIfUndecided(unit, why: "cancel")
         Log.engine.notice("utterance cancelled")
         let capture = self.capture
         Task { await capture.stop() }
+    }
+
+    private func fallBackToProvisionalIfUndecided(_ unit: Utterance, why: String) {
+        guard unit.decision == nil else { return }
+        Log.engine.notice("""
+            no language decision arrived before \(why, privacy: .public); \
+            falling back to the arm-time reading (\(unit.provisional.localeIdentifier, privacy: .public))
+            """)
+        unit.settle(unit.provisional)
+        model?.apply(activeLocale: unit.provisional.localeIdentifier,
+                     isSecondary: unit.provisional.isSecondary)
     }
 
     // MARK: - The sequence
@@ -681,8 +816,57 @@ public final class DictationController {
         var session: (any TranscriptionSession)?
         var watchdog: Task<Void, Never>?
 
+        let openedAt = Date()
+
         do {
             await engine.setBiasing(unit.biasing)
+
+            // ── Capture first, analyzer second. This ordering IS the fix. ───────────────────────
+            //
+            // The microphone opens here, before the language is known, and the buffers pile up in
+            // the stream's own queue — which is sized in *seconds*, 100 of them, precisely because
+            // `.bufferingNewest` discards the OLDEST element and would otherwise delete the
+            // beginning of the utterance and look like a model failure (RECON §20). Nothing consumes
+            // the stream until the feed loop below, so every buffer captured while the decision was
+            // open is still in it, in order, when the analyzer finally exists.
+            //
+            // Two things improve for free by moving `capture.start` above `engine.begin`:
+            //
+            // * The language modifier gets a real window to arrive in. That is the point.
+            // * `engine.begin` can *wait* — `claimSlot` gives the previous utterance up to 1.5 s to
+            //   finish finalizing (RECON §8 puts the real window at 0.15–0.53 s) — and that wait
+            //   used to happen with the microphone shut, so a press-pause-press rhythm silently
+            //   dropped the first half-second of the second sentence. Now it is captured.
+            let stream = try await capture.start(targetFormat: unit.captureFormat ?? analyzerFormat)
+            audioStarted = true
+            // `.listening` the moment the microphone is live, which is now *earlier* than before
+            // rather than later: the HUD must not claim to be arming while audio is being recorded.
+            model?.apply(phase: .listening)
+
+            // Started from the moment audio starts flowing, not from the moment the analyzer exists,
+            // so the ceiling covers the whole recording however long the decision took.
+            watchdog = Task { [weak self] in
+                try? await Task.sleep(for: Self.maxUtteranceDuration)
+                guard !Task.isCancelled else { return }
+                Log.engine.error("utterance exceeded the maximum duration; forcing a stop")
+                self?.end()
+            }
+
+            // ── The language, at last ──────────────────────────────────────────────────────────
+            // Resolved already for an `.app`-origin utterance and for the non-deferrable case, so
+            // this returns without suspending there. For a hotkey hold it waits for the modifier
+            // window to close — or for the release, if the user let go first.
+            let decision = await unit.awaitDecision()
+            let waited = -openedAt.timeIntervalSinceNow
+            Log.engine.info("""
+                locale settled after \(waited * 1000, format: .fixed(precision: 1), privacy: .public) ms: \
+                \(decision.localeIdentifier, privacy: .public)\
+                \(decision.isSecondary ? " (modifier)" : "")
+                """)
+
+            // A cancel or a very fast tap can land while the decision was open. Bail before an
+            // analyzer is built for an utterance nobody wants.
+            try unit.checkCancelled()
 
             // Sendable box: the update callback fires off the main actor from the analyzer's
             // results task, so it hops rather than touching `AppModel` directly.
@@ -692,29 +876,16 @@ public final class DictationController {
             // Throws rather than falling back if the secondary language's assets are missing. That is
             // the whole point: an English model handed Indonesian speech does not fail, it returns
             // confident English nonsense and the injection ladder types it into the user's document.
-            let started = try await engine.begin(locale: unit.engineLocale, onUpdate: { update in
+            let started = try await engine.begin(locale: decision.engineLocale, onUpdate: { update in
                 sink.publish(committed: update.finalText, volatile: update.volatileText)
             })
             session = started
             unit.session = started
 
-            // A cancel or a very fast tap can land while `begin` was awaiting. Bail before the
-            // microphone is ever opened.
-            try unit.checkCancelled()
-
-            let stream = try await capture.start(targetFormat: unit.analyzerFormat ?? analyzerFormat)
-            audioStarted = true
-            model?.apply(phase: .listening)
-
-            watchdog = Task { [weak self] in
-                try? await Task.sleep(for: Self.maxUtteranceDuration)
-                guard !Task.isCancelled else { return }
-                Log.engine.error("utterance exceeded the maximum duration; forcing a stop")
-                self?.end()
-            }
-
-            // The user may have released the key while `start` was awaiting; `stop()` is safe to
-            // call before the first buffer and simply finishes the stream immediately.
+            // The user may have released the key while any of the above was awaiting; `stop()` is
+            // safe to call before the first buffer and simply finishes the stream — which does NOT
+            // discard what is already queued in it, so a hold shorter than the whole set-up still
+            // delivers every buffer it captured.
             if unit.stopRequested || unit.cancelRequested {
                 await capture.stop()
             }
@@ -785,6 +956,10 @@ public final class DictationController {
         // "Inserting" for the whole of a wait that is not an insertion.
         let dropped = max(0, capture.statsSnapshot.dropped - unit.droppedBaseline)
         let raw = outcome.text
+        // Non-nil by construction: `run(_:)` awaits the decision before it builds the analyzer that
+        // produced this outcome. The fallback is the primary language rather than a crash, because a
+        // transcript labelled with the wrong language is a smaller loss than a lost transcript.
+        let localeIdentifier = unit.decision?.localeIdentifier ?? settings.localeIdentifier
 
         // Layer 2 runs off the main actor. `Corrector` is `Sendable` and the rule set was frozen at
         // key-down, so this is a pure function of two immutable values — the one piece of per-
@@ -803,7 +978,7 @@ public final class DictationController {
         // releasing the key and the text appearing. See `Settings.refineBeforeInsert`.
         let refinement = await refineBeforeInserting(
             corrected.text,
-            localeIdentifier: unit.localeIdentifier
+            localeIdentifier: localeIdentifier
         )
 
         model?.apply(phase: .injecting)
@@ -815,7 +990,7 @@ public final class DictationController {
             corrections: corrected.hits,
             audioDuration: outcome.audioDuration,
             transcribeDuration: outcome.latency,
-            localeIdentifier: unit.localeIdentifier,
+            localeIdentifier: localeIdentifier,
             targetBundleID: unit.target.bundleID,
             targetAppName: unit.target.appName,
             injection: injection,
@@ -1265,18 +1440,30 @@ private final class Utterance {
     let target: InjectionTarget
     let biasing: [String]
     let corrector: Corrector
-    /// The language actually used, recorded on the `Transcript` so history can show it.
-    let localeIdentifier: String
-    /// Which of the engine's two prepared locales runs this utterance. Frozen at key-down for the same
-    /// reason as everything else here: the framework takes one `Locale` per analyzer and there is no
-    /// way to change it mid-stream.
-    let engineLocale: SpeechEngine.UtteranceLocale
-    /// The analyzer-compatible format for `engineLocale`. Carried on the utterance rather than read at
-    /// use time so the converter and the analyzer cannot end up disagreeing if the locale changes
-    /// while this utterance is in flight.
-    let analyzerFormat: AVAudioFormat?
+    /// The format every microphone buffer of this utterance is converted into.
+    ///
+    /// Frozen at key-down and **not** per-locale, unlike everything else about the language: capture
+    /// now opens before the language is known, so the converter cannot be configured from a decision
+    /// that has not been made yet. `DictationController.localeDecisionDeferrable` is the guard that
+    /// makes this safe — it refuses to defer at all unless the two prepared languages agree on their
+    /// analyzer format, which on this machine they do (1 ch / 16 kHz / Int16 / interleaved for both).
+    let captureFormat: AVAudioFormat?
+    /// What the modifier looked like at arm time. Not the decision — the fallback for the paths that
+    /// end an utterance without the monitor ever getting to close the window (a dead tap, the
+    /// duration watchdog, Esc, a lost permission). Without it those paths would leave `run(_:)`
+    /// suspended on a decision that is never coming, and the app wedged with an utterance in flight.
+    let provisional: LocaleDecision
     /// `CaptureStats` is cumulative for the process, so per-utterance drops are a delta.
     let droppedBaseline: Int
+
+    /// The language, once the modifier window has closed. `nil` while the decision is still open.
+    ///
+    /// This is the whole point of the change: it starts out `nil`, audio is already being captured
+    /// against it being `nil`, and the analyzer is built only once it is not.
+    private(set) var decision: LocaleDecision?
+    /// Suspended `run(_:)` continuations waiting for `decision`. At most one in practice; an array
+    /// because a second waiter must not silently overwrite the first.
+    private var decisionWaiters: [CheckedContinuation<LocaleDecision, Never>] = []
 
     var task: Task<Void, Never>?
     var session: (any TranscriptionSession)?
@@ -1288,24 +1475,56 @@ private final class Utterance {
         target: InjectionTarget,
         biasing: [String],
         corrector: Corrector,
-        localeIdentifier: String,
-        engineLocale: SpeechEngine.UtteranceLocale,
-        analyzerFormat: AVAudioFormat?,
+        captureFormat: AVAudioFormat?,
+        provisional: LocaleDecision,
         droppedBaseline: Int
     ) {
         self.origin = origin
         self.target = target
         self.biasing = biasing
         self.corrector = corrector
-        self.localeIdentifier = localeIdentifier
-        self.engineLocale = engineLocale
-        self.analyzerFormat = analyzerFormat
+        self.captureFormat = captureFormat
+        self.provisional = provisional
         self.droppedBaseline = droppedBaseline
+    }
+
+    /// Publish the language. Idempotent: the first caller wins, so a window that closes at the same
+    /// moment as a release cannot decide twice.
+    func settle(_ decision: LocaleDecision) {
+        guard self.decision == nil else { return }
+        self.decision = decision
+        let waiters = decisionWaiters
+        decisionWaiters = []
+        for waiter in waiters { waiter.resume(returning: decision) }
+    }
+
+    /// Wait for the language. Returns immediately when it is already known — which is the common
+    /// case for a hold long enough that the window closed while `capture.start()` was awaiting.
+    func awaitDecision() async -> LocaleDecision {
+        if let decision { return decision }
+        return await withCheckedContinuation { continuation in
+            decisionWaiters.append(continuation)
+        }
     }
 
     func checkCancelled() throws {
         if cancelRequested { throw CancellationError() }
     }
+}
+
+// MARK: - LocaleDecision
+
+/// Which language one utterance runs in, and therefore which analyzer gets built.
+///
+/// A value rather than three loose fields on `Utterance` so that "the decision" is one thing that is
+/// either made or not made. It is what `Utterance.decision` being non-`nil` *means*.
+struct LocaleDecision: Sendable, Equatable {
+    /// The identifier recorded on the `Transcript`, in Edict's own spelling — `id-ID`, not `id_ID`.
+    let localeIdentifier: String
+    /// Which of the engine's two prepared locales to build the analyzer from.
+    let engineLocale: SpeechEngine.UtteranceLocale
+    /// True when the language modifier chose this, for the HUD's tag.
+    let isSecondary: Bool
 }
 
 // MARK: - LiveTextRelay

@@ -6,13 +6,34 @@ import Foundation
 // MARK: - Public surface
 
 public enum HotkeyEvent: Sendable, Hashable {
-    /// The key has been held long enough to be a deliberate dictation gesture. Start recording.
+    /// The key has been held long enough to be a deliberate dictation gesture. **Start capturing
+    /// audio** — but do not yet commit to a language.
     ///
     /// - Parameter alternate: the configured language modifier was held at the moment the hold armed.
-    ///   The monitor deliberately knows nothing about locales — it reports the modifier state and
-    ///   `DictationController` maps it to a language. Sampled once, at arm time, and never revised for
-    ///   the rest of the hold; see `armTimerFired`.
+    ///   This is a *provisional* reading, good only for showing the user something immediately. It is
+    ///   superseded by the `.alternateSettled` that always follows, and a consumer that chooses an
+    ///   acoustic model from this value has the bug this pair of events exists to fix — see
+    ///   `timerFired`.
     case pressed(alternate: Bool)
+    /// The language-modifier window has closed: **this** is the reading to choose a locale from.
+    ///
+    /// Emitted exactly once per `.pressed`, always before the matching `.released`, whichever of the
+    /// two ends the hold. `alternate` is the modifier state at whichever came first — the window
+    /// closing, or the key coming up.
+    ///
+    /// ## Why the monitor reports the decision twice
+    ///
+    /// A two-handed chord has no natural order and no fixed skew. Sampling once, `armDelay` (~120 ms)
+    /// after key-down, made a modifier that landed a moment late invisible — and the cost of missing
+    /// it is not a missing feature, it is Indonesian speech handed to the English acoustic model,
+    /// which does not fail but returns a confident salad of English proper nouns. Six consecutive
+    /// dictations from the user's own history show it: every garbage segment was `en-US`.
+    ///
+    /// The framework will not let the locale be revised later — `DictationTranscriber` takes one
+    /// `Locale` and `SpeechAnalyzer` is built around it (RECON §3) — so the fix cannot be to change
+    /// the model mid-utterance. It is to stop *deciding* so early: capture opens on `.pressed`, the
+    /// audio buffers, and the analyzer is not built until this event says which language it is for.
+    case alternateSettled(alternate: Bool)
     /// The hold ended. Always follows a `.pressed`, exactly once — including when the hold was aborted,
     /// so a consumer can never be left recording forever.
     case released
@@ -199,19 +220,14 @@ struct HotkeyBinding: Sendable, Hashable {
 /// * **Qualified** (`fn` then the dictation key). Recognised in the `.flagsChanged` branch at the
 ///   moment the dictation key goes *down*, from the qualifier bit carried on that very event. This
 ///   is the whole ordering rule: the bit is either already set when the key goes down, or it is not.
-/// * **Discrete** (`⌥⌘R`, `⌃⌥R`). Recognised in the `.keyDown` branch, from a keycode plus a
-///   required-and-forbidden pair of flag masks.
+/// * **Discrete** (`⌘⌥/`, `⌥⌘R`, `⌃⌥R`). Recognised in the `.keyDown` branch, from a keycode plus a
+///   required-and-forbidden pair of flag masks, both taken from ``RefineChord/discrete``.
 ///
 /// Everything is a bit test. RECON amendment 31 measured Right Option arriving as `0x00080140`
 /// rather than the expected `0x00080040` because a keyboard remapper stamps `nonCoalesced` (`0x100`)
 /// on every event it synthesizes, and this file's own probe measured `0x20000000` on every
 /// posted one — so any comparison against a literal raw word silently never fires.
 struct RefineChordBinding: Sendable, Hashable {
-
-    /// Virtual keycodes this file needs beyond ``HotkeyBinding/KeyCode``.
-    private enum KeyCode {
-        static let r: Int64 = 15   // kVK_ANSI_R
-    }
 
     /// Flag bits meaning "the qualifier is held", or `nil` for the discrete family.
     let qualifierMask: UInt64?
@@ -243,17 +259,17 @@ struct RefineChordBinding: Sendable, Hashable {
             requiredFlags = 0
             forbiddenFlags = 0
 
-        case .optionCommandR, .controlOptionR:
+        case .commandOptionSlash, .optionCommandR, .controlOptionR:
+            // The keycode and the required/forbidden masks are `RefineChord`'s own decision table,
+            // not this file's: they are pure logic over `(keyCode, rawFlags)` and are unit-tested
+            // there without a tap. This file keeps only the part that needs a *setting* — the
+            // dictation key's device bit, below.
+            guard let table = chord.discrete else { return nil }
             qualifierMask = nil
             qualifierKeyCodes = []
-            discreteKeyCode = KeyCode.r
-            let required: UInt64 = chord == .optionCommandR
-                ? UInt64(CGEventFlags.maskAlternate.rawValue) | UInt64(CGEventFlags.maskCommand.rawValue)
-                : UInt64(CGEventFlags.maskControl.rawValue) | UInt64(CGEventFlags.maskAlternate.rawValue)
-            let excluded: UInt64 = chord == .optionCommandR
-                ? UInt64(CGEventFlags.maskControl.rawValue) | UInt64(CGEventFlags.maskShift.rawValue)
-                : UInt64(CGEventFlags.maskCommand.rawValue) | UInt64(CGEventFlags.maskShift.rawValue)
-            requiredFlags = required
+            discreteKeyCode = table.keyCode
+            requiredFlags = table.requiredFlags
+            let excluded: UInt64 = table.forbiddenFlags
             // Plus the dictation key's own *device* bit. Without this, a user whose dictation key is
             // Right Option and who reaches for ⌥⌘R with that key would fire the chord out of a hold
             // that has already armed — a popup and a half-second recording from one gesture. Only the
@@ -388,6 +404,21 @@ public final class HotkeyMonitor: Sendable {
         case none, install, remove
     }
 
+    /// Which of the hold's two deadlines the one shared timer is counting down to.
+    ///
+    /// One timer, two deadlines, rather than a second `CFRunLoopTimer`: the timer is created and
+    /// invalidated on the tap thread as part of `TapResources`, and a second one would double that
+    /// teardown ordering for no benefit. Rescheduling costs no allocation (see the timer's own
+    /// comment), so the cheap thing is also the simple thing.
+    private enum HoldStage: Sendable {
+        /// No hold, or the hold is finished. The timer is parked in the far future.
+        case idle
+        /// Counting down `armDelay` to `.pressed`.
+        case arming
+        /// Counting down the rest of `alternateWindow` to `.alternateSettled`.
+        case settling
+    }
+
     private final class TapState: @unchecked Sendable {
         private let lock = NSLock()
 
@@ -426,6 +457,11 @@ public final class HotkeyMonitor: Sendable {
         var lastObservedFlags: UInt64 = 0
         /// True once `.pressed` has been emitted for the current hold.
         var armed = false
+        /// What the single shared run-loop timer is currently counting down to.
+        var stage: HoldStage = .idle
+        /// True once `.alternateSettled` has been emitted for the current hold. Exactly one per
+        /// `.pressed`, whichever of the window and the key release gets there first.
+        var settled = false
         /// True once this hold has been disqualified; suppresses repeat cancellations.
         var chorded = false
         /// Set after a failed re-enable so the watchdog reports `.permissionLost` exactly once.
@@ -479,8 +515,52 @@ public final class HotkeyMonitor: Sendable {
     /// who want the last millisecond.
     public let armDelay: TimeInterval
 
-    public init(armDelay: TimeInterval = 0.12) {
+    /// How long after key-down the language modifier is still allowed to arrive, measured from
+    /// key-down and therefore inclusive of `armDelay`.
+    ///
+    /// ## Why 400 ms, and why the number costs nothing
+    ///
+    /// The old behaviour sampled the modifier at `armDelay`, ~120 ms, which is inside the skew of a
+    /// two-handed chord. The cost of losing the modifier is the wrong acoustic model for the whole
+    /// utterance, and an English model fed Indonesian does not fail — it invents proper nouns.
+    ///
+    /// Widening the window is nearly free because the decision no longer gates *capture*:
+    /// `.pressed` still fires at `armDelay`, the microphone opens there, and the audio buffers in
+    /// the capture stream (sized in seconds — RECON §20) until `.alternateSettled` says which
+    /// analyzer to build. The analyzer then consumes the buffered head far faster than realtime, so
+    /// the head-start is absorbed rather than added to the user's wait.
+    ///
+    /// The ceiling is not latency, it is legibility: the HUD's language tag has to be *settled*
+    /// while the user is still speaking, or it cannot be the thing that catches the mistake. The
+    /// shortest real dictations in the user's history run 0.9–1.3 s of audio, so 400 ms leaves at
+    /// least half a second of settled readout even on those, and a hold that ends before the window
+    /// closes settles at the release instead of waiting for it.
+    ///
+    /// Values at or below `armDelay` collapse to the old arm-time behaviour, which is what the
+    /// regression tests use to pin it.
+    public let alternateWindow: TimeInterval
+
+    /// Reads the *current* modifier flags for the whole session — the second, independent source for
+    /// "is the language modifier held".
+    ///
+    /// Injectable for one reason: the real implementation reads the user's live keyboard, so a test
+    /// that asserted "no modifier was held" would be asserting something about whatever the user's
+    /// hands were doing at the time. RECON §43 measured this call latched at `maskCommand` for over
+    /// three seconds with no key down, which is exactly the kind of thing a test must be able to
+    /// supply rather than inherit.
+    private let pollFlags: @Sendable () -> UInt64
+
+    /// - Parameter pollFlags: test seam only; the default is the measured-safe production read.
+    public convenience init(armDelay: TimeInterval = 0.12, alternateWindow: TimeInterval = 0.40) {
+        self.init(armDelay: armDelay, alternateWindow: alternateWindow, pollFlags: Self.pollSessionFlags)
+    }
+
+    init(armDelay: TimeInterval,
+         alternateWindow: TimeInterval,
+         pollFlags: @escaping @Sendable () -> UInt64) {
+        self.pollFlags = pollFlags
         self.armDelay = armDelay
+        self.alternateWindow = alternateWindow
         // Unbounded on purpose. `.bufferingNewest` discards the OLDEST element (RECON §20), which here
         // would mean dropping a `.released` and leaving the app recording forever.
         (eventStream, eventContinuation) = AsyncStream<HotkeyEvent>.makeStream(bufferingPolicy: .unbounded)
@@ -740,7 +820,7 @@ public final class HotkeyMonitor: Sendable {
             .greatestFiniteMagnitude,
             0, 0
         ) { [weak self] _ in
-            self?.armTimerFired()
+            self?.timerFired()
         }
         if let timer { CFRunLoopAddTimer(runLoop, timer, .commonModes) }
 
@@ -1177,65 +1257,150 @@ public final class HotkeyMonitor: Sendable {
             guard s.holdStart == nil else { return nil }   // ignore duplicate down reports
             s.holdStart = CFAbsoluteTimeGetCurrent()
             s.armed = false
+            s.settled = false
             s.chorded = false
+            s.stage = .arming
             return s.resources?.timer
         }
+        // The state above is set whether or not a timer exists. Only a monitor with live tap
+        // resources has one, and the hold machine has to be drivable without them — that is what
+        // lets `LateLocaleTests` walk a synthetic timeline through the real code instead of
+        // through a copy of it. A monitor with no timer simply never reaches its own deadlines.
         guard let timer else { return }
         CFRunLoopTimerSetNextFireDate(timer, CFAbsoluteTimeGetCurrent() + armDelay)
         diagnosticContinuation.yield(.holdBegan)
     }
 
-    /// Fires `armDelay` after key-down. Only here does a hold become a recording.
+    /// The one timer callback for both of a hold's deadlines. Dispatches on `TapState.stage`.
     ///
-    /// ## The language modifier is sampled HERE, and this is the contract
+    /// ## Arm, then settle
     ///
-    /// Not at key-down. The whole `armDelay` window (~120 ms) is a grace period in which the user may
-    /// press the hotkey and the modifier **in either order** and still get the secondary language —
-    /// which matters because there is no natural order for a two-handed chord, and requiring one would
-    /// mean silently dictating Indonesian speech with an English model whenever the thumbs landed the
-    /// wrong way round. Pressing the modifier *after* arming does not retroactively change the
-    /// language: the locale is fixed for the whole utterance by the framework
-    /// (`DictationTranscriber` takes one `Locale`), so there is nothing to change it to.
-    private func armTimerFired() {
-        let sample: (binding: HotkeyBinding, observed: UInt64)? = state.withLock { s in
-            guard s.holdStart != nil, !s.armed, !s.chorded, let binding = s.binding else { return nil }
-            s.armed = true
-            return (binding, s.lastObservedFlags)
+    /// - At `armDelay` the hold becomes a recording: `.pressed` is emitted and the microphone opens.
+    ///   The `alternate` carried on it is **provisional** — enough for the HUD to show something at
+    ///   once, not enough to choose an acoustic model.
+    /// - At `alternateWindow` the language is decided and `.alternateSettled` is emitted. This is the
+    ///   reading `DictationController` builds the analyzer from.
+    ///
+    /// The whole window is a grace period in which the user may press the hotkey and the modifier in
+    /// **either order, with either hand first**, and still get the secondary language. There is no
+    /// natural order for a two-handed chord, and the old contract — one sample at `armDelay` —
+    /// silently punished the wrong order by transcribing Indonesian speech with the English model.
+    ///
+    /// Beyond `alternateWindow` the modifier really is inert: the framework fixes the locale for the
+    /// whole utterance, so past the point where the analyzer exists there is nothing left to change.
+    private func timerFired() {
+        enum Next { case none, arm(HotkeyBinding, UInt64, CFAbsoluteTime), settle(HotkeyBinding, UInt64) }
+
+        let next: Next = state.withLock { s in
+            guard let start = s.holdStart, !s.chorded, let binding = s.binding else { return .none }
+            switch s.stage {
+            case .idle:
+                return .none
+            case .arming:
+                guard !s.armed else { return .none }
+                s.armed = true
+                // A window at or inside the arm delay is not a window: settle in the same step, so
+                // the contract ("exactly one `.alternateSettled` per `.pressed`") holds for a
+                // monitor configured the old way.
+                if alternateWindow <= armDelay {
+                    s.settled = true
+                    s.stage = .idle
+                    return .arm(binding, s.lastObservedFlags, .nan)
+                }
+                s.stage = .settling
+                return .arm(binding, s.lastObservedFlags, start + alternateWindow)
+            case .settling:
+                guard !s.settled else { return .none }
+                s.settled = true
+                s.stage = .idle
+                return .settle(binding, s.lastObservedFlags)
+            }
         }
-        guard let sample else { return }
 
-        // `.combinedSessionState`, NEVER `.privateState`: RECON's injection section measured
-        // `CGEventSource.flagsState(.privateState)` blocking FOREVER — the probe process had to be
-        // SIGTERMed at both 12 s and 120 s. Blocking here would wedge the tap thread's run loop and
-        // kill the hotkey outright.
-        let polled = CGEventSource.flagsState(.combinedSessionState).rawValue
-        // Two independent sources, OR-ed. Either one saying the modifier is held is enough: the tap's
-        // own last `.flagsChanged` cannot be inert, and the poll covers a modifier that was already
-        // down before the tap started. They agree in the normal case.
-        let alternate = sample.binding.isAlternateHeld(rawFlags: polled)
-            || sample.binding.isAlternateHeld(rawFlags: sample.observed)
+        switch next {
+        case .none:
+            break
 
-        Log.hotkey.debug("""
-            hotkey armed polled=0x\(String(polled, radix: 16), privacy: .public) \
-            observed=0x\(String(sample.observed, radix: 16), privacy: .public) \
-            alternate=\(alternate, privacy: .public)
-            """)
-        eventContinuation.yield(.pressed(alternate: alternate))
+        case .arm(let binding, let observed, let deadline):
+            let alternate = isAlternateHeld(binding, observed: observed)
+            Log.hotkey.debug("""
+                hotkey armed observed=0x\(String(observed, radix: 16), privacy: .public) \
+                provisional alternate=\(alternate, privacy: .public)
+                """)
+            eventContinuation.yield(.pressed(alternate: alternate))
+            if deadline.isNaN {
+                // Collapsed window: the provisional reading *is* the decision.
+                eventContinuation.yield(.alternateSettled(alternate: alternate))
+            } else if let timer = state.withLock({ $0.resources?.timer }) {
+                CFRunLoopTimerSetNextFireDate(timer, deadline)
+            }
+
+        case .settle(let binding, let observed):
+            let alternate = isAlternateHeld(binding, observed: observed)
+            Log.hotkey.info("""
+                language window closed: observed=0x\(String(observed, radix: 16), privacy: .public) \
+                alternate=\(alternate, privacy: .public)
+                """)
+            eventContinuation.yield(.alternateSettled(alternate: alternate))
+        }
+    }
+
+    /// Is the language modifier held? Two independent sources, OR-ed.
+    ///
+    /// `observed` is the raw flags word from the tap's most recent `.flagsChanged`, which cannot be
+    /// inert. The poll covers a modifier that was already down before the tap started, and RECON
+    /// could not confirm `CGEventSource.flagsState` works at all without Input Monitoring, so
+    /// neither source is trusted alone.
+    ///
+    /// `.combinedSessionState`, NEVER `.privateState`: RECON §27 measured
+    /// `CGEventSource.flagsState(.privateState)` blocking FOREVER — the probe had to be SIGTERMed at
+    /// both 12 s and 120 s. Blocking here would wedge the tap thread's run loop and kill the hotkey
+    /// outright. RECON §43 is why the poll is only ever an *additional* yes and never a no: it was
+    /// measured latched at `maskCommand` for over three seconds with no key down.
+    private func isAlternateHeld(_ binding: HotkeyBinding, observed: UInt64) -> Bool {
+        if binding.isAlternateHeld(rawFlags: observed) { return true }
+        return binding.isAlternateHeld(rawFlags: pollFlags())
+    }
+
+    private static let pollSessionFlags: @Sendable () -> UInt64 = {
+        CGEventSource.flagsState(.combinedSessionState).rawValue
     }
 
     private func endHold() {
         enum Ending { case none, released(TimeInterval), tooShort(TimeInterval) }
+        // The settle, if this release beat the window to it. Sampled inside the same lock step that
+        // tears the hold down, so a window closing on the tap thread and a release arriving on it
+        // cannot both emit one.
+        var settle: (binding: HotkeyBinding, observed: UInt64)?
         let ending: Ending = state.withLock { s in
             guard let start = s.holdStart else { return .none }
             let held = CFAbsoluteTimeGetCurrent() - start
             let wasArmed = s.armed
+            if wasArmed, !s.settled, let binding = s.binding {
+                s.settled = true
+                settle = (binding, s.lastObservedFlags)
+            }
             s.holdStart = nil
             s.armed = false
+            s.settled = false
             s.chorded = false
+            s.stage = .idle
             if let timer = s.resources?.timer {
                 CFRunLoopTimerSetNextFireDate(timer, Date.distantFuture.timeIntervalSinceReferenceDate)
             }
             return wasArmed ? .released(held) : .tooShort(held)
+        }
+        // A hold shorter than the window is not a hold that loses the feature: the modifier held at
+        // the release is the decision. Emitted BEFORE `.released`, because the consumer needs the
+        // language before it can finish the utterance the release just ended.
+        if let settle {
+            let alternate = isAlternateHeld(settle.binding, observed: settle.observed)
+            Log.hotkey.info("""
+                language settled at release (window had not closed): \
+                observed=0x\(String(settle.observed, radix: 16), privacy: .public) \
+                alternate=\(alternate, privacy: .public)
+                """)
+            eventContinuation.yield(.alternateSettled(alternate: alternate))
         }
         switch ending {
         case .none:
@@ -1258,14 +1423,21 @@ public final class HotkeyMonitor: Sendable {
         abortHold(reason: reason)
     }
 
-    /// Ends the current hold without waiting for a key release. Emits `.released` if and only if a
-    /// `.pressed` was already emitted, so the pressed/released pairing invariant always holds.
+    /// Ends the current hold without waiting for a key release. Emits `.alternateSettled` and then
+    /// `.released` if and only if a `.pressed` was already emitted, so both pairing invariants hold.
     private func abortHold(reason: HotkeyCancelReason) {
+        var settle: (binding: HotkeyBinding, observed: UInt64)?
         let wasArmed: Bool = state.withLock { s in
             let armed = s.armed
+            if armed, !s.settled, let binding = s.binding {
+                s.settled = true
+                settle = (binding, s.lastObservedFlags)
+            }
             s.holdStart = nil
             s.armed = false
+            s.settled = false
             s.chorded = true
+            s.stage = .idle
             if let timer = s.resources?.timer {
                 CFRunLoopTimerSetNextFireDate(timer, Date.distantFuture.timeIntervalSinceReferenceDate)
             }
@@ -1273,10 +1445,59 @@ public final class HotkeyMonitor: Sendable {
         }
         diagnosticContinuation.yield(.cancelled(reason))
         if wasArmed {
+            // An abort commits what was already spoken (see `DictationController.handle`), so it owes
+            // the consumer a language just as much as a clean release does.
+            if let settle {
+                eventContinuation.yield(
+                    .alternateSettled(alternate: isAlternateHeld(settle.binding, observed: settle.observed)))
+            }
             Log.hotkey.notice("hold aborted after arming (\(String(describing: reason), privacy: .public))")
             eventContinuation.yield(.released)
         }
     }
+
+    // MARK: The hold machine, without a keyboard
+
+    /// A synthetic timeline for the hold state machine: no event tap, no Input Monitoring, no finger.
+    ///
+    /// This is the *only* way the language decision can be tested. The real inputs are a CGEventTap
+    /// that needs a system permission and a human hand, and RECON §40 rules out driving the running
+    /// app — so without a seam here the timing rule that decides which acoustic model transcribes the
+    /// user's speech would be covered by nothing at all. It exists because that rule already shipped
+    /// wrong once.
+    ///
+    /// It drives the **production** methods, not a copy of them: `beginHold`, `timerFired`,
+    /// `endHold` and `abortHold` are exactly what the tap callback and the run-loop timer call. The
+    /// only thing the harness stands in for is *when* — which is the CFRunLoopTimer's job, and is
+    /// itself two lines (`SetNextFireDate(start + armDelay)`, then `start + alternateWindow`) that
+    /// `LateLocaleTests` reproduces against the real clock.
+    struct HoldHarness {
+        let monitor: HotkeyMonitor
+
+        /// Bind a key and a language modifier, as `start(key:alternate:refine:)` would.
+        func bind(_ key: HotkeyChoice, alternate: HotkeyModifier?) {
+            monitor.state.withLock { $0.binding = HotkeyBinding(key, alternate: alternate) }
+        }
+
+        /// A `.flagsChanged` arrived carrying this complete modifier state.
+        func flagsChanged(to rawFlags: UInt64) {
+            monitor.state.withLock { $0.lastObservedFlags = rawFlags }
+        }
+
+        /// The dictation key went down.
+        func keyDown() { monitor.beginHold() }
+
+        /// The next deadline came round: `armDelay` the first time, `alternateWindow` the second.
+        func deadline() { monitor.timerFired() }
+
+        /// The dictation key came up.
+        func keyUp() { monitor.endHold() }
+
+        /// The hold was disqualified — a chorded modifier, a dead tap, a rebind mid-hold.
+        func abort(_ reason: HotkeyCancelReason) { monitor.abortHold(reason: reason) }
+    }
+
+    var holdHarness: HoldHarness { HoldHarness(monitor: self) }
 
     // MARK: Diagnostics
 

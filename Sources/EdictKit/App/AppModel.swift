@@ -449,7 +449,17 @@ public final class AppModel {
             return "\(base) — add \(settings.secondaryLocaleModifier.glyph) for \(Self.badge(secondary))"
         case .arming: return "Arming"
         case .listening:
-            return activeLocaleIsSecondary ? "Listening (\(localeBadge))" : "Listening"
+            // The badge prints for BOTH languages once a second one is configured, not just for the
+            // unusual one. A readout that appears only when something unexpected happened is read as
+            // decoration until the day it matters; a channel that always says which model is running
+            // is the thing a user can learn to glance at — and glancing at it mid-sentence is the
+            // only moment the wrong language is still free to fix. With one language configured it
+            // stays plain "Listening": a badge that can never change indicates nothing, which is the
+            // same argument `AppModel.tagCode` makes about `EN` against `EN`.
+            guard secondaryLocaleReady, settings.effectiveSecondaryLocaleIdentifier != nil else {
+                return "Listening"
+            }
+            return "Listening (\(localeBadge))"
         case .transcribing: return "Transcribing"
         case .refining: return "Cleaning the text up"
         case .injecting: return "Inserting text"

@@ -147,9 +147,10 @@ public final class Settings {
         /// pre-warm that the dictation path was doing anyway. The key-suppressing tap exists only
         /// while the popup is on screen.
         public static let refineSelectionEnabled = true
-        /// The user's own gesture. See `RefineChord` for the measurement that made it safe to
-        /// default to `fn` after RECON §8 ruled `fn` out as a *hotkey*.
-        public static let refineSelectionChord = RefineChord.fnThenDictationKey
+        /// `⌘⌥/`. Named by `RefineChord` itself so the value and the three measurements behind it
+        /// (no character typed, so no suppressing tap; `fn` invisible on non-Apple keyboards; no
+        /// collision with the active Karabiner profile) stay in one file.
+        public static let refineSelectionChord = RefineChord.default
         public static let historyLimit = 5000
     }
 

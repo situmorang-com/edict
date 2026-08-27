@@ -920,26 +920,44 @@ private struct RefineSelectionSection: View {
         }
     }
 
+    /// One row per chord: the keys, whether it is the live one, and — for the one chord that cannot
+    /// work on most keyboards — the reason, on the row rather than only in the paragraph below.
+    ///
+    /// The caveat is on the key itself because that is where the mistake gets made. A user scanning
+    /// four rows picks one and stops reading; `Hold 🌐` looks like the friendliest of the four and is
+    /// the only one that is silently dead on a Logitech, a Keychron or a Das. It has to say so in the
+    /// same glance as its own name.
     private func key(_ chord: RefineChord) -> some View {
         let refused = chord.refusal(dictationKey: settings.hotkey) != nil
+        let isLive = chord == settings.refineSelectionChord
         return TapeButton(
             role: .neutral,
-            isLatched: chord == settings.refineSelectionChord,
+            isLatched: isLive,
             minWidth: S.keyWidth,
             action: { settings.refineSelectionChord = chord }
         ) {
             HStack(spacing: D.space.sm) {
                 Text(chord.displayName(dictationKey: settings.hotkey))
-                if chord == settings.refineSelectionChord {
+                if isLive {
                     Text(refused ? "Unavailable" : "Live")
                         .typeStyle(D.type.silkscreenTiny)
+                }
+                if let caveat = chord.rowCaveat {
+                    Spacer(minLength: D.space.sm)
+                    Text(caveat)
+                        .typeStyle(D.type.silkscreenTiny)
+                        .foregroundStyle(D.color.textSecondary)
                 }
             }
         }
         .disabled(refused)
         .opacity(refused ? D.opacity.disabled : 1)
-        .accessibilityLabel(chord.displayName(dictationKey: settings.hotkey))
-        .accessibilityAddTraits(chord == settings.refineSelectionChord ? .isSelected : [])
+        .accessibilityLabel(
+            [chord.displayName(dictationKey: settings.hotkey), chord.rowCaveat]
+                .compactMap(\.self)
+                .joined(separator: ", ")
+        )
+        .accessibilityAddTraits(isLive ? .isSelected : [])
     }
 
     /// The two things a user has to know before trusting this with their own document, both measured
@@ -1203,6 +1221,8 @@ public enum DualLocaleFixtures {
         // Panel width plus the deck gutter the settings column pads with, so the sheet frames the
         // panel the way the window does.
         let panel = CGSize(width: S.column, height: 640)
+        // The refine panel is the tallest of these: four chord rows plus two paragraphs.
+        let refinePanel = CGSize(width: S.column, height: 860)
         let hud = CGSize(width: D.size.hudSize.width + D.space.lg,
                          height: D.size.hudSize.height + D.size.waveformHeight + D.space.lg)
 
@@ -1249,10 +1269,14 @@ public enum DualLocaleFixtures {
             // sheet cropped above the thing being proved proves nothing.
             sheet("settings-column", CGSize(width: S.column, height: 2_560),
                   SettingsWindow(model: PreviewFixtures.model(), unbounded: true, locales: locales)),
-            sheet("refine-selection-fn", panel, refineSelection(PreviewFixtures.model())),
-            sheet("refine-selection-discrete", panel, refineSelection(discreteChord())),
-            sheet("refine-selection-refused", panel, refineSelection(globeIsTheDictationKey())),
-            sheet("refine-selection-off", panel, refineSelection(refineOff())),
+            // Taller than `panel`: the picker grew a fourth row and the two prose blocks under it
+            // are the whole reason these sheets exist. A sheet cropped above the copy proves nothing.
+            sheet("refine-selection-default", refinePanel, refineSelection(PreviewFixtures.model())),
+            sheet("refine-selection-discrete", refinePanel, refineSelection(discreteChord())),
+            // The row that has to read as a caveat rather than as a feature.
+            sheet("refine-selection-fn", refinePanel, refineSelection(globeQualifier())),
+            sheet("refine-selection-refused", refinePanel, refineSelection(globeIsTheDictationKey())),
+            sheet("refine-selection-off", refinePanel, refineSelection(refineOff())),
         ]
     }
 
@@ -1276,6 +1300,16 @@ public enum DualLocaleFixtures {
     private static func discreteChord() -> AppModel {
         let model = ready()
         model.settings.refineSelectionChord = .optionCommandR
+        return model
+    }
+
+    /// The demoted `fn` gesture, deliberately chosen on a keyboard-agnostic dictation key so the row
+    /// is *live* rather than refused. This is the sheet to read: it is the only chord that can be
+    /// selected, look healthy and still never fire, so the picker has to say "Apple keyboards only"
+    /// on the row and say why underneath.
+    private static func globeQualifier() -> AppModel {
+        let model = ready()
+        model.settings.refineSelectionChord = .fnThenDictationKey
         return model
     }
 

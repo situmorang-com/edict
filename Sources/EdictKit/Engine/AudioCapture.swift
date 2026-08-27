@@ -352,6 +352,22 @@ final class CaptureNode: @unchecked Sendable {
     /// and one silently missing its first sentence (RECON §20).
     private let bufferedCount: Int
 
+    /// Tap buffers per second of headroom. `installTap`'s `bufferSize` is hard-clamped to
+    /// [100 ms, 400 ms] (RECON §19), so 100 ms is the floor and therefore the only safe divisor:
+    /// assuming anything larger would under-size the queue on the very devices that deliver fastest.
+    static let tapBufferFloorSeconds = 0.100
+
+    /// The `.bufferingNewest` capacity for a given number of seconds of headroom.
+    ///
+    /// Exposed, and used by the initialiser below, so the "sized in seconds" requirement is pinned by
+    /// a test rather than by a comment. It is load-bearing twice over now: the queue absorbs a
+    /// consumer stall (RECON §20) *and* it holds the head of the utterance for the few hundred
+    /// milliseconds between the microphone opening and the language being decided, during which there
+    /// is deliberately no consumer at all.
+    static func bufferedBufferCount(forSeconds seconds: Double) -> Int {
+        max(8, Int(seconds / tapBufferFloorSeconds))
+    }
+
     init(shared: CaptureShared,
          hardwareFormat: AVAudioFormat,
          analyzerFormat: AVAudioFormat,
@@ -360,7 +376,7 @@ final class CaptureNode: @unchecked Sendable {
         self.shared = shared
         self.hardwareFormat = hardwareFormat
         self.analyzerFormat = analyzerFormat
-        self.bufferedCount = max(8, Int(bufferedSeconds / 0.100))
+        self.bufferedCount = Self.bufferedBufferCount(forSeconds: bufferedSeconds)
         self.preRoll = PreRollRing(limit: max(1, Int((preRollSeconds / 0.100).rounded(.up))))
 
         // Conversion is not optional and it is not just a resample: hardware is 24 or 48 kHz
