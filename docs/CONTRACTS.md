@@ -205,6 +205,15 @@
 >     the running app is genuinely required, it has to come from the user's own session — and must capture
 >     **only the app's window by id**, never a display.
 >
+> 41. **Refinement runs on-device and must never make a network request.** The README's privacy claim is
+>     load-bearing. Build a **fresh `LanguageModelSession` per refinement** (a reused one accumulates a
+>     transcript, so the previous dictation conditions the next), use `@Generable` rather than parsing
+>     markdown, and use greedy sampling — temperature is what decides whether the model paraphrases, and
+>     paraphrasing is invention in a transcription tool. `supportsLocale == false` means "no guarantees",
+>     not "refuse": Indonesian measured excellent with the flag false, so caption the result rather than
+>     disabling the feature. Keep instructions short; a fourth clause measurably diluted the others on
+>     this ~3B model.
+>
 > ### Amended API surface
 >
 > These supersede the signatures below where they conflict:

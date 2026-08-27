@@ -141,6 +141,62 @@ public struct TranscriptSegment: Codable, Hashable, Sendable, Identifiable {
     }
 }
 
+// MARK: - RefinementRecord
+
+/// What the on-device model did to a dictation *before it was inserted*, when the user has asked for
+/// that (`Settings.refineBeforeInsert`).
+///
+/// **Why this is stored beside `Transcript.text` rather than in it.** `text` is the record of what
+/// the person said; a refinement is a derived reading of it. Overwriting `text` with cleaned prose
+/// would destroy the only copy of the actual speech, in an app whose entire premise is a faithful
+/// record — and it would do it silently, hours before the user noticed. So the refined string that
+/// reached the cursor lives here, and the history pane shows both.
+///
+/// On-demand refinements made from the history pane are deliberately **not** stored: they are a
+/// reading of a transcript the user can ask for again in about a second, and persisting every one
+/// would grow the history file with text nobody has decided to keep. Only the refinement that was
+/// actually inserted into a document is a fact about what happened.
+public struct RefinementRecord: Codable, Hashable, Sendable {
+
+    public var action: RefinementAction
+    /// The refined text that was inserted, or `nil` when refinement did not produce one.
+    public var text: String?
+    /// Wall-clock seconds the model took. Kept because it is the cost the user opted into, and the
+    /// only place they can see what it actually is on their machine (measured 1.0 s warm, 2.9 s cold).
+    public var duration: TimeInterval
+    public var localeIdentifier: String
+    /// True when Apple does not list `localeIdentifier` as supported by the on-device model. The
+    /// output is still in the dictated language — this flags "no guarantees". See `TextRefiner`.
+    public var localeUnsupported: Bool
+    /// Why nothing was refined, when `text` is `nil`. One sentence, shown verbatim.
+    ///
+    /// A failure here is never allowed to cost the dictation: what the user said is inserted
+    /// unchanged and this says so, rather than the text vanishing into a model error.
+    public var failure: String?
+
+    public init(
+        action: RefinementAction,
+        text: String? = nil,
+        duration: TimeInterval = 0,
+        localeIdentifier: String = Settings.Default.localeIdentifier,
+        localeUnsupported: Bool = false,
+        failure: String? = nil
+    ) {
+        self.action = action
+        self.text = text
+        self.duration = duration
+        self.localeIdentifier = localeIdentifier
+        self.localeUnsupported = localeUnsupported
+        self.failure = failure
+    }
+
+    /// True when the text that reached the cursor was the refined one rather than the transcript.
+    public var didInsertRefinedText: Bool {
+        guard let text else { return false }
+        return !text.isEmpty
+    }
+}
+
 /// One completed dictation. `rawText` and `text` are both kept so the history pane can show the
 /// raw-vs-corrected diff — without that, the user has no way to tell whether the dictionary did
 /// anything at all.
@@ -204,6 +260,12 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
     /// `RecognitionQuality` for the 70-minute meeting that made this necessary.
     public var quality: RecognitionQuality?
 
+    /// What the on-device language model did to this dictation before it was inserted, or `nil` —
+    /// which is every transcript unless the user turned `Settings.refineBeforeInsert` on.
+    ///
+    /// See `RefinementRecord` for why the refined string is kept here instead of replacing `text`.
+    public var refinement: RefinementRecord?
+
     /// The engine identifier written into new transcripts. RECON §1: `DictationTranscriber`, not
     /// `SpeechTranscriber` — contextual-string biasing is a measured no-op on the latter.
     public static let currentEngine = "apple.dictationtranscriber"
@@ -231,7 +293,8 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         lowConfidenceWords: [String] = [],
         source: TranscriptSource = .dictated,
         segments: [TranscriptSegment] = [],
-        quality: RecognitionQuality? = nil
+        quality: RecognitionQuality? = nil,
+        refinement: RefinementRecord? = nil
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -254,6 +317,7 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         self.source = source
         self.segments = segments
         self.quality = quality
+        self.refinement = refinement
     }
 
     public var wordCount: Int {
@@ -315,6 +379,9 @@ public struct Transcript: Codable, Identifiable, Hashable, Sendable {
         // `try?` for the same reason as the two above: a malformed quality block must cost the
         // warning, never the entry. `RecognitionQuality`'s own decoder is lenient in the same way.
         quality = try? c.decodeIfPresent(RecognitionQuality.self, forKey: .quality)
+        // `try?` for the same reason as `quality`: a malformed refinement block must cost the note
+        // about the refinement, never the transcript it is attached to.
+        refinement = try? c.decodeIfPresent(RefinementRecord.self, forKey: .refinement)
     }
 }
 

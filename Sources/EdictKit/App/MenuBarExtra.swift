@@ -30,7 +30,7 @@ struct EdictMenuBarLabel: View {
     private var symbolName: String {
         switch model.phase {
         case .listening, .arming: return "waveform.circle.fill"
-        case .transcribing, .injecting: return "waveform.circle"
+        case .transcribing, .refining, .injecting: return "waveform.circle"
         case .error: return "exclamationmark.triangle"
         case .idle: return model.hotkeyLive ? "waveform" : "waveform.badge.exclamationmark"
         }

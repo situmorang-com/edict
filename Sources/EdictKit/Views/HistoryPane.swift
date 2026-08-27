@@ -218,6 +218,11 @@ struct HistoryPane: View {
 
     private func delete(_ id: UUID) {
         model.history.remove(ids: [id])
+        // A refinement is a reading of a transcript, so it cannot outlive one. Without this, a
+        // deleted row's cleaned-up text would sit in memory keyed by an id nothing points at any
+        // more — and a new transcript is never given a used id, so it would never be shown again,
+        // but the app would still be holding the user's deleted speech.
+        model.refinement.forget(id)
         if selection == id { selection = nil }
     }
 }
@@ -289,8 +294,24 @@ private struct TranscriptDetail: View {
                     // is trusted. Renders to nothing when the recognition rate was plausible.
                     QualityNotice(transcript.quality)
                     if outcome.needsRecovery { recovery }
-                    textBlock(label: transcript.isImported ? "Transcript" : "Inserted", body: transcript.text)
+                    textBlock(label: transcriptLabel, body: transcript.text)
+                    // What the on-device model did to this dictation *before* it was inserted, for a
+                    // transcript recorded while `Settings.refineBeforeInsert` was on. Directly under
+                    // the transcript, because the pair is the point: this is the record of speech,
+                    // that is what went into the document.
+                    if let record = transcript.refinement {
+                        InsertedRefinement(record: record)
+                    }
                     LanguageSpansView(transcript: transcript)
+                    // The three keys, above the dictionary evidence rather than below it. This is a
+                    // control the user came here to press; "as heard" and the hit list are evidence
+                    // they read when something looks wrong. Burying the keys under a scroll would
+                    // make the primary surface of the feature the part nobody finds.
+                    RefinementBlock(
+                        transcript: transcript,
+                        store: model.refinement,
+                        unbounded: unbounded
+                    )
                     if transcript.didCorrect {
                         textBlock(label: "As heard", body: transcript.rawText)
                         corrections
@@ -306,6 +327,17 @@ private struct TranscriptDetail: View {
         }
         // A fresh measurement per transcript: a stale height would size the new block for a frame.
         .id(transcript.id)
+    }
+
+    /// What the transcript well is called.
+    ///
+    /// Normally "Inserted", because for a dictation the transcript *is* what went to the cursor. When
+    /// refinement ran before inserting, it is not: the refined text went in, and calling this well
+    /// "Inserted" would be a false claim about a document the user cannot see from here. The refined
+    /// block below takes the name in that case.
+    private var transcriptLabel: String {
+        if transcript.isImported { return "Transcript" }
+        return transcript.refinement?.didInsertRefinedText == true ? "As dictated" : "Inserted"
     }
 
     // MARK: Header

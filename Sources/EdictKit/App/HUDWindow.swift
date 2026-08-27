@@ -87,7 +87,7 @@ public final class HUDWindowController {
     /// seconds when the user most wants to know something is still happening.
     private static func shouldShow(_ phase: DictationPhase) -> Bool {
         switch phase {
-        case .arming, .listening, .transcribing, .injecting: return true
+        case .arming, .listening, .transcribing, .refining, .injecting: return true
         case .idle, .error: return false
         }
     }
@@ -250,7 +250,17 @@ struct HUDContent: View {
             }
             StatusReadout(model.statusCondition, compact: true)
             Spacer(minLength: D.space.xs)
-            SegmentCounter(.elapsed(model.elapsed), scale: .tiny, seated: false)
+            // During refinement the counter switches to the *refinement's* clock rather than the
+            // speech clock. It is the same question — how long has this been going — and it is the
+            // only moving thing on the HUD in a phase that lasts 1–3 s while the waveform is frozen.
+            // Reading it as speech seconds is not a risk: the channel immediately to its left says
+            // "Refining", and it starts again from zero. Apple's framework reports no progress
+            // fraction, so a bar here would be invented; a climbing counter is the true version.
+            SegmentCounter(
+                .elapsed(model.phase == .refining ? model.refineElapsed : model.elapsed),
+                scale: .tiny,
+                seated: false
+            )
         }
     }
 
@@ -271,7 +281,9 @@ struct HUDContent: View {
             Waveform(
                 level: frame,
                 isLive: isLive,
-                isTranscribing: model.phase == .transcribing || model.phase == .injecting
+                isTranscribing: model.phase == .transcribing
+                    || model.phase == .refining
+                    || model.phase == .injecting
             )
         }
         .frame(height: D.size.waveformHeight)
@@ -321,6 +333,7 @@ struct HUDContent: View {
         case .arming: return "Listening…"
         case .listening: return "Speak now"
         case .transcribing: return "Finishing…"
+        case .refining: return "Cleaning up…"
         case .injecting: return "Inserting…"
         case .idle, .error: return ""
         }

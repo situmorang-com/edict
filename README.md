@@ -11,7 +11,7 @@ and there is nothing to pay for.
 [![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?style=flat-square&logo=swift&logoColor=white)](https://swift.org)
 [![Zero dependencies](https://img.shields.io/badge/dependencies-0-4C8A3A?style=flat-square)](Package.swift)
 [![7 MB](https://img.shields.io/badge/app%20size-7%20MB-4C8A3A?style=flat-square)](#how-it-stays-small)
-[![185 tests](https://img.shields.io/badge/tests-185-4C8A3A?style=flat-square)](Tests)
+[![351 tests](https://img.shields.io/badge/tests-351-4C8A3A?style=flat-square)](Tests)
 [![MIT](https://img.shields.io/badge/licence-MIT-blue?style=flat-square)](LICENSE)
 
 ![Edict's main window](docs/images/history.png)
@@ -50,6 +50,26 @@ container, so a video costs nothing extra.
 Measured on an M5 Pro: **9–27× realtime** warm, **75×** on a six-minute file, with **4.1% word error**
 against the source script. Imports land in history with timestamps and never touch your cursor —
 that is the line between dictating and transcribing.
+
+## Clean it up afterwards, on-device
+
+Dictation gives you what you said, filler and all. Any transcript can then be turned into clean prose,
+a bullet list, or a one-sentence summary — **on this machine**, with Apple's on-device model. No API
+key, no network, nothing leaving the computer.
+
+    in   so um i think we should like move the meeting to thursday because uh mark
+         is out on wednesday and we need him for the budget bit
+
+    out  So I think we should move the meeting to Thursday because Mark is out on
+         Wednesday and we need him for the budget bit.
+
+Measured: clean-up 0.8–1.0 s, bullets ~1.0 s, summary ~0.8 s. It works in Indonesian too, which Apple
+reports as an unsupported locale — so the result is captioned as carrying no guarantees rather than
+quietly disabled.
+
+The refined text always sits **beside** the transcript, never over it: the raw dictation is the record
+of what was actually said. Refining before insertion is available as a setting, off by default, because
+it adds a second or so to every dictation.
 
 ## The dictionary is the interesting part
 

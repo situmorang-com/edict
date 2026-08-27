@@ -833,3 +833,59 @@ ScreenCaptureKit returns `-3811` even from a locally-signed bundle. Proof sheets
 
 **`ImageRenderer` does not rasterise a `ScrollView`'s contents** — lists and transcript trays come out
 empty. Views that need proving offline expose an `unbounded` hatch used only by fixtures.
+
+---
+
+## On-device text refinement — `FoundationModels`
+
+Post-dictation clean-up, bullets and summaries run on Apple's on-device model, which keeps the app's
+central privacy property intact: nothing leaves the machine and there is no key to manage.
+
+    SystemLanguageModel.default.availability ......... available
+    contextSize ..................................... 8192 tokens on macOS 27
+    supportsLocale(en_US) ........................... true
+    supportsLocale(id_ID) .......................... FALSE
+
+**`supportsLocale == false` means "no guarantees", not "refuse".** Indonesian clean-up measured
+excellent despite the flag, so the feature stays enabled and captions the result instead of disabling
+it. Never silently substitute a language.
+
+**Latency, measured (M5 Pro):** clean-up 0.84–1.04 s, bullets 0.97–1.17 s, summary 0.78–0.88 s,
+Indonesian clean-up 1.05–1.24 s.
+
+**The cold cost is daemon-level, not per-process.** An early probe measured 2.89 s for the first call
+and it was read as a per-process warm-up. It is not: the model runs in its own daemon, and the first
+call in a brand-new process measures ~1.0 s whenever that daemon is resident. `prewarm()` helps a cold
+machine, not a warm one.
+
+**Build a fresh `LanguageModelSession` per refinement.** A reused session accumulates a transcript, so
+the previous dictation conditions the next one — a correctness bug in this app, not an inefficiency.
+
+**Use `@Generable` for the bullet list** rather than parsing markdown out of a string. Parsing a model's
+own formatting is how bullet lists acquire stray dashes and empty items.
+
+**Greedy sampling.** Temperature is the knob that decides whether the model paraphrases, and
+paraphrasing is invention in a tool whose job is faithful transcription.
+
+**Instruction bloat measurably dilutes rules on this ~3B model.** Adding a fourth clause to a
+clean-up instruction fixed nothing and made a filler word reappear. Keep instructions short and put
+anything deterministic in code.
+
+**Capitalisation:** with the instruction "Repair punctuation, capitalisation and sentence breaks…
+Preserve every fact. Add nothing. Answer in the same language as the input", sentence case *and*
+proper nouns came back correct in 6 of 6 greedy runs across two fixtures — `Thursday`, `Mark`,
+`Pertamina`, `Azure`, `Microsoft`. An agent working from slightly different wording saw output stay
+lowercase and added a deterministic sentence-case-and-terminator pass in `TextRefiner.tidy`; that pass
+is a no-op on these fixtures and harmless either way. Worth re-measuring before trusting either claim
+after an OS update.
+
+**Cancellation is genuinely honoured.** `LanguageModelSession.respond` released its caller 0.40 s into
+a multi-second generation when the task was cancelled, so no watchdog race is needed.
+
+**Model-backed tests are gated behind `EDICT_MODEL_TESTS=1`**, mirroring `EDICT_SPEECH_TESTS`, so the
+default suite stays fast and offline-deterministic.
+
+**A Claude API path was considered and deliberately not built.** A claude.ai subscription is not API
+access, Swift has no official Anthropic SDK (so it would be hand-rolled HTTP), and — decisively — it
+would send dictated text off the machine for a marginal gain on this task. The local model is good
+enough here; revisit only if long or subtle text proves otherwise.

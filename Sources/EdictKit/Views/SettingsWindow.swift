@@ -91,6 +91,7 @@ public struct SettingsWindow: View {
                 SpeechModelSection(model: model, locales: locales)
                 SecondLanguageSection(model: model, locales: locales)
                 BehaviourSection(model: model)
+                RefineSection(model: model)
                 ImportSection(settings: model.settings)
                 DictionarySection(settings: model.settings, dictionary: model.dictionary)
                 LimitsSection(settings: model.settings, history: model.history)
@@ -777,6 +778,88 @@ struct LoginItemRow: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - Refine
+
+/// One switch, and the numbers that are the whole reason it is a switch.
+///
+/// **The copy quotes latency before it describes the feature.** Clean-up is genuinely good — measured
+/// excellent on both English and Indonesian — so a section that led with what it does would read as an
+/// unqualified improvement, and the user would turn it on and then find that Edict had stopped feeling
+/// instant without knowing which setting did it. The cost is 1.0 s warm and 2.9 s cold on a tail that
+/// is otherwise 0.15–0.53 s, paid on *every* dictation. That belongs in the first sentence.
+///
+/// The availability line below the switch is not decoration either: refinement runs on Apple's
+/// on-device model, which can be switched off in System Settings or still downloading, and a switch
+/// that flips happily while the model it needs is unavailable is the inert-control failure this
+/// codebase has already paid for once (see `LoginItemRow`).
+private struct RefineSection: View {
+
+    let model: AppModel
+
+    private var settings: Settings { model.settings }
+
+    /// The answer for the *primary* dictation language. The secondary language gets its own answer
+    /// when a transcript in it is refined; this line is about the switch, and the switch's common case
+    /// is the language the user dictates in by default.
+    @State private var availability: RefinerAvailability?
+
+    var body: some View {
+        PanelSurface("Refine") {
+            VStack(alignment: .leading, spacing: D.space.md) {
+                RockerSwitch(
+                    "Clean up before inserting",
+                    isOn: Binding(
+                        get: { settings.refineBeforeInsert },
+                        set: { settings.refineBeforeInsert = $0 }
+                    ),
+                    // `RockerSwitch` truncates its caption at two lines, so the number that decides
+                    // this lives there and the rest of the trade is printed below.
+                    caption: "Measured on this Mac: 1.0 s once warm, 2.9 s cold — added to every "
+                           + "dictation, on top of a wait that is normally under half a second."
+                )
+                Text("On, a dictation is punctuated and stripped of filler before it reaches your "
+                     + "cursor, and Edict stops feeling instant. Off, you can still clean up, "
+                     + "bullet-point or summarise any transcript from the log whenever you want it, "
+                     + "at no cost to dictation itself.")
+                    .typeStyle(D.type.explain)
+                    .foregroundStyle(D.color.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Refinement runs on Apple's on-device model. Nothing is sent anywhere, there is "
+                     + "no account and no key, and it works with no network at all — the same as the "
+                     + "rest of Edict. It only ever rewrites words you said: it will not add a fact, "
+                     + "answer a question in your dictation, or translate.")
+                    .typeStyle(D.type.explain)
+                    .foregroundStyle(D.color.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let sentence = availabilitySentence {
+                    Text(sentence)
+                        .typeStyle(D.type.explain)
+                        .foregroundStyle(availabilityIsFault ? D.color.alert : D.color.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .task(id: settings.localeIdentifier) {
+            availability = await model.refinement.refiner.availability(for: settings.localeIdentifier)
+        }
+    }
+
+    /// Only says something when there is something to say: a supported language on a working model
+    /// needs no line, and printing "available" would be a control reporting its own health at the
+    /// user for no reason.
+    private var availabilitySentence: String? {
+        switch availability {
+        case .ready, .none: return nil
+        case .localeUnsupported(let why), .unavailable(let why): return why
+        }
+    }
+
+    private var availabilityIsFault: Bool {
+        if case .unavailable = availability { return true }
+        return false
     }
 }
 

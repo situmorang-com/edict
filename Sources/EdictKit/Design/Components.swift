@@ -2103,6 +2103,10 @@ public struct StatusReadout: View {
         case armed
         case listening
         case transcribing
+        /// The on-device language model is cleaning a dictation up before it is inserted. Seconds,
+        /// not milliseconds — measured 1.0 s warm and 2.9 s cold — which is why it is its own word
+        /// rather than a longer `injecting`.
+        case refining
         case injecting
         /// 0…1. Model download.
         case downloading(Double)
@@ -2178,7 +2182,7 @@ public struct StatusReadout: View {
 
     private var isLitTellTale: Bool {
         switch condition {
-        case .ready, .listening, .transcribing, .injecting, .downloading: true
+        case .ready, .listening, .transcribing, .refining, .injecting, .downloading: true
         case .armed, .fault, .needsPermission: false
         }
     }
@@ -2248,6 +2252,7 @@ public struct StatusReadout: View {
         case .armed: "Armed"
         case .listening: "Listening"
         case .transcribing: "Transcribing"
+        case .refining: "Refining"
         case .injecting: "Inserting"
         case .downloading(let p): String(format: "Model %.0f%%", min(max(p, 0), 1) * 100)
         case .fault(let message): message

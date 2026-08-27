@@ -131,6 +131,14 @@ public final class Settings {
         /// English model produced 61, and choosing between two transcripts neither of which contains
         /// the speech is not a fix. On by default would present it as one.
         public static let importDualPass = false
+        /// **Off**, because it changes what kind of tool Edict is.
+        ///
+        /// Measured on this machine: clean-up costs 1.0 s warm and 2.9 s cold, *added to every
+        /// dictation* between the last word and the text appearing. Dictation's own end-to-end tail
+        /// is 0.15–0.53 s, so this is not a percentage — it is several times the whole wait, on a
+        /// key the user holds down expecting the text to be there when they let go. A user who
+        /// wants that trade can have it; a user who never opens Settings must not be given it.
+        public static let refineBeforeInsert = false
         public static let historyLimit = 5000
     }
 
@@ -252,6 +260,20 @@ public final class Settings {
         importDualPass && effectiveSecondaryLocaleIdentifier != nil
     }
 
+    /// Clean up a dictation with the on-device language model before it reaches the cursor.
+    ///
+    /// The whole cost of this switch is latency, and it is a cost the user pays on *every* dictation
+    /// rather than when they ask: measured 1.0 s warm and 2.9 s cold on top of a 0.15–0.53 s tail.
+    /// That is why it is off by default and why the settings copy quotes the numbers instead of
+    /// describing the feature. Refinement runs entirely on this Mac either way — the same
+    /// `TextRefiner` the history pane uses, so nothing new leaves the machine.
+    ///
+    /// A refinement that fails or is declined never costs the dictation: what was said is inserted
+    /// unchanged and `Transcript.refinement.failure` records why. See `DictationController.complete`.
+    public var refineBeforeInsert: Bool {
+        didSet { write(refineBeforeInsert, .refineBeforeInsert) }
+    }
+
     public var historyLimit: Int {
         didSet {
             let clamped = Self.historyLimitRange.clamped(to: historyLimit)
@@ -298,6 +320,7 @@ public final class Settings {
         prewarmMicrophone = bool(.prewarmMicrophone, Default.prewarmMicrophone)
         importUsesGeneralModel = bool(.importUsesGeneralModel, Default.importUsesGeneralModel)
         importDualPass = bool(.importDualPass, Default.importDualPass)
+        refineBeforeInsert = bool(.refineBeforeInsert, Default.refineBeforeInsert)
         historyLimit = Self.historyLimitRange.clamped(to: int(.historyLimit, Default.historyLimit))
     }
 
@@ -318,6 +341,7 @@ public final class Settings {
         prewarmMicrophone = Default.prewarmMicrophone
         importUsesGeneralModel = Default.importUsesGeneralModel
         importDualPass = Default.importDualPass
+        refineBeforeInsert = Default.refineBeforeInsert
         historyLimit = Default.historyLimit
         Log.data.info("Settings reset to defaults")
     }
@@ -392,6 +416,7 @@ public final class Settings {
         case secondaryLocaleEnabled, secondaryLocaleIdentifier, secondaryLocaleModifier
         case biasingEnabled, biasingLimit, correctionsEnabled, termCaseNormalisation
         case prewarmMicrophone, importUsesGeneralModel, importDualPass, historyLimit
+        case refineBeforeInsert
 
         var storageKey: String { "edict.\(rawValue)" }
     }

@@ -48,6 +48,10 @@ public final class DictationController {
     private let injector = TextInjector()
     private let hotkey: HotkeyMonitor
 
+    /// The on-device text refiner, shared with `AppModel.refinement` so both use the same pre-warmed
+    /// sessions. Only touched when `Settings.refineBeforeInsert` is on.
+    private let refiner: TextRefiner
+
     /// Handed to the views so `LevelMeter` can poll `levelSnapshot` synchronously at 60 Hz without
     /// an actor hop. That property is `nonisolated` and `Mutex`-backed precisely for this.
     public var levelSource: any LevelSource { capture }
@@ -114,12 +118,14 @@ public final class DictationController {
         settings: Settings = .shared,
         dictionary: DictionaryStore = .shared,
         history: HistoryStore = .shared,
-        permissions: Permissions = .shared
+        permissions: Permissions = .shared,
+        refiner: TextRefiner = TextRefiner()
     ) {
         self.settings = settings
         self.dictionary = dictionary
         self.history = history
         self.permissions = permissions
+        self.refiner = refiner
         self.hotkey = HotkeyMonitor()
     }
 
@@ -695,8 +701,10 @@ public final class DictationController {
 
     /// Correction → injection → history → dictionary hit counts.
     private func complete(_ unit: Utterance, outcome: TranscriptionOutcome) async {
-        model?.apply(phase: .injecting)
-
+        // The phase stays `.transcribing` through the correction pass and is moved on by the two
+        // steps below, which is what lets the HUD distinguish a 1–3 s refinement from an insertion
+        // that takes a few milliseconds. Announcing `.injecting` here would have the HUD say
+        // "Inserting" for the whole of a wait that is not an insertion.
         let dropped = max(0, capture.statsSnapshot.dropped - unit.droppedBaseline)
         let raw = outcome.text
 
@@ -713,7 +721,15 @@ public final class DictationController {
             }.value
         }
 
-        let injection = await inject(corrected.text, unit: unit)
+        // Opt-in, off by default: measured 1.0 s warm and 2.9 s cold, added between the user
+        // releasing the key and the text appearing. See `Settings.refineBeforeInsert`.
+        let refinement = await refineBeforeInserting(
+            corrected.text,
+            localeIdentifier: unit.localeIdentifier
+        )
+
+        model?.apply(phase: .injecting)
+        let injection = await inject(refinement?.text ?? corrected.text, unit: unit)
 
         let transcript = Transcript(
             rawText: raw,
@@ -726,7 +742,8 @@ public final class DictationController {
             targetAppName: unit.target.appName,
             injection: injection,
             droppedBuffers: dropped,
-            lowConfidenceWords: outcome.lowConfidenceWords
+            lowConfidenceWords: outcome.lowConfidenceWords,
+            refinement: refinement
         )
 
         if !raw.isEmpty {
@@ -737,7 +754,9 @@ public final class DictationController {
         }
 
         utterance = nil
-        model?.apply(committed: corrected.text, volatile: "")
+        // What actually landed, which is the refined string when refinement ran. The HUD's last frame
+        // should show the text that went into the document, not the version of it that did not.
+        model?.apply(committed: refinement?.text ?? corrected.text, volatile: "")
         model?.finished(transcript: transcript)
         model?.apply(phase: .idle)
         playFeedback(injection.isSuccess || injection == .notAttempted ? .stop : .fault)
@@ -748,8 +767,72 @@ public final class DictationController {
             latency \(outcome.latency, format: .fixed(precision: 3), privacy: .public) s, \
             \(corrected.hits.count, privacy: .public) corrections, \
             injection \(injection.rawValue, privacy: .public)\
-            \(dropped > 0 ? ", DROPPED \(dropped) buffers" : "")
+            \(dropped > 0 ? ", DROPPED \(dropped) buffers" : "")\
+            \(Self.refinementLog(refinement))
             """)
+    }
+
+    // MARK: - Refine before inserting
+
+    /// Clean the text up with the on-device model before it reaches the cursor, when the user has
+    /// asked for that. Returns `nil` when the switch is off, so the caller's `??` is the whole
+    /// difference between the two paths.
+    ///
+    /// **A failure here never costs the dictation.** Everything `TextRefiner.refine` can throw —
+    /// Apple Intelligence switched off, a guardrail refusal, a transcript longer than the context
+    /// window — is caught, recorded on the transcript as a sentence the history pane prints, and the
+    /// unrefined text is inserted exactly as if the switch were off. The alternative, letting the
+    /// error propagate, would mean a user with this switch on and Apple Intelligence off loses their
+    /// speech to a feature they turned on for convenience.
+    /// `internal`, not `private`, and taking a locale rather than the `Utterance` it is called with:
+    /// this is the one branch in the file that decides whether a user's speech survives a model
+    /// error, and it is otherwise reachable only by speaking into a microphone.
+    /// `RefinementSurfaceModelTests` calls it directly.
+    func refineBeforeInserting(_ text: String, localeIdentifier: String) async -> RefinementRecord? {
+        guard settings.refineBeforeInsert else { return nil }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+
+        model?.apply(phase: .refining)
+        let started = Date()
+        // The one action offered here. Bullets and a summary are things the user asks for *about* a
+        // finished transcript in the history pane; nobody wants their dictation silently turned into
+        // a bullet list on the way to a text field they were typing a sentence into.
+        let action = RefinementAction.cleanUp
+        do {
+            let result = try await refiner.refine(
+                text,
+                as: action,
+                localeIdentifier: localeIdentifier
+            )
+            return RefinementRecord(
+                action: action,
+                text: result.text,
+                duration: result.duration,
+                localeIdentifier: result.localeIdentifier,
+                localeUnsupported: result.wasLocaleUnsupported
+            )
+        } catch is CancellationError {
+            // The user cancelled the utterance; there is nothing to say about a refinement that was
+            // never going to be inserted either.
+            return nil
+        } catch {
+            let sentence = (error as? any LocalizedError)?.errorDescription
+                ?? "The on-device model could not clean this up."
+            Log.engine.notice("refine-before-insert failed: \(sentence, privacy: .public)")
+            return RefinementRecord(
+                action: action,
+                duration: Date().timeIntervalSince(started),
+                localeIdentifier: localeIdentifier,
+                failure: sentence
+            )
+        }
+    }
+
+    private static func refinementLog(_ record: RefinementRecord?) -> String {
+        guard let record else { return "" }
+        return record.didInsertRefinedText
+            ? String(format: ", refined in %.2f s", record.duration)
+            : ", refinement declined or failed"
     }
 
     private func inject(_ text: String, unit: Utterance) async -> InjectionOutcome {

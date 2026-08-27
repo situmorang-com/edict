@@ -20,6 +20,15 @@ public enum DictationPhase: Sendable, Hashable {
     case listening
     /// Audio is closed; waiting for the final result. RECON measured 0.15–0.53 s here.
     case transcribing
+    /// The on-device language model is cleaning the text up before it is inserted. Only reachable
+    /// when `Settings.refineBeforeInsert` is on.
+    ///
+    /// A phase of its own rather than a longer `injecting`, for one reason: it is the only phase in
+    /// this machine measured in *seconds* rather than milliseconds — 1.0 s warm, 2.9 s cold — and a
+    /// HUD that says "Inserting" for three seconds while nothing moves is indistinguishable from a
+    /// hang. The user is waiting on this with their cursor parked in another app, so it has to be
+    /// able to say what it is doing.
+    case refining
     /// Running the correction pass and the injection ladder.
     case injecting
     case error(String)
@@ -28,7 +37,7 @@ public enum DictationPhase: Sendable, Hashable {
     public var isActive: Bool {
         switch self {
         case .idle, .error: return false
-        case .arming, .listening, .transcribing, .injecting: return true
+        case .arming, .listening, .transcribing, .refining, .injecting: return true
         }
     }
 
@@ -310,6 +319,19 @@ public final class AppModel {
     /// and it reads as a model failure, so it has to be surfaced.
     public private(set) var lastCaptureSuspect: Bool = false
 
+    /// Wall-clock seconds the on-device model has been refining the utterance in flight; zero in
+    /// every other phase.
+    ///
+    /// This exists because `.refining` is the one wait in this app long enough to need evidence that
+    /// it is a wait and not a stall. Measured 1.0 s warm and 2.9 s cold — long enough that a frozen
+    /// HUD reads as a hang, and Apple's framework reports no progress at all, so a bar would be
+    /// fiction. A counter climbing through tenths is the honest version of the same reassurance, and
+    /// it is also the number that tells the user what the switch they turned on actually costs them.
+    ///
+    /// Separate from `elapsed`, which counts *speech*: adding refinement seconds to it would make
+    /// the HUD claim the user talked for longer than they did.
+    public private(set) var refineElapsed: TimeInterval = 0
+
     // MARK: Stores
 
     public let settings: Settings
@@ -331,6 +353,14 @@ public final class AppModel {
     /// routing them through this object would only add a second invalidation source.
     @ObservationIgnored public let importQueue: ImportQueue
 
+    /// The on-device refinement surface's state, and the one `TextRefiner` the app owns.
+    ///
+    /// One instance, shared with `DictationController`, because `TextRefiner` keeps pre-warmed
+    /// `LanguageModelSession`s: a second refiner would mean a second cold start, and the measured
+    /// difference between cold and warm is 2.9 s against 1.0 s. `@ObservationIgnored` for the same
+    /// reason as `importQueue` — it is a `let` that is itself `@Observable`.
+    @ObservationIgnored public let refinement: RefinementStore
+
     // MARK: Window state
 
     /// Which rail stop the main window is showing.
@@ -349,6 +379,8 @@ public final class AppModel {
     private static let elapsedHz: Double = 10
 
     private var tickers: Task<Void, Never>?
+    /// See `startRefineTicker()`.
+    private var refineTicker: Task<Void, Never>?
     private var didBootstrap = false
 
     // MARK: Init
@@ -368,11 +400,15 @@ public final class AppModel {
         self.history = history
         self.permissions = permissions
         self.loginItem = loginItem
+        // Built before the controller so both hold the same refiner. See `refinement`.
+        let refinement = RefinementStore()
+        self.refinement = refinement
         let controller = DictationController(
             settings: settings,
             dictionary: dictionary,
             history: history,
-            permissions: permissions
+            permissions: permissions,
+            refiner: refinement.refiner
         )
         self.controller = controller
         self.importQueue = ImportQueue(environment: controller.importEnvironment())
@@ -415,6 +451,7 @@ public final class AppModel {
         case .listening:
             return activeLocaleIsSecondary ? "Listening (\(localeBadge))" : "Listening"
         case .transcribing: return "Transcribing"
+        case .refining: return "Cleaning the text up"
         case .injecting: return "Inserting text"
         case .error(let message): return message
         }
@@ -434,6 +471,7 @@ public final class AppModel {
         case .arming: return .armed
         case .listening: return .listening
         case .transcribing: return .transcribing
+        case .refining: return .refining
         case .injecting: return .injecting
         case .error(let message): return .fault(message)
         }
@@ -444,7 +482,7 @@ public final class AppModel {
         case .idle: return .off
         case .arming: return .armed
         case .listening: return .recording
-        case .transcribing, .injecting: return .armed
+        case .transcribing, .refining, .injecting: return .armed
         case .error: return .fault
         }
     }
@@ -602,8 +640,14 @@ public final class AppModel {
         } else {
             stopTickers()
         }
+        if newPhase == .refining {
+            startRefineTicker()
+        } else {
+            stopRefineTicker()
+        }
         if newPhase == .idle {
             elapsed = 0
+            refineElapsed = 0
             level = .silent
             levelMeter.reset()
         }
@@ -913,5 +957,33 @@ public final class AppModel {
     private func stopTickers() {
         tickers?.cancel()
         tickers = nil
+    }
+
+    /// Publishes `refineElapsed` at the same rate `SegmentCounter(.elapsed:)` renders tenths at.
+    ///
+    /// A second task rather than a branch inside `startTickers`, because that one exists to sample
+    /// the audio level as well and must stop the instant the microphone closes. This one runs on the
+    /// other side of that boundary.
+    private func startRefineTicker() {
+        guard refineTicker == nil else { return }
+        let started = ContinuousClock.now
+        refineElapsed = 0
+        refineTicker = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1.0 / Self.elapsedHz))
+                guard let self, self.phase == .refining else { return }
+                let span = started.duration(to: .now)
+                self.refineElapsed = Double(span.components.seconds)
+                    + Double(span.components.attoseconds) / 1e18
+            }
+        }
+    }
+
+    private func stopRefineTicker() {
+        refineTicker?.cancel()
+        refineTicker = nil
+        // Deliberately not zeroed here. The HUD is still on screen for the injection that follows,
+        // and snapping the counter to 0.0 s for those few milliseconds would erase the one number
+        // that says what the wait cost. `apply(phase:)` clears it when the phase reaches `.idle`.
     }
 }
