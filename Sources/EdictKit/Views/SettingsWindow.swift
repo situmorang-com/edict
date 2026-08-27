@@ -942,7 +942,7 @@ private struct RefineSelectionSection: View {
                     Text(refused ? "Unavailable" : "Live")
                         .typeStyle(D.type.silkscreenTiny)
                 }
-                if let caveat = chord.rowCaveat {
+                if let caveat = chord.rowCaveat(dictationKey: settings.hotkey) {
                     Spacer(minLength: D.space.sm)
                     Text(caveat)
                         .typeStyle(D.type.silkscreenTiny)
@@ -953,7 +953,8 @@ private struct RefineSelectionSection: View {
         .disabled(refused)
         .opacity(refused ? D.opacity.disabled : 1)
         .accessibilityLabel(
-            [chord.displayName(dictationKey: settings.hotkey), chord.rowCaveat]
+            [chord.displayName(dictationKey: settings.hotkey),
+             chord.rowCaveat(dictationKey: settings.hotkey)]
                 .compactMap(\.self)
                 .joined(separator: ", ")
         )
@@ -1221,8 +1222,9 @@ public enum DualLocaleFixtures {
         // Panel width plus the deck gutter the settings column pads with, so the sheet frames the
         // panel the way the window does.
         let panel = CGSize(width: S.column, height: 640)
-        // The refine panel is the tallest of these: four chord rows plus two paragraphs.
-        let refinePanel = CGSize(width: S.column, height: 860)
+        // The refine panel is the tallest of these: five chord rows plus two paragraphs, and the
+        // default's paragraph is now the longest of the five because it has two chords to explain.
+        let refinePanel = CGSize(width: S.column, height: 960)
         let hud = CGSize(width: D.size.hudSize.width + D.space.lg,
                          height: D.size.hudSize.height + D.size.waveformHeight + D.space.lg)
 
@@ -1269,9 +1271,15 @@ public enum DualLocaleFixtures {
             // sheet cropped above the thing being proved proves nothing.
             sheet("settings-column", CGSize(width: S.column, height: 2_560),
                   SettingsWindow(model: PreviewFixtures.model(), unbounded: true, locales: locales)),
-            // Taller than `panel`: the picker grew a fourth row and the two prose blocks under it
-            // are the whole reason these sheets exist. A sheet cropped above the copy proves nothing.
+            // Taller than `panel`: the picker grew a fifth row and the two prose blocks under it are
+            // the whole reason these sheets exist. A sheet cropped above the copy proves nothing.
+            // `-default` is the sheet to read for the new gesture: it has to make plain, in one
+            // glance, that 🌐/ and ⌃⌘/ are one setting rather than two.
             sheet("refine-selection-default", refinePanel, refineSelection(PreviewFixtures.model())),
+            sheet("refine-selection-slash", refinePanel, refineSelection(commandOptionSlashChord())),
+            // The one configuration where the default's row would print two chords and mean one:
+            // Globe dictates, so only the alias can fire, and the row has to say which.
+            sheet("refine-selection-globe-dictates", refinePanel, refineSelection(globeIsTheDictationKeyWithDefault())),
             sheet("refine-selection-discrete", refinePanel, refineSelection(discreteChord())),
             // The row that has to read as a caveat rather than as a feature.
             sheet("refine-selection-fn", refinePanel, refineSelection(globeQualifier())),
@@ -1296,6 +1304,14 @@ public enum DualLocaleFixtures {
         return model
     }
 
+    /// The previous default, chosen by hand — the population the migration note is about. Rendered
+    /// because its paragraph now has to warn about Alfred without contradicting the row above it.
+    private static func commandOptionSlashChord() -> AppModel {
+        let model = ready()
+        model.settings.refineSelectionChord = .commandOptionSlash
+        return model
+    }
+
     /// A discrete chord chosen, so the explanation line under the keys is the other one.
     private static func discreteChord() -> AppModel {
         let model = ready()
@@ -1310,6 +1326,16 @@ public enum DualLocaleFixtures {
     private static func globeQualifier() -> AppModel {
         let model = ready()
         model.settings.refineSelectionChord = .fnThenDictationKey
+        return model
+    }
+
+    /// Globe as the dictation key with the *default* chord selected. Nothing is refused here — the
+    /// `⌃⌘/` half still fires — but `fn + /` cannot, so the row tag has to change rather than promise
+    /// a chord that is busy holding a recording open.
+    private static func globeIsTheDictationKeyWithDefault() -> AppModel {
+        let model = ready()
+        model.settings.hotkey = .fn
+        model.settings.refineSelectionChord = .fnSlash
         return model
     }
 

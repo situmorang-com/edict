@@ -136,8 +136,8 @@ struct RefineChordTests {
     func defaults() {
         let settings = Settings(defaults: EphemeralDefaults())
         #expect(settings.refineSelectionEnabled)
-        #expect(settings.refineSelectionChord == .commandOptionSlash)
-        #expect(settings.effectiveRefineChord == .commandOptionSlash)
+        #expect(settings.refineSelectionChord == .fnSlash)
+        #expect(settings.effectiveRefineChord == .fnSlash)
     }
 
     @Test("effectiveRefineChord is the one answer the tap, the picker and the status line share")
@@ -705,5 +705,81 @@ struct HotkeyChordLiveTests {
         try await Task.sleep(for: .milliseconds(150))
         #expect(sink.events == [.pressed(alternate: false), .released])
         #expect(sink.gestures.isEmpty)
+    }
+
+    // MARK: The tap inventory
+
+    /// The invariant amendment 50 buys, checked the only way it can be: by asking the window server.
+    ///
+    /// Amendment 42 used to say "at idle Edict must hold exactly **one** tap, listen-only". The refine
+    /// trigger widened that to two, and a widening nobody can see is a widening that grows. So this
+    /// asserts the *whole* shape — how many, which options, which masks — rather than merely that the
+    /// new one exists:
+    ///
+    /// * one `.listenOnly` tap on `keyDown | keyUp | flagsChanged` — the hotkey. It must never become
+    ///   consuming: it watches modifier holds, and a consuming tap on `.flagsChanged` would eat the
+    ///   user's Option key system-wide.
+    /// * one `.defaultTap` on `keyDown` **alone** — the refine trigger. keyDown is the minimum
+    ///   surface that can swallow a character, and anything wider is unearned suppression.
+    ///
+    /// Posts nothing, so unlike its neighbours in this suite it cannot touch the user's keyboard.
+    @Test("at idle the monitor holds exactly two taps: one listen-only, one consuming keyDown-only")
+    func tapInventory() throws {
+        let monitor = HotkeyMonitor(armDelay: 0.12)
+        defer { monitor.stop() }
+        // `start` returns only once both taps are installed, so there is nothing to wait for here.
+        try monitor.start(key: .rightOption, alternate: .shift, refine: .fnSlash)
+
+        let taps = HotkeyMonitor.installedTaps(forPID: getpid())
+        #expect(taps.count == 2, "tap inventory is \(taps.count): \(Self.describe(taps))")
+
+        let listenOnly = taps.filter { $0.options == .listenOnly }
+        let consuming = taps.filter { $0.options == .defaultTap }
+        #expect(listenOnly.count == 1, Comment(rawValue: Self.describe(taps)))
+        #expect(consuming.count == 1, Comment(rawValue: Self.describe(taps)))
+
+        let keyDown = CGEventMask(1) << CGEventType.keyDown.rawValue
+        let keyUp = CGEventMask(1) << CGEventType.keyUp.rawValue
+        let flags = CGEventMask(1) << CGEventType.flagsChanged.rawValue
+        #expect(listenOnly.first?.eventsOfInterest == keyDown | keyUp | flags)
+        #expect(consuming.first?.eventsOfInterest == keyDown)
+        #expect(taps.allSatisfy { $0.enabled })
+    }
+
+    /// RECON §12 measured 500 taps created without `CFMachPortInvalidate` leaking exactly 500 Mach
+    /// ports, 1:1. There are now three ports in play per generation (hotkey, trigger, and the timer's
+    /// run-loop source), so the teardown order matters more than it did, and this is the assertion
+    /// that would catch a `removeTriggerTap()` dropped from the thread's exit path.
+    @Test("start and stop cycles leave no taps and no Mach port growth")
+    func noPortGrowth() throws {
+        // One warm-up cycle first: the first run loop and tap of a process cost a one-time,
+        // non-recurring number of ports (measured constant at 50, 500 and 3000 iterations).
+        try Self.cycle()
+        let before = HotkeyMonitor.machPortCount()
+        for _ in 0..<10 { try Self.cycle() }
+        let after = HotkeyMonitor.machPortCount()
+        #expect(after - before <= 4, "10 start/stop cycles moved the port count by \(after - before)")
+        #expect(HotkeyMonitor.installedTaps(forPID: getpid()).isEmpty)
+    }
+
+    /// One start/stop, waiting for the tap thread to finish its own teardown — which happens on that
+    /// thread, after `stop()` has already returned.
+    private static func cycle() throws {
+        let monitor = HotkeyMonitor(armDelay: 0.12)
+        try monitor.start(key: .rightOption, alternate: .shift, refine: .fnSlash)
+        #expect(HotkeyMonitor.installedTaps(forPID: getpid()).count == 2)
+        monitor.stop()
+        for _ in 0..<200 where !HotkeyMonitor.installedTaps(forPID: getpid()).isEmpty {
+            usleep(5_000)
+        }
+        #expect(HotkeyMonitor.installedTaps(forPID: getpid()).isEmpty,
+                "a tap outlived its monitor")
+    }
+
+    private static func describe(_ taps: [CGEventTapInformation]) -> String {
+        taps.map {
+            "{options=\($0.options == .listenOnly ? "listenOnly" : "defaultTap") "
+                + "mask=0x\(String($0.eventsOfInterest, radix: 16)) enabled=\($0.enabled)}"
+        }.joined(separator: " ")
     }
 }

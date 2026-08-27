@@ -143,13 +143,14 @@ public final class Settings {
         /// feature they asked for by name, and a gesture nobody is told about is a gesture nobody
         /// uses. The chord is printed in Settings for the same reason.
         ///
-        /// It costs nothing when unused: no timer, no extra tap, no work at launch beyond one
-        /// pre-warm that the dictation path was doing anyway. The key-suppressing tap exists only
-        /// while the popup is on screen.
+        /// It costs one thing when unused, and it is worth naming: the trigger's consuming tap is
+        /// alive whenever the monitor is (RECON amendment 50), so a keyDown-only callback runs in
+        /// front of every keystroke and passes all but one shape straight through. The
+        /// digit-suppressing tap still exists only while the popup is on screen.
         public static let refineSelectionEnabled = true
-        /// `⌘⌥/`. Named by `RefineChord` itself so the value and the three measurements behind it
-        /// (no character typed, so no suppressing tap; `fn` invisible on non-Apple keyboards; no
-        /// collision with the active Karabiner profile) stay in one file.
+        /// `fn + /`, or `⌃⌘/` on a keyboard that hides `fn`. Named by `RefineChord` itself so the
+        /// value and the measurements behind it (which slash chords type a character; `fn` invisible
+        /// on non-Apple keyboards; no collision with Karabiner or Alfred) stay in one file.
         public static let refineSelectionChord = RefineChord.default
         public static let historyLimit = 5000
     }

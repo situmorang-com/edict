@@ -214,13 +214,17 @@
 >     disabling the feature. Keep instructions short; a fourth clause measurably diluted the others on
 >     this ~3B model.
 >
-> 42. **Amendment 13 ("`.listenOnly`, never suppress") has exactly one sanctioned exception.** While the
->     selection popup is on screen, `HotkeyMonitor` installs a **second, consuming** tap on the same
->     thread and run loop, alive only for that window, so that `1`/`2`/`3`/`Esc` choose an action
->     instead of typing over the very selection about to be replaced. Without it, pressing `1` replaces
->     the user's selected text with the character "1" — measured. At idle Edict must hold **exactly one
->     tap, listen-only**; verify with `CGGetEventTapList` filtered on `getpid()` after any change here.
->     Suppression anywhere else, and for any other reason, is still forbidden.
+> 42. **Amendment 13 ("`.listenOnly`, never suppress") has exactly two sanctioned exceptions.**
+>     *Amended by amendment 50, which added the second and rewrote the tap inventory below.* The first
+>     is the popup: while the selection popup is on screen, `HotkeyMonitor` installs a **consuming**
+>     tap on the same thread and run loop, alive only for that window, so that `1`/`2`/`3`/`Esc` choose
+>     an action instead of typing over the very selection about to be replaced. Without it, pressing
+>     `1` replaces the user's selected text with the character "1" — measured. The second is the refine
+>     *trigger* (amendment 50). **At idle Edict holds exactly two taps: one `.listenOnly` on
+>     `keyDown|keyUp|flagsChanged` for the hotkey, and one `.defaultTap` on `keyDown` alone for the
+>     trigger.** Verify with `CGGetEventTapList` filtered on `getpid()` after any change here — there is
+>     a test that does exactly that (`HotkeyChordLive.tapInventory`). Suppression anywhere else, and for
+>     any other reason, is still forbidden.
 >
 > 43. **`CGEventSource.flagsState` cannot be trusted to say whether a chord is still held.** Measured
 >     latched at `maskCommand` for over three seconds with no key down. The trustworthy signal is
@@ -304,9 +308,11 @@
 >     `UCKeyTranslate` on this machine's ABC layout: `/`→`/`, `⌥/`→`÷`, `⌃⌥/`→`/`, `⇧⌥/`→`¿`. A trigger
 >     that types **replaces the user's selection before it can be read**, which is the exact failure the
 >     feature exists to prevent. A Command chord is a key equivalent and inserts nothing, so `⌘⌥/`
->     needs **no consuming tap** — Edict keeps exactly one listen-only tap at idle. Do not add one here.
->     Control and Shift are *forbidden* rather than ignored, so this user's four-modifier Safari slash
->     mapping cannot fire it.
+>     needs **no consuming tap**. Control and Shift are *forbidden* rather than ignored, so this user's
+>     four-modifier Safari slash mapping cannot fire it. **Superseded in part by amendment 50:** `⌘⌥/`
+>     is no longer the default (Alfred owns it on this machine) and it is no longer true that Edict
+>     holds only one tap at idle. What survives intact is the rule this amendment exists for — a
+>     trigger must not insert text *unless Edict swallows it*, and swallowing has to be paid for.
 >
 > 48. **`fn` is not a portable modifier.** Third-party keyboards — Logitech, Keychron, Das —
 >     resolve `fn` in their own firmware and macOS never sees the key, so `maskSecondaryFn` is never set
@@ -324,6 +330,60 @@
 >     seconds (RECON §20), and the analyzer is built only once `.alternateSettled` fires. A hold shorter
 >     than the window settles from whatever is held at release.
 
+
+> 50. **The refine trigger is `fn + /`, with `⌃⌘/` as a keyboard-independent alias, and it is the one
+>     trigger Edict swallows.** This widens amendment 42 — read that first — and it is the only
+>     widening of amendment 13 that has been allowed on a *trigger*.
+>
+>     **Why a consuming tap here, when it was refused for `⌥/`.** Measured with `UCKeyTranslate` on
+>     this machine's ABC layout: `/`→`/`, `⌥/`→`÷`, `⌃/`→`/`, `⌃⌥/`→`/`, `⇧⌥/`→`¿`, `fn/`→`/`. Only a
+>     `⌘`-bearing chord inserts nothing. So every short slash chord must either be swallowed or
+>     abandoned, and the deciding question is what swallowing *costs the user*: eating `⌥/` would take
+>     away their only way to type `÷`, and `⌥'` their only `æ`. `fn + /` costs nothing at all, because
+>     it is a redundant way to type a character that is already on an unmodified key. That asymmetry
+>     is the whole argument. It does not generalise to any other chord, and a future trigger that
+>     inserts a character the user cannot type otherwise must be refused again.
+>
+>     **Why one setting has two chords.** `fn` is resolved in firmware on third-party keyboards and
+>     macOS never sees it (amendment 48), and this user works on both a MacBook internal keyboard and
+>     a Logitech. `fnSlash` therefore fires on two shapes, both keycode 44: `maskSecondaryFn` set with
+>     every other modifier forbidden (**consumed**), or Control+Command with Option and Shift
+>     forbidden (**passed through**, since it inserts nothing). `⌃⌘/` was checked against the machine,
+>     not assumed: no keycode-44 hotkey in either Alfred's synced prefs or its local storage, and
+>     neither Karabiner `slash` rule matches it. The picker states both in plain words; do **not**
+>     split them into two settings.
+>
+>     **The shape of the tap.** A *second* port, never a mode on the hotkey tap: that one is
+>     `.listenOnly` because it watches modifier holds, and a consuming tap on `.flagsChanged` would eat
+>     the user's Option key. `eventsOfInterest` is `keyDown` **only** — the minimum surface that can
+>     swallow a character, and small enough that a stripped keyboard mask is an *empty* mask, so
+>     `tapCreate` returning nil is a complete permission gate (unlike the listen-only case in
+>     RECON §11). The callback returns `nil` for one exact `(keyCode, flags)` shape and the unmodified
+>     event for everything else; it allocates nothing and builds no `String`, because RECON §12's
+>     budget is what keeps `.tapDisabledByTimeout` from making the tap deaf. `.tapDisabledBy*` is
+>     handled and re-enabled on this tap too, and the 0.25 s watchdog polls it — a silently disabled
+>     consuming tap does not go quiet, it goes *transparent*, and `fn + /` would start typing slashes
+>     into the user's document with no popup and no error. Teardown is the measured order
+>     (`CFRunLoopRemoveSource` → `tapEnable(false)` → `CFMachPortInvalidate`) on the thread that
+>     created the port, or it leaks one Mach port per creation.
+>
+>     **How the two taps cannot double-fire.** Each shape is claimed by exactly one tap, by whether it
+>     needs swallowing (`RefineChord.Discrete.consumesTrigger`): the consuming tap answers
+>     `matchesConsuming`, the hotkey tap answers `matchesListenOnly`, and the sets are disjoint by
+>     construction. Correctness therefore does not depend on which tap the window server serves first.
+>
+>     **Measured on this machine.** `CGGetEventTapList` filtered on `getpid()` reports exactly two taps
+>     while the monitor runs — `consuming/mask=0x400/enabled=true` and
+>     `listenOnly/mask=0x1c00/enabled=true` — and none after `stop()`; ten start/stop cycles moved the
+>     task's Mach port count by **0**. Against a scratch app of our own (never the user's frontmost
+>     window), a posted `fn + /` reached the document as **nothing** while a posted plain `/` inserted
+>     `/`, and the gesture fired exactly once. **No agent has ever pressed the physical `fn` key**;
+>     every `fn` observation in this project is a posted `maskSecondaryFn`, and the claim that a real
+>     `fn + /` carries that bit on keycode 44 comes from the user's own measurement, not from ours.
+>
+>     **One known edge, deliberately not papered over.** With Globe as the *dictation* key the `fn`
+>     shape is dropped rather than masked — `fn` is holding a recording open, so `fn + /` cannot also
+>     mean this — and only `⌃⌘/` fires. The row still reads as live, because it is.
 
 Fixed interfaces. Every implementation agent codes against these signatures exactly.
 If you believe a signature is wrong, implement it as written and note the objection in your report —

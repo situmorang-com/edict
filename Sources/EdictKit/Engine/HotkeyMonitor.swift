@@ -220,8 +220,23 @@ struct HotkeyBinding: Sendable, Hashable {
 /// * **Qualified** (`fn` then the dictation key). Recognised in the `.flagsChanged` branch at the
 ///   moment the dictation key goes *down*, from the qualifier bit carried on that very event. This
 ///   is the whole ordering rule: the bit is either already set when the key goes down, or it is not.
-/// * **Discrete** (`⌘⌥/`, `⌥⌘R`, `⌃⌥R`). Recognised in the `.keyDown` branch, from a keycode plus a
-///   required-and-forbidden pair of flag masks, both taken from ``RefineChord/discrete``.
+/// * **Discrete** (`fn + /` and its `⌃⌘/` alias, `⌘⌥/`, `⌥⌘R`, `⌃⌥R`). Recognised in a `.keyDown`
+///   branch, from a keycode plus a required-and-forbidden pair of flag masks, all taken from
+///   ``RefineChord/discretes``.
+///
+/// ## Two taps own the discrete family between them, and the split is by shape
+///
+/// A shape that types a character can only work if Edict swallows it, and a shape that types nothing
+/// must not be swallowed — suppression is bought where it is needed and nowhere else (RECON
+/// amendments 13, 42 and 50). So each shape is claimed by exactly one tap:
+///
+/// * ``matchesConsuming(keyCode:rawFlags:)`` — the keyDown-only **consuming** tap. `fn + /` only.
+/// * ``matchesListenOnly(keyCode:rawFlags:)`` — the existing **listen-only** hotkey tap. Everything
+///   else, exactly as before.
+///
+/// The two sets are disjoint by construction (`Discrete.consumesTrigger` partitions them), so no
+/// event can fire the gesture twice and the answer does not depend on which tap the window server
+/// happens to serve first.
 ///
 /// Everything is a bit test. RECON amendment 31 measured Right Option arriving as `0x00080140`
 /// rather than the expected `0x00080040` because a keyboard remapper stamps `nonCoalesced` (`0x100`)
@@ -229,20 +244,41 @@ struct HotkeyBinding: Sendable, Hashable {
 /// posted one — so any comparison against a literal raw word silently never fires.
 struct RefineChordBinding: Sendable, Hashable {
 
+    /// One `.keyDown` shape, resolved: `RefineChord`'s own masks plus the part that depends on a
+    /// *setting* — the dictation key's device bit.
+    struct Variant: Sendable, Hashable {
+        let keyCode: Int64
+        /// Every bit in here must be SET.
+        let requiredFlags: UInt64
+        /// Any bit in here being set disqualifies the match.
+        let forbiddenFlags: UInt64
+        /// Whether this shape has to be swallowed. See the type's note.
+        let consumes: Bool
+
+        func matches(keyCode: Int64, rawFlags: UInt64) -> Bool {
+            guard keyCode == self.keyCode else { return false }
+            // Ands only. Never `rawFlags == something` (RECON amendment 31).
+            return rawFlags & requiredFlags == requiredFlags && rawFlags & forbiddenFlags == 0
+        }
+    }
+
     /// Flag bits meaning "the qualifier is held", or `nil` for the discrete family.
     let qualifierMask: UInt64?
     /// Keycodes belonging to the qualifier. Exempt from chord cancellation, which is the second half
     /// of the ordering rule: a qualifier pressed *during* a hold must not cancel the recording.
     let qualifierKeyCodes: Set<Int64>
 
-    /// The plain key of a discrete chord, or `nil` for the qualified family.
-    let discreteKeyCode: Int64?
-    /// Every bit in here must be SET for a discrete chord to match.
-    let requiredFlags: UInt64
-    /// Any bit in here being set disqualifies the match.
-    let forbiddenFlags: UInt64
+    /// Every shape that fires this chord with this dictation key. Empty for the qualified family.
+    let variants: [Variant]
 
     let displayName: String
+
+    /// The first shape's key, or `nil` for the qualified family. Diagnostics and tests only — the tap
+    /// asks `matches…`, which is the whole rule.
+    var discreteKeyCode: Int64? { variants.first?.keyCode }
+
+    /// Whether this binding needs the consuming tap to be alive to be usable at all.
+    var needsConsumingTap: Bool { variants.contains(where: \.consumes) }
 
     /// `nil` when the chord cannot be expressed with this dictation key — `fn` cannot qualify `fn`.
     /// `Settings.effectiveRefineChord` refuses the same combination in the UI, so this is the second
@@ -255,27 +291,36 @@ struct RefineChordBinding: Sendable, Hashable {
             guard dictationKey != .fn else { return nil }
             qualifierMask = UInt64(CGEventFlags.maskSecondaryFn.rawValue)
             qualifierKeyCodes = [HotkeyBinding.KeyCode.fn]
-            discreteKeyCode = nil
-            requiredFlags = 0
-            forbiddenFlags = 0
+            variants = []
 
-        case .commandOptionSlash, .optionCommandR, .controlOptionR:
-            // The keycode and the required/forbidden masks are `RefineChord`'s own decision table,
+        case .fnSlash, .commandOptionSlash, .optionCommandR, .controlOptionR:
+            // The keycodes and the required/forbidden masks are `RefineChord`'s own decision table,
             // not this file's: they are pure logic over `(keyCode, rawFlags)` and are unit-tested
             // there without a tap. This file keeps only the part that needs a *setting* — the
             // dictation key's device bit, below.
-            guard let table = chord.discrete else { return nil }
             qualifierMask = nil
             qualifierKeyCodes = []
-            discreteKeyCode = table.keyCode
-            requiredFlags = table.requiredFlags
-            let excluded: UInt64 = table.forbiddenFlags
-            // Plus the dictation key's own *device* bit. Without this, a user whose dictation key is
-            // Right Option and who reaches for ⌥⌘R with that key would fire the chord out of a hold
-            // that has already armed — a popup and a half-second recording from one gesture. Only the
-            // device bit is excluded, never the side-agnostic `maskAlternate`, because ⌥⌘R needs
-            // `maskAlternate` set to be ⌥⌘R at all.
-            forbiddenFlags = excluded | Self.deviceBit(of: dictationKey)
+            // The dictation key's own *device* bit. Without excluding it, a user whose dictation key
+            // is Right Option and who reaches for ⌥⌘R with that key would fire the chord out of a
+            // hold that has already armed — a popup and a half-second recording from one gesture.
+            // Only the device bit is excluded, never the side-agnostic `maskAlternate`, because ⌥⌘R
+            // needs `maskAlternate` set to be ⌥⌘R at all.
+            let owned = Self.deviceBit(of: dictationKey)
+            // A shape that *requires* a bit the dictation key owns is dropped rather than neutered:
+            // adding `owned` to its forbidden mask would leave a shape that can never match, which
+            // is a chord that silently does nothing. The case is real — `fn + /` with Globe as the
+            // dictation key — and dropping only that shape is what lets `fnSlash`'s `⌃⌘/` alias go on
+            // working there instead of taking the whole setting away.
+            let shapes = chord.discretes.filter { $0.requiredFlags & owned == 0 }
+            guard !shapes.isEmpty else { return nil }
+            variants = shapes.map {
+                Variant(
+                    keyCode: $0.keyCode,
+                    requiredFlags: $0.requiredFlags,
+                    forbiddenFlags: $0.forbiddenFlags | owned,
+                    consumes: $0.consumesTrigger
+                )
+            }
         }
     }
 
@@ -291,9 +336,22 @@ struct RefineChordBinding: Sendable, Hashable {
         }
     }
 
+    /// Does this `.keyDown` fire the chord at all, by either tap? Diagnostics and tests; the taps ask
+    /// the two narrower questions below, because which tap answers decides whether the keystroke
+    /// survives.
     func matchesDiscrete(keyCode: Int64, rawFlags: UInt64) -> Bool {
-        guard let discreteKeyCode, keyCode == discreteKeyCode else { return false }
-        return rawFlags & requiredFlags == requiredFlags && rawFlags & forbiddenFlags == 0
+        variants.contains { $0.matches(keyCode: keyCode, rawFlags: rawFlags) }
+    }
+
+    /// The listen-only tap's question: a shape that types nothing, so it is fired and passed through.
+    func matchesListenOnly(keyCode: Int64, rawFlags: UInt64) -> Bool {
+        variants.contains { !$0.consumes && $0.matches(keyCode: keyCode, rawFlags: rawFlags) }
+    }
+
+    /// The consuming tap's question: a shape that types a character, so firing it means swallowing
+    /// the keystroke.
+    func matchesConsuming(keyCode: Int64, rawFlags: UInt64) -> Bool {
+        variants.contains { $0.consumes && $0.matches(keyCode: keyCode, rawFlags: rawFlags) }
     }
 }
 
@@ -346,6 +404,12 @@ extension HotkeyModifier {
 /// - Never suppress (RECON §13). Right Option is AltGr on many layouts; eating it would break dead keys
 ///   and accented characters system-wide. Ambiguity is resolved in software instead: the key must be held
 ///   alone, and held for at least `armDelay`.
+/// - **Two taps at idle** (RECON amendment 50), and this is the only widening of §13 that stands:
+///   the listen-only hotkey tap above, plus a **consuming, keyDown-only** tap that exists to swallow
+///   the refine trigger's `fn + /`. The second one returns `nil` for that one shape and passes every
+///   other keystroke through unchanged. It is a *separate port* rather than a mode on the hotkey tap
+///   for a reason that is not stylistic: the hotkey tap watches modifier holds, and a consuming tap
+///   on `.flagsChanged` would eat the user's Option key.
 /// - A dedicated `.userInteractive` thread with its own CFRunLoop (RECON §12). Measured: with the main
 ///   thread blocked 3 s, a dedicated run loop serviced 151/150 expected ticks and the main run loop
 ///   serviced 0/150. On the main run loop any SwiftUI hitch delays press/release by the hitch duration
@@ -400,6 +464,24 @@ public final class HotkeyMonitor: Sendable {
         }
     }
 
+    /// The refine trigger's consuming tap: keyDown only, alive for as long as the monitor is.
+    ///
+    /// Same shape as `CaptureResources` and deliberately not the same type. The capture tap is
+    /// installed and removed on request while a panel is up; this one is part of the tap thread's own
+    /// lifecycle, created straight after the hotkey tap and torn down on the way out. Sharing one
+    /// field would mean one of them could invalidate the other's port.
+    private final class TriggerResources: @unchecked Sendable {
+        let runLoop: CFRunLoop
+        let port: CFMachPort
+        let source: CFRunLoopSource?
+
+        init(runLoop: CFRunLoop, port: CFMachPort, source: CFRunLoopSource?) {
+            self.runLoop = runLoop
+            self.port = port
+            self.source = source
+        }
+    }
+
     private enum CaptureRequest: Sendable {
         case none, install, remove
     }
@@ -442,6 +524,9 @@ public final class HotkeyMonitor: Sendable {
         /// tap is installed or after installation failed.
         var runLoop: CFRunLoop?
         var resources: TapResources?
+        /// The consuming keyDown-only tap for the refine trigger. Non-nil for the whole life of a
+        /// healthy tap thread; `nil` means `fn + /` cannot be swallowed, and therefore must not fire.
+        var trigger: TriggerResources?
 
         /// Non-nil while the key is physically down.
         var holdStart: CFAbsoluteTime?
@@ -679,6 +764,12 @@ public final class HotkeyMonitor: Sendable {
                 state.withLock { $0.runLoop = runLoop }
                 owned = installTap(on: runLoop)
                 installed.value = owned != nil
+                // Second, and only if the first one lives: a monitor whose hotkey tap failed is about
+                // to be torn down, and a consuming tap in the path of every keystroke on the system
+                // has no business outliving the thing it exists to serve. Installing it *after* also
+                // puts it nearer the head of the chain — which is convenient rather than
+                // load-bearing, because the two taps claim disjoint shapes (`RefineChordBinding`).
+                if owned != nil { installTriggerTap(on: runLoop) }
             }
             ready.signal()
 
@@ -692,8 +783,10 @@ public final class HotkeyMonitor: Sendable {
                 serviceCaptureRequest()
             }
             // Unconditional, and before the hotkey tap goes: a suppressing tap left installed after
-            // its owning thread exited would swallow the user's digits for ever.
+            // its owning thread exited would swallow the user's digits — or the user's slashes —
+            // for ever.
             removeCaptureTap()
+            removeTriggerTap()
             teardown(owned)
         }
         thread.name = "com.edict.hotkey"
@@ -712,12 +805,20 @@ public final class HotkeyMonitor: Sendable {
             throw HotkeyError.tapCreationFailed
         }
 
+        // `trigger=` is worth a word in the same line as the binding: a chord whose only usable shape
+        // needs swallowing is silent without that tap, and this is where a "the chord does nothing"
+        // report gets answered in one grep.
+        let trigger: String = state.withLock { s in
+            guard let refine = s.refine, refine.needsConsumingTap else { return "not needed" }
+            return s.trigger == nil ? "MISSING" : "live"
+        }
         Log.hotkey.notice("""
             hotkey monitor live on \(binding.displayName, privacy: .public) \
             (keyCode \(binding.keyCode)) \
             alternate=\(alternate?.rawValue ?? "none", privacy: .public) \
             mask=0x\(String(binding.alternateMask, radix: 16), privacy: .public) \
-            refine=\(refineBinding?.displayName ?? "off", privacy: .public)
+            refine=\(refineBinding?.displayName ?? "off", privacy: .public) \
+            trigger=\(trigger, privacy: .public)
             """)
     }
 
@@ -871,6 +972,131 @@ public final class HotkeyMonitor: Sendable {
         }
         CGEvent.tapEnable(tap: resources.port, enable: false)
         CFMachPortInvalidate(resources.port)
+    }
+
+    // MARK: The refine trigger — the one consuming tap that is always alive
+
+    /// keyDown **only**, which is the minimum surface that can swallow a character.
+    ///
+    /// Not keyUp: an unmatched key-up is usually the thing that leaves a text field believing a key is
+    /// still held, but a trigger is not a hold — nothing downstream is tracking `/` between its down
+    /// and its up, and the character is produced by the down. Not `.flagsChanged`, emphatically: a
+    /// consuming tap on modifier transitions would eat the user's Option key. Keyboard-only keeps the
+    /// window server from stripping the keys while leaving the mask non-empty (RECON §11), and with
+    /// keyDown as the only bit, a stripped mask is an *empty* mask — so `CGEvent.h`'s documented NULL
+    /// return makes the nil-check a complete permission gate here.
+    private static let triggerMask: CGEventMask = 1 << CGEventType.keyDown.rawValue
+
+    /// Tap thread only. Installed once per generation, straight after the hotkey tap.
+    ///
+    /// ## Why this exists at all, when RECON §13 says never suppress
+    ///
+    /// The refine trigger is `fn + /`, and `fn + /` **types a slash** (measured with `UCKeyTranslate`
+    /// on this machine's ABC layout, along with `⌥/`→`÷` and `⇧⌥/`→`¿`). A trigger that types
+    /// replaces the selection Edict is about to read, which is the exact failure the feature exists to
+    /// prevent — so this shape can either be swallowed or abandoned. It was abandoned for `⌥/` and
+    /// `⌥'`, and rightly: those chords are the only way this user can type `÷` and `æ`. `fn + /` is
+    /// different in the one way that matters — it is a *redundant* way to type a character that is
+    /// already on an unmodified key — so swallowing it costs the user nothing at all. That asymmetry
+    /// is the whole argument, and it is why this is a second tap rather than a mode on the first
+    /// (RECON amendment 50, which widens amendment 42).
+    ///
+    /// The blast radius is bounded by construction: the mask is keyDown only, the callback returns
+    /// `nil` for exactly one `(keyCode, flags)` shape and `Unmanaged.passUnretained(event)` for
+    /// everything else, and it never allocates — RECON §12's sub-millisecond budget is what keeps
+    /// `.tapDisabledByTimeout` from firing and leaving the tap deaf.
+    private func installTriggerTap(on runLoop: CFRunLoop) {
+        // `passUnretained`, for the same reason as the hotkey tap: `CGEventTapCreate` never releases
+        // `userInfo`, so `passRetained` would be an unconditional leak with nowhere to balance it.
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard let port = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: Self.triggerMask,
+            callback: { _, type, event, refcon in
+                guard let refcon else { return Unmanaged.passUnretained(event) }
+                return Unmanaged<HotkeyMonitor>.fromOpaque(refcon)
+                    .takeUnretainedValue()
+                    .handleTrigger(type: type, event: event)
+            },
+            userInfo: context
+        ) else {
+            // A `.defaultTap` returns nil rather than a dead port, so this is the whole gate. Not
+            // fatal: dictation is unaffected, and the chord's `⌃⌘/` alias needs no suppression, so the
+            // honest degradation is "the Apple-keyboard half of the gesture is silent".
+            Log.hotkey.error("could not create the refine trigger tap; Accessibility is not granted")
+            return
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
+        CFRunLoopAddSource(runLoop, source, .commonModes)
+        CGEvent.tapEnable(tap: port, enable: true)
+        guard CGEvent.tapIsEnabled(tap: port) else {
+            Log.hotkey.error("refine trigger tap created but disabled")
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            CFMachPortInvalidate(port)
+            return
+        }
+        state.withLock { $0.trigger = TriggerResources(runLoop: runLoop, port: port, source: source) }
+        Log.hotkey.info("refine trigger tap installed (keyDown only, consuming)")
+    }
+
+    /// Same teardown order as every other tap here, for the same measured reason (RECON §12):
+    /// dropping the Swift reference leaks one Mach port per tap, 1:1, because the run loop source
+    /// holds the port.
+    private func removeTriggerTap() {
+        let trigger: TriggerResources? = state.withLock { s in
+            let trigger = s.trigger
+            s.trigger = nil
+            return trigger
+        }
+        guard let trigger else { return }
+        if let source = trigger.source {
+            CFRunLoopRemoveSource(trigger.runLoop, source, .commonModes)
+        }
+        CGEvent.tapEnable(tap: trigger.port, enable: false)
+        CFMachPortInvalidate(trigger.port)
+        Log.hotkey.info("refine trigger tap removed")
+    }
+
+    /// The consuming tap's callback. Returning `nil` swallows the event.
+    ///
+    /// Every path out of here is either `nil` for one matched shape or the event unmodified. There is
+    /// no third case on purpose: this callback sits in front of every keystroke the user types, so
+    /// "pass it through" has to be what happens when anything is unexpected.
+    private func handleTrigger(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        switch type {
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            // Arrives whether or not it was asked for, and is not covered by `eventsOfInterest`
+            // (RECON §12). Falling through to `return event` is how a tap goes permanently deaf.
+            let reason = type == .tapDisabledByTimeout ? "timeout" : "userInput"
+            let port: CFMachPort? = state.withLock { $0.trigger?.port }
+            if let port { CGEvent.tapEnable(tap: port, enable: true) }
+            Log.hotkey.error("refine trigger tap disabled by \(reason, privacy: .public); re-enabled")
+            diagnosticContinuation.yield(.tapReEnabled("refine trigger \(reason)"))
+            return nil
+
+        case .keyDown:
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            let rawFlags = event.flags.rawValue
+            // Decode and hand off. No String is built on this path and nothing is allocated: the
+            // decision is `&` against two stored masks behind one uncontended lock (RECON §12).
+            let fire: Bool = state.withLock { s in
+                s.refine?.matchesConsuming(keyCode: keyCode, rawFlags: rawFlags) ?? false
+            }
+            guard fire else { return Unmanaged.passUnretained(event) }
+            // Autorepeat is swallowed but not re-reported. A held `fn + /` would otherwise ask for
+            // thirty popups a second, and `RefineGestureController` would answer twenty-nine of them
+            // with "busy" — the first press is the gesture.
+            if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                gestureContinuation.yield(.refinePopup)
+            }
+            return nil
+
+        default:
+            return Unmanaged.passUnretained(event)
+        }
     }
 
     // MARK: Key capture — for a panel that cannot become key
@@ -1106,6 +1332,23 @@ public final class HotkeyMonitor: Sendable {
 
     /// Belt and braces: the OS can kill a tap without ever delivering `.tapDisabledBy*`, so poll.
     private func runWatchdog() {
+        // The trigger tap gets the same treatment, and needs it more: a silently disabled consuming
+        // tap does not go quiet, it goes *transparent* — `fn + /` would start typing slashes into the
+        // user's document with no popup and no error anywhere.
+        let trigger: CFMachPort? = state.withLock { s in
+            guard s.thread === Thread.current else { return nil }
+            return s.trigger?.port
+        }
+        if let trigger, !CGEvent.tapIsEnabled(tap: trigger) {
+            CGEvent.tapEnable(tap: trigger, enable: true)
+            if CGEvent.tapIsEnabled(tap: trigger) {
+                Log.hotkey.notice("watchdog re-enabled the refine trigger tap")
+                diagnosticContinuation.yield(.tapReEnabled("refine trigger watchdog"))
+            } else {
+                Log.hotkey.error("the refine trigger tap is dead; fn+/ cannot be swallowed")
+            }
+        }
+
         let port: CFMachPort? = state.withLock { s in
             guard s.thread === Thread.current, !s.reportedPermissionLost else { return nil }
             return s.resources?.port
@@ -1167,8 +1410,13 @@ public final class HotkeyMonitor: Sendable {
             }
             // The discrete chord is recognised before the cancellation rule below, which would
             // otherwise see nothing but "a real key arrived during a hold".
+            //
+            // `matchesListenOnly`, not `matchesDiscrete`: the shapes that have to be *swallowed* to be
+            // safe belong to the consuming tap, which never lets them reach this one. Asking the wider
+            // question here would double every `fn + /` if the window server ever served this tap
+            // first — and would fire a gesture whose slash had already landed in the user's document.
             if let refine = down.refine, !isRepeat,
-               refine.matchesDiscrete(keyCode: keyCode, rawFlags: rawFlags) {
+               refine.matchesListenOnly(keyCode: keyCode, rawFlags: rawFlags) {
                 Log.hotkey.info("refine chord \(refine.displayName, privacy: .public) fired")
                 gestureContinuation.yield(.refinePopup)
             }
@@ -1501,19 +1749,25 @@ public final class HotkeyMonitor: Sendable {
 
     // MARK: Diagnostics
 
-    /// The mask the window server actually granted this process. Needs no permission of its own.
-    static func grantedMask(forPID pid: pid_t) -> CGEventMask {
+    /// Every tap one process has installed, as the window server sees it. Needs no permission.
+    ///
+    /// The authority on Edict's own tap inventory, which is an invariant now that there are two of
+    /// them (RECON amendment 50): at idle this must report exactly two — one `.listenOnly` on
+    /// keyDown|keyUp|flagsChanged, one `.defaultTap` on keyDown alone. Anything else is either a leak
+    /// or a suppression Edict has no business holding, and both are invisible from inside the app.
+    static func installedTaps(forPID pid: pid_t) -> [CGEventTapInformation] {
         var count: UInt32 = 0
         _ = CGGetEventTapList(0, nil, &count)
-        guard count > 0 else { return 0 }
+        guard count > 0 else { return [] }
         var buffer = [CGEventTapInformation](repeating: CGEventTapInformation(), count: Int(count))
         var written: UInt32 = 0
-        guard CGGetEventTapList(count, &buffer, &written) == .success else { return 0 }
-        var mask: CGEventMask = 0
-        for index in 0..<Int(written) where buffer[index].tappingProcess == pid {
-            mask |= buffer[index].eventsOfInterest
-        }
-        return mask
+        guard CGGetEventTapList(count, &buffer, &written) == .success else { return [] }
+        return (0..<Int(written)).map { buffer[$0] }.filter { $0.tappingProcess == pid }
+    }
+
+    /// The mask the window server actually granted this process. Needs no permission of its own.
+    static func grantedMask(forPID pid: pid_t) -> CGEventMask {
+        installedTaps(forPID: pid).reduce(into: CGEventMask(0)) { $0 |= $1.eventsOfInterest }
     }
 
     /// Human-readable dump of every event tap installed on this system, for a debug menu item.

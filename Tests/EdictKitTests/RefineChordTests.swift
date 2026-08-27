@@ -213,14 +213,19 @@ struct CommandOptionSlashTests {
                                                        rawFlags: Self.cmd | Self.alt | Self.junk))
     }
 
-    @Test("⌘⌥/ is the default, and it is what a fresh install gets")
+    /// It stopped being the default when Alfred turned out to own `⌘⌥/` on this machine, and the
+    /// replacement is `fn + /` (`FnSlashTests`). What has to stay true is that choosing this one still
+    /// works everywhere — it is the row a user reaches for precisely when Edict must not touch a key.
+    @Test("⌘⌥/ is no longer the default, and still resolves for every dictation key")
     @MainActor
-    func isTheDefault() {
-        #expect(RefineChord.default == .commandOptionSlash)
-        #expect(Settings.Default.refineSelectionChord == .commandOptionSlash)
+    func isNoLongerTheDefault() {
+        #expect(RefineChord.default == .fnSlash)
+        #expect(Settings.Default.refineSelectionChord == .fnSlash)
 
         let settings = Settings(defaults: EphemeralDefaults())
-        #expect(settings.refineSelectionChord == .commandOptionSlash)
+        #expect(settings.refineSelectionChord == .fnSlash)
+
+        settings.refineSelectionChord = .commandOptionSlash
         #expect(settings.effectiveRefineChord == .commandOptionSlash)
         // And it stays live on the one dictation key that silences the `fn` gesture.
         settings.hotkey = .fn
@@ -230,20 +235,25 @@ struct CommandOptionSlashTests {
     /// The documented migration decision, pinned so it cannot drift into an accident.
     ///
     /// `refineSelectionChord` is written to `UserDefaults` **only** by the picker, so an absent key
-    /// means "never chose" and a present one means "chose". Everybody who merely inherited the old
-    /// `fn` default therefore moves to `⌘⌥/` with no migration code, and a deliberate `fn` choice is
-    /// kept rather than silently rewritten. See the note at the foot of `RefineChord`.
-    @Test("a deliberate Fn choice survives a relaunch, and no stored value means the new default")
+    /// means "never chose" and a present one means "chose". Everybody who merely inherited a previous
+    /// default therefore moves to the current one with no migration code, and a deliberate choice is
+    /// kept rather than silently rewritten. Held across three changes of default now; see the note at
+    /// the foot of `RefineChord`.
+    @Test("a deliberate choice survives a relaunch, and no stored value means the new default")
     @MainActor
     func migrationDecision() {
         let store = EphemeralDefaults()
 
         // Nothing stored: the new default, and nothing written by merely reading it.
         let fresh = Settings(defaults: store)
-        #expect(fresh.refineSelectionChord == .commandOptionSlash)
+        #expect(fresh.refineSelectionChord == .fnSlash)
         #expect(store.object(forKey: "edict.refineSelectionChord") == nil)
 
-        // Chosen by hand: kept.
+        // Chosen by hand: kept, including the chord that used to be the default.
+        fresh.refineSelectionChord = .commandOptionSlash
+        #expect(store.string(forKey: "edict.refineSelectionChord") == "commandOptionSlash")
+        #expect(Settings(defaults: store).refineSelectionChord == .commandOptionSlash)
+
         fresh.refineSelectionChord = .fnThenDictationKey
         #expect(store.string(forKey: "edict.refineSelectionChord") == "fnThenDictationKey")
         #expect(Settings(defaults: store).refineSelectionChord == .fnThenDictationKey)
@@ -255,11 +265,14 @@ struct CommandOptionSlashTests {
     /// as strings here; read as pixels in the proof sheets below.
     @Test("only the Fn gesture carries a keyboard caveat, and it says which keyboards")
     func caveats() throws {
-        #expect(RefineChord.commandOptionSlash.rowCaveat == nil)
-        #expect(RefineChord.optionCommandR.rowCaveat == nil)
-        #expect(RefineChord.controlOptionR.rowCaveat == nil)
+        // The default's row tag is not a caveat but its alias, which is the other thing a row can
+        // usefully say in a glance. Asserted in `FnSlashTests.pickerSaysBothChords`.
+        #expect(RefineChord.fnSlash.rowCaveat(dictationKey: .rightOption) != nil)
+        #expect(RefineChord.commandOptionSlash.rowCaveat(dictationKey: .rightOption) == nil)
+        #expect(RefineChord.optionCommandR.rowCaveat(dictationKey: .rightOption) == nil)
+        #expect(RefineChord.controlOptionR.rowCaveat(dictationKey: .rightOption) == nil)
 
-        let caveat = try #require(RefineChord.fnThenDictationKey.rowCaveat)
+        let caveat = try #require(RefineChord.fnThenDictationKey.rowCaveat(dictationKey: .rightOption))
         #expect(caveat.localizedCaseInsensitiveContains("Apple"))
         #expect(caveat.localizedCaseInsensitiveContains("keyboard"))
 
@@ -288,9 +301,11 @@ struct CommandOptionSlashTests {
     /// list of alternatives to something else.
     @Test("the picker offers the default first and the Apple-only gesture last")
     func order() {
-        #expect(RefineChord.allCases.first == .commandOptionSlash)
+        #expect(RefineChord.allCases.first == .fnSlash)
+        #expect(RefineChord.allCases.first == RefineChord.default)
+        #expect(RefineChord.allCases.dropFirst().first == .commandOptionSlash)
         #expect(RefineChord.allCases.last == .fnThenDictationKey)
-        #expect(RefineChord.allCases.count == 4)
+        #expect(RefineChord.allCases.count == 5)
     }
 
     // MARK: - Proof sheets
