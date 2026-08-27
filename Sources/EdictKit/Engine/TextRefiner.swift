@@ -358,11 +358,28 @@ public actor TextRefiner {
                 includeSchemaInPrompt: true,
                 options: options
             )
-            return response.content.points
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n")
+            // Prefix each point with a marker. Joining with a bare newline produced three plain
+            // lines, which a user reasonably reported as "bullets doesn't make bullet points" — the
+            // model had done its job and the display had not. `- ` rather than `\u{2022} ` so the
+            // COPY key yields a Markdown list that pastes as a list into an editor, a note, or a
+            // message, which is where these actually go.
+            return Self.bulletList(from: response.content.points)
         }
+    }
+
+    /// Join generated points into a Markdown list.
+    ///
+    /// Joining with a bare newline produced three unmarked lines, which a user reasonably reported as
+    /// "bullets doesn't make bullet points" — the model had done its job and the display had not.
+    /// `- ` rather than a bullet glyph so the COPY key yields a list that pastes as a list into an
+    /// editor, a note, or a message, which is where these go.
+    static func bulletList(from points: [String]) -> String {
+        points
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .map { $0.hasPrefix("- ") ? String($0.dropFirst(2)).trimmingCharacters(in: .whitespaces) : $0 }
+            .filter { !$0.isEmpty }
+            .map { "- \($0)" }
+            .joined(separator: "\n")
     }
 
     // MARK: - Typography

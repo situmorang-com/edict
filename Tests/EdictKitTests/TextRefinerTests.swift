@@ -324,11 +324,17 @@ struct TextRefinerModelTests {
         #expect(lines.count >= 2, "the fixture makes more than one point")
         for line in lines {
             #expect(!line.trimmingCharacters(in: .whitespaces).isEmpty, "no empty bullets")
-            // This is what `Generable` buys us: nothing to mis-parse, so no leading markers.
-            #expect(!line.hasPrefix("-"))
-            #expect(!line.hasPrefix("*"))
-            #expect(!line.hasPrefix("•"))
-            #expect(!line.hasPrefix("1."))
+            // Exactly ONE marker per line, supplied by us. This assertion used to demand *no*
+            // marker, on the reasoning that `Generable` leaves nothing to mis-parse — true of
+            // parsing, but it meant the pane rendered three unmarked lines, which a user reported
+            // as "bullets doesn't make bullet points". `Generable` means we own the marker, not
+            // that there should not be one.
+            #expect(line.hasPrefix("- "), "every line is a Markdown bullet")
+            let body = line.dropFirst(2)
+            #expect(!body.hasPrefix("-"), "no doubled marker")
+            #expect(!body.hasPrefix("*"))
+            #expect(!body.hasPrefix("\u{2022}"))
+            #expect(!body.hasPrefix("1."), "no verbal or numeric enumeration left in the text")
         }
         let lower = result.text.lowercased()
         for invention in RefinerFixtures.englishInventions {
@@ -506,5 +512,36 @@ enum SystemLanguageModelUnavailableReasonProbe: CaseIterable, Sendable, CustomSt
         case .modelNotReady: .modelNotReady
         case .deviceNotEligible: .deviceNotEligible
         }
+    }
+}
+
+// MARK: - Bullet markers
+
+/// Regression: the model produced the right three points and the display showed three unmarked
+/// lines, which reads as the feature not working. Reported against real Indonesian dictation:
+/// "Johan ini daftar yang harus kamu tanya sama guru itu nomor satu berapa biayanya…"
+@Suite("Bullet formatting")
+struct BulletFormattingTests {
+
+    @Test("Points are joined as a Markdown list, so COPY pastes as a list")
+    func pointsBecomeAMarkdownList() {
+        let joined = TextRefiner.bulletList(from: ["berapa biayanya", "berapa lama kelasnya", "apa aja syarat syaratnya"])
+        #expect(joined == "- berapa biayanya\n- berapa lama kelasnya\n- apa aja syarat syaratnya")
+    }
+
+    @Test("A marker the model added itself is not doubled")
+    func modelSuppliedMarkersAreNotDoubled() {
+        #expect(TextRefiner.bulletList(from: ["- already marked"]) == "- already marked")
+    }
+
+    @Test("Blank and whitespace-only points are dropped, not emitted as empty bullets")
+    func blankPointsAreDropped() {
+        #expect(TextRefiner.bulletList(from: ["one", "   ", "", "two"]) == "- one\n- two")
+    }
+
+    @Test("An empty set of points yields an empty string rather than a lone dash")
+    func noPointsYieldsNothing() {
+        #expect(TextRefiner.bulletList(from: []).isEmpty)
+        #expect(TextRefiner.bulletList(from: ["  "]).isEmpty)
     }
 }
