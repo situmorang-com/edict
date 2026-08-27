@@ -89,6 +89,12 @@ struct EdictMenuBarContent: View {
                 }
             }
             SilkscreenLabel("Hold \(model.settings.hotkey.glyph) \(model.settings.hotkey.displayName)")
+            // Text, not a button. Clicking anything in here activates Edict, and the refine gesture
+            // exists precisely because activating Edict loses the selection it is about to replace —
+            // so the only honest thing the menu bar can do for this feature is name the chord.
+            if let chord = model.settings.effectiveRefineChord {
+                SilkscreenLabel("\(chord.glyph(dictationKey: model.settings.hotkey)) refines a selection")
+            }
         }
     }
 

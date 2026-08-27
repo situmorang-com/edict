@@ -139,6 +139,17 @@ public final class Settings {
         /// key the user holds down expecting the text to be there when they let go. A user who
         /// wants that trade can have it; a user who never opens Settings must not be given it.
         public static let refineBeforeInsert = false
+        /// **On.** Everything else that costs the user something is off by default; this is the
+        /// feature they asked for by name, and a gesture nobody is told about is a gesture nobody
+        /// uses. The chord is printed in Settings for the same reason.
+        ///
+        /// It costs nothing when unused: no timer, no extra tap, no work at launch beyond one
+        /// pre-warm that the dictation path was doing anyway. The key-suppressing tap exists only
+        /// while the popup is on screen.
+        public static let refineSelectionEnabled = true
+        /// The user's own gesture. See `RefineChord` for the measurement that made it safe to
+        /// default to `fn` after RECON §8 ruled `fn` out as a *hotkey*.
+        public static let refineSelectionChord = RefineChord.fnThenDictationKey
         public static let historyLimit = 5000
     }
 
@@ -274,6 +285,33 @@ public final class Settings {
         didSet { write(refineBeforeInsert, .refineBeforeInsert) }
     }
 
+    /// Whether the chord opens the refine popup over a selection in another app.
+    ///
+    /// Read on every gesture rather than at start-up, so turning it off takes effect on the next
+    /// press without a restart — and so an off switch cannot leave a chord armed.
+    public var refineSelectionEnabled: Bool {
+        didSet { write(refineSelectionEnabled, .refineSelectionEnabled) }
+    }
+
+    /// Which chord opens it. `HotkeyMonitor` watches this the same way it watches ``hotkey``, so
+    /// writing it *is* the rebind; there is no Apply key.
+    public var refineSelectionChord: RefineChord {
+        didSet { write(refineSelectionChord.rawValue, .refineSelectionChord) }
+    }
+
+    /// The chord actually in force, or `nil` when the feature is off or the stored chord cannot be
+    /// expressed with the current dictation key.
+    ///
+    /// The refusal case is not defensive: `fn` cannot qualify `fn`. Resolving it here — rather than
+    /// in the monitor or in the view — means the picker, the status line and the event tap all get
+    /// the same answer, and a user who changes the dictation key to Globe silently keeps a working
+    /// popup instead of an armed chord that can never fire.
+    public var effectiveRefineChord: RefineChord? {
+        guard refineSelectionEnabled else { return nil }
+        guard refineSelectionChord.refusal(dictationKey: hotkey) == nil else { return nil }
+        return refineSelectionChord
+    }
+
     public var historyLimit: Int {
         didSet {
             let clamped = Self.historyLimitRange.clamped(to: historyLimit)
@@ -321,6 +359,10 @@ public final class Settings {
         importUsesGeneralModel = bool(.importUsesGeneralModel, Default.importUsesGeneralModel)
         importDualPass = bool(.importDualPass, Default.importDualPass)
         refineBeforeInsert = bool(.refineBeforeInsert, Default.refineBeforeInsert)
+        refineSelectionEnabled = bool(.refineSelectionEnabled, Default.refineSelectionEnabled)
+        refineSelectionChord = RefineChord(
+            rawValue: string(.refineSelectionChord, Default.refineSelectionChord.rawValue)
+        ) ?? Default.refineSelectionChord
         historyLimit = Self.historyLimitRange.clamped(to: int(.historyLimit, Default.historyLimit))
     }
 
@@ -342,6 +384,8 @@ public final class Settings {
         importUsesGeneralModel = Default.importUsesGeneralModel
         importDualPass = Default.importDualPass
         refineBeforeInsert = Default.refineBeforeInsert
+        refineSelectionEnabled = Default.refineSelectionEnabled
+        refineSelectionChord = Default.refineSelectionChord
         historyLimit = Default.historyLimit
         Log.data.info("Settings reset to defaults")
     }
@@ -417,6 +461,7 @@ public final class Settings {
         case biasingEnabled, biasingLimit, correctionsEnabled, termCaseNormalisation
         case prewarmMicrophone, importUsesGeneralModel, importDualPass, historyLimit
         case refineBeforeInsert
+        case refineSelectionEnabled, refineSelectionChord
 
         var storageKey: String { "edict.\(rawValue)" }
     }

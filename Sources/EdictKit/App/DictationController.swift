@@ -52,6 +52,19 @@ public final class DictationController {
     /// sessions. Only touched when `Settings.refineBeforeInsert` is on.
     private let refiner: TextRefiner
 
+    /// Reads and replaces a selection in *another* app, for the refine popup.
+    ///
+    /// Built on this controller's own `injector`, not a second one. `SelectionBridge` reads and writes
+    /// `TextInjector`'s learned per-bundle policy map, so a separate injector would mean an app
+    /// demoted to paste-only by a refinement stayed AX-first for dictation and vice versa — two
+    /// halves of one machine learning different things about the same app.
+    private let selectionBridge: SelectionBridge
+
+    /// The refine-popup gesture, end to end. Lives here because it needs three things this class
+    /// already owns: the hotkey monitor (for the chord *and* for the tap that swallows the popup's
+    /// digits), the shared refiner, and the injector behind `selectionBridge`.
+    private let refineGesture: RefineGestureController
+
     /// Handed to the views so `LevelMeter` can poll `levelSnapshot` synchronously at 60 Hz without
     /// an actor hop. That property is `nonisolated` and `Mutex`-backed precisely for this.
     public var levelSource: any LevelSource { capture }
@@ -70,6 +83,8 @@ public final class DictationController {
     private var utterance: Utterance?
     private var hotkeyEventsTask: Task<Void, Never>?
     private var hotkeyDiagnosticsTask: Task<Void, Never>?
+    private var hotkeyGesturesTask: Task<Void, Never>?
+    private var hotkeyCapturedKeysTask: Task<Void, Never>?
     private var permissionsTask: Task<Void, Never>?
     private var prewarmTask: Task<Void, Never>?
 
@@ -83,6 +98,10 @@ public final class DictationController {
 
     private var appliedHotkey: HotkeyChoice?
     private var appliedAlternateModifier: HotkeyModifier?
+    /// The refine chord currently bound into the tap, or `nil` when the feature is off. Tracked
+    /// separately from the setting for the same reason as `appliedAlternateModifier`: a change to it
+    /// is a rebind even when the dictation key has not moved.
+    private var appliedRefineChord: RefineChord?
     private var appliedLocale: String?
     /// The secondary identifier the engine currently holds a reservation for, or `nil` when the
     /// shortcut is off or its locale could not be prepared.
@@ -126,7 +145,17 @@ public final class DictationController {
         self.history = history
         self.permissions = permissions
         self.refiner = refiner
-        self.hotkey = HotkeyMonitor()
+        let hotkey = HotkeyMonitor()
+        self.hotkey = hotkey
+        let bridge = SelectionBridge(injector: injector)
+        self.selectionBridge = bridge
+        self.refineGesture = RefineGestureController(
+            popup: RefinePopupController(),
+            selection: bridge,
+            refiner: refiner,
+            capture: hotkey,
+            settings: settings
+        )
     }
 
     func attach(model: AppModel) {
@@ -185,6 +214,10 @@ public final class DictationController {
         // and do one throwaway system-wide AX read. Without this the *first* dictation of a session
         // pays the whole window-server + TCC bootstrap while the user watches.
         await injector.prewarm()
+        // Same reasoning as the injector's: the bridge's first `CGEventSource` costs 44–50 ms and the
+        // main-actor keyboard-layout scan has to happen off the popup's hot path (RECON §26, §36).
+        // Cheap and idempotent — and skipped entirely at no cost if the popup is never used.
+        await selectionBridge.prewarm()
         permissions.prewarm()
 
         // RECON §3: pays the cold model load once, so every later utterance costs ~2.5 ms of setup.
@@ -278,6 +311,8 @@ public final class DictationController {
         prewarmTask?.cancel()
         hotkeyEventsTask?.cancel()
         hotkeyDiagnosticsTask?.cancel()
+        hotkeyGesturesTask?.cancel()
+        hotkeyCapturedKeysTask?.cancel()
         permissionsTask?.cancel()
         hotkey.stop()
         dictionary.stopWatchingFile()
@@ -298,14 +333,17 @@ public final class DictationController {
     private func startHotkey() {
         let key = settings.hotkey
         let alternate = alternateModifier
+        let refine = settings.effectiveRefineChord
         do {
-            try hotkey.start(key: key, alternate: alternate)
+            try hotkey.start(key: key, alternate: alternate, refine: refine)
             appliedHotkey = key
             appliedAlternateModifier = alternate
+            appliedRefineChord = refine
             model?.apply(hotkeyLive: true)
             Log.hotkey.info("monitor live on \(key.rawValue, privacy: .public)")
         } catch {
             appliedHotkey = nil
+            appliedRefineChord = nil
             model?.apply(hotkeyLive: false)
             Log.hotkey.error("monitor failed to start: \(Self.describe(error), privacy: .public)")
         }
@@ -330,6 +368,28 @@ public final class DictationController {
     private func startHotkeyConsumersIfNeeded() {
         guard hotkeyEventsTask == nil, hotkeyDiagnosticsTask == nil else { return }
 
+        // Both of these are stored `AsyncStream`s with the same one-consumer rule as `events`
+        // (RECON amendment 32), so they are iterated exactly once here and never re-iterated on a
+        // restart. The captured-key loop in particular must outlive any number of tap generations:
+        // it is the only path a keystroke has to a panel that cannot become key.
+        let gestures = hotkey.gestures
+        hotkeyGesturesTask = Task { [weak self] in
+            for await gesture in gestures {
+                guard let self else { return }
+                switch gesture {
+                case .refinePopup: self.refineGesture.gestureFired()
+                }
+            }
+        }
+
+        let capturedKeys = hotkey.capturedKeys
+        hotkeyCapturedKeysTask = Task { [weak self] in
+            for await key in capturedKeys {
+                guard let self else { return }
+                self.refineGesture.handleCapturedKey(keyCode: key.keyCode, rawFlags: key.rawFlags)
+            }
+        }
+
         let events = hotkey.events
         hotkeyEventsTask = Task { [weak self] in
             for await event in events {
@@ -345,6 +405,14 @@ public final class DictationController {
                 self.handle(diagnostic)
             }
         }
+    }
+
+    /// Open the refine popup over the current selection without the chord.
+    ///
+    /// The menu-bar path, and the only path an automated verification run has: the chord itself has
+    /// to be pressed, and posting it as a synthetic event exercises the tap rather than this.
+    public func refineSelection() {
+        refineGesture.gestureFired()
     }
 
     /// RECON §11 is categorical: a tap created while access was denied is *permanently* dead and
@@ -426,6 +494,8 @@ public final class DictationController {
             _ = settings.secondaryLocaleEnabled
             _ = settings.secondaryLocaleIdentifier
             _ = settings.secondaryLocaleModifier
+            _ = settings.refineSelectionEnabled
+            _ = settings.refineSelectionChord
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -438,16 +508,24 @@ public final class DictationController {
     private func settingsChanged() {
         // The modifier is part of the binding, so a change to it is a rebind even when the key is the
         // same — without this, turning the shortcut on would leave Shift still cancelling the hold.
-        if settings.hotkey != appliedHotkey || alternateModifier != appliedAlternateModifier {
+        // The refine chord is part of the binding too, and `effectiveRefineChord` can change without
+        // either setting moving — switching the dictation key to Globe refuses a `fn`-qualified
+        // chord — so it is compared as a resolved value rather than as a raw preference.
+        let refine = settings.effectiveRefineChord
+        if settings.hotkey != appliedHotkey
+            || alternateModifier != appliedAlternateModifier
+            || refine != appliedRefineChord {
             let key = settings.hotkey
             let alternate = alternateModifier
             appliedHotkey = key
             appliedAlternateModifier = alternate
+            appliedRefineChord = refine
             if hotkey.isRunning {
-                hotkey.update(key: key, alternate: alternate)
+                hotkey.update(key: key, alternate: alternate, refine: refine)
                 Log.hotkey.info("""
                     rebound to \(key.rawValue, privacy: .public) \
-                    + \(alternate?.rawValue ?? "none", privacy: .public)
+                    + \(alternate?.rawValue ?? "none", privacy: .public) \
+                    refine=\(refine?.rawValue ?? "off", privacy: .public)
                     """)
             } else {
                 startHotkey()

@@ -889,3 +889,43 @@ default suite stays fast and offline-deterministic.
 access, Swift has no official Anthropic SDK (so it would be hand-rolled HTTP), and — decisively — it
 would send dictated text off the machine for a marginal gain on this task. The local model is good
 enough here; revisit only if long or subtle text proves otherwise.
+
+---
+
+## Accessibility support for *selection*, measured per app
+
+The first real per-app table on this project, taken with Accessibility and PostEvent actually granted —
+every earlier probe was blocked on exactly this.
+
+| App | AX read | AX replace | Fallback |
+|---|---|---|---|
+| TextEdit | yes, 43 units | **verified** | ⌘C, 35 ms |
+| Notes | yes, 59 units | **verified** | not reached |
+| Safari `<textarea>` | yes, 43 units | **success, then ignored** | paste landed |
+| Google Chrome | yes, 43 units | seeded paste-only | paste landed |
+| Ghostty | yes, whole viewport | `settable == false` | ⌘C, 35 ms |
+| Cursor (Electron) | **no focused element** | — | ⌘C found nothing |
+
+**Safari settles the open question from the injection probe.** It reports `settable == true`, accepts the
+write with `kAXErrorSuccess`, and changes nothing. Read-back caught it and the per-app demotion fired.
+That is the silent-success failure the whole verified ladder exists for, finally observed.
+
+Two rows changed the code. **Terminals do answer the read** — Ghostty returns the selected viewport, and
+an honest `kAXErrorNoValue` when nothing is selected — so a terminal is not a dead end for reading.
+And **an Electron app can have no focused element at all**, so nil focus must fall through to the
+fallback rather than throw.
+
+**A false negative worth knowing about:** in Ghostty the paste verifier reported `clipboardOnly` while the
+text had in fact landed, because a terminal's `AXValue` is the whole scrollback and the fingerprint check
+cannot see a local change in it. So the app would claim "left on your clipboard" after it had already
+pasted. Terminals may deserve treating as unverifiable-by-design rather than as a provable failure.
+
+**The `fn` + Right Option chord is observable**, contrary to the risk flagged earlier. Posted through a
+listen-only session tap: 4/4 delivered, and nothing ahead of Edict consumed them — including Siri and
+SiriNCService, which hold *consuming* `.defaultTap` taps on `flagsChanged` at the same tap point. No timer
+is needed for the ordering rule, because the qualifier rides on the dictation key's own event:
+`keyCode 61, raw 0x20880040` with the `fn` bit set. This machine's Karabiner profile claims only `fn+esc`
+and `fn+N`, and with one input source installed the Globe key's default action has nothing to switch to.
+
+> Caveat recorded honestly: every chord measurement came from **synthesized** events. An agent cannot
+> press a physical key, so the user's own press is the real confirmation.

@@ -18,6 +18,32 @@ public enum HotkeyEvent: Sendable, Hashable {
     case released
 }
 
+/// A gesture that is *not* dictation, reported on its own stream.
+///
+/// Deliberately separate from ``HotkeyEvent``. That type is a two-case press/release contract with a
+/// hard invariant (exactly one `.released` per `.pressed`), and a third case would have made every
+/// consumer's exhaustive switch answer a question about a gesture that has no release at all.
+public enum HotkeyGesture: Sendable, Hashable {
+    /// The refine-selection chord fired. Dictation deliberately did **not** arm; there is no
+    /// matching release event and none is owed.
+    case refinePopup
+}
+
+/// One keystroke the monitor captured on behalf of a non-activating panel.
+///
+/// The panel that shows the refine popup can never become key (it would steal focus and lose the
+/// selection it is about to replace), so its keystrokes have to come from a tap. See
+/// ``HotkeyMonitor/beginKeyCapture(shouldCapture:)``.
+public struct HotkeyCapturedKey: Sendable, Hashable {
+    public var keyCode: Int64
+    public var rawFlags: UInt64
+
+    public init(keyCode: Int64, rawFlags: UInt64) {
+        self.keyCode = keyCode
+        self.rawFlags = rawFlags
+    }
+}
+
 public enum HotkeyError: Error, Sendable {
     case tapCreationFailed
     case permissionDenied
@@ -164,6 +190,97 @@ struct HotkeyBinding: Sendable, Hashable {
     }
 }
 
+// MARK: - RefineChordBinding
+
+/// A ``RefineChord`` resolved into the exact bit tests the event tap needs.
+///
+/// Two families, because they are recognised in two different places:
+///
+/// * **Qualified** (`fn` then the dictation key). Recognised in the `.flagsChanged` branch at the
+///   moment the dictation key goes *down*, from the qualifier bit carried on that very event. This
+///   is the whole ordering rule: the bit is either already set when the key goes down, or it is not.
+/// * **Discrete** (`⌥⌘R`, `⌃⌥R`). Recognised in the `.keyDown` branch, from a keycode plus a
+///   required-and-forbidden pair of flag masks.
+///
+/// Everything is a bit test. RECON amendment 31 measured Right Option arriving as `0x00080140`
+/// rather than the expected `0x00080040` because a keyboard remapper stamps `nonCoalesced` (`0x100`)
+/// on every event it synthesizes, and this file's own probe measured `0x20000000` on every
+/// posted one — so any comparison against a literal raw word silently never fires.
+struct RefineChordBinding: Sendable, Hashable {
+
+    /// Virtual keycodes this file needs beyond ``HotkeyBinding/KeyCode``.
+    private enum KeyCode {
+        static let r: Int64 = 15   // kVK_ANSI_R
+    }
+
+    /// Flag bits meaning "the qualifier is held", or `nil` for the discrete family.
+    let qualifierMask: UInt64?
+    /// Keycodes belonging to the qualifier. Exempt from chord cancellation, which is the second half
+    /// of the ordering rule: a qualifier pressed *during* a hold must not cancel the recording.
+    let qualifierKeyCodes: Set<Int64>
+
+    /// The plain key of a discrete chord, or `nil` for the qualified family.
+    let discreteKeyCode: Int64?
+    /// Every bit in here must be SET for a discrete chord to match.
+    let requiredFlags: UInt64
+    /// Any bit in here being set disqualifies the match.
+    let forbiddenFlags: UInt64
+
+    let displayName: String
+
+    /// `nil` when the chord cannot be expressed with this dictation key — `fn` cannot qualify `fn`.
+    /// `Settings.effectiveRefineChord` refuses the same combination in the UI, so this is the second
+    /// of two independent guards rather than the only one.
+    init?(_ chord: RefineChord, dictationKey: HotkeyChoice) {
+        displayName = chord.displayName(dictationKey: dictationKey)
+
+        switch chord {
+        case .fnThenDictationKey:
+            guard dictationKey != .fn else { return nil }
+            qualifierMask = UInt64(CGEventFlags.maskSecondaryFn.rawValue)
+            qualifierKeyCodes = [HotkeyBinding.KeyCode.fn]
+            discreteKeyCode = nil
+            requiredFlags = 0
+            forbiddenFlags = 0
+
+        case .optionCommandR, .controlOptionR:
+            qualifierMask = nil
+            qualifierKeyCodes = []
+            discreteKeyCode = KeyCode.r
+            let required: UInt64 = chord == .optionCommandR
+                ? UInt64(CGEventFlags.maskAlternate.rawValue) | UInt64(CGEventFlags.maskCommand.rawValue)
+                : UInt64(CGEventFlags.maskControl.rawValue) | UInt64(CGEventFlags.maskAlternate.rawValue)
+            let excluded: UInt64 = chord == .optionCommandR
+                ? UInt64(CGEventFlags.maskControl.rawValue) | UInt64(CGEventFlags.maskShift.rawValue)
+                : UInt64(CGEventFlags.maskCommand.rawValue) | UInt64(CGEventFlags.maskShift.rawValue)
+            requiredFlags = required
+            // Plus the dictation key's own *device* bit. Without this, a user whose dictation key is
+            // Right Option and who reaches for ⌥⌘R with that key would fire the chord out of a hold
+            // that has already armed — a popup and a half-second recording from one gesture. Only the
+            // device bit is excluded, never the side-agnostic `maskAlternate`, because ⌥⌘R needs
+            // `maskAlternate` set to be ⌥⌘R at all.
+            forbiddenFlags = excluded | Self.deviceBit(of: dictationKey)
+        }
+    }
+
+    /// The side-specific bit the dictation key sets while held, or the `fn` bit for Globe. Zero for a
+    /// non-modifier key, which cannot contaminate a chord.
+    private static func deviceBit(of key: HotkeyChoice) -> UInt64 {
+        switch key {
+        case .rightOption: HotkeyBinding.DevBits.ralt
+        case .rightCommand: HotkeyBinding.DevBits.rcmd
+        case .rightControl: HotkeyBinding.DevBits.rctrl
+        case .fn: UInt64(CGEventFlags.maskSecondaryFn.rawValue)
+        case .f13: 0
+        }
+    }
+
+    func matchesDiscrete(keyCode: Int64, rawFlags: UInt64) -> Bool {
+        guard let discreteKeyCode, keyCode == discreteKeyCode else { return false }
+        return rawFlags & requiredFlags == requiredFlags && rawFlags & forbiddenFlags == 0
+    }
+}
+
 // MARK: - HotkeyModifier bits
 
 extension HotkeyModifier {
@@ -250,10 +367,45 @@ public final class HotkeyMonitor: Sendable {
         }
     }
 
+    /// The suppressing tap, alive only while a non-activating panel is waiting for a keystroke.
+    ///
+    /// A second port rather than a second thread: it lives on the *same* run loop as the hotkey tap,
+    /// so teardown happens on the thread that created it (CFMachPort teardown is not thread-agnostic
+    /// in practice) and the two cannot race each other.
+    private final class CaptureResources: @unchecked Sendable {
+        let runLoop: CFRunLoop
+        let port: CFMachPort
+        let source: CFRunLoopSource?
+
+        init(runLoop: CFRunLoop, port: CFMachPort, source: CFRunLoopSource?) {
+            self.runLoop = runLoop
+            self.port = port
+            self.source = source
+        }
+    }
+
+    private enum CaptureRequest: Sendable {
+        case none, install, remove
+    }
+
     private final class TapState: @unchecked Sendable {
         private let lock = NSLock()
 
         var binding: HotkeyBinding?
+        /// The refine chord in force, or `nil` when the feature is off.
+        var refine: RefineChordBinding?
+        /// Whether the refine qualifier was held as of the most recent `.flagsChanged`.
+        ///
+        /// A second, independent source for the ordering rule, alongside the bit carried on the
+        /// dictation key's own down event. Both come from the tap; neither comes from
+        /// `CGEventSource.flagsState`, which `SelectionBridge` measured reporting `maskCommand` set
+        /// for seconds at a stretch with no key physically down — a latched reading here would open
+        /// the popup instead of starting a recording.
+        ///
+        /// Self-correcting, and that is what makes a second source safe rather than a second way to
+        /// be wrong: every `.flagsChanged` carries the *complete* modifier state, so this is rewritten
+        /// from scratch on every modifier event of any kind rather than accumulated.
+        var qualifierHeld = false
         var thread: Thread?
         /// The run loop of the *current* thread, kept separately so `stop()` can wake it even before the
         /// tap is installed or after installation failed.
@@ -280,6 +432,27 @@ public final class HotkeyMonitor: Sendable {
         var reportedPermissionLost = false
         var reEnableCount = 0
 
+        // MARK: Key capture
+
+        var capture: CaptureResources?
+        /// Whether captured keys are swallowed as well as reported. False while the popup is showing
+        /// something that cannot act on them, so a stray digit reaches the app underneath instead of
+        /// vanishing — which is `RefinePopupSession.handle`'s rule, enforced here at the tap.
+        var suppressing = false
+        /// Keycodes whose `.keyDown` was swallowed, so the matching `.keyUp` is swallowed too even if
+        /// suppression was switched off in between. An unmatched key-up is the kind of thing that
+        /// leaves a text field thinking a key is still down.
+        var suppressedKeys: Set<Int64> = []
+        /// Set by the caller; asked of every keystroke while the capture tap is installed. Pure and
+        /// allocation-free by contract — it runs inside a `.defaultTap` callback, which is on the
+        /// critical path of every keystroke on the system.
+        var shouldCapture: (@Sendable (Int64, UInt64) -> Bool)?
+        /// What the tap thread should do with the capture tap next. Requests rather than direct calls
+        /// because the port has to be created and invalidated on the thread that owns the run loop.
+        var captureRequest: CaptureRequest = .none
+        /// Set by the tap thread once an install request has been serviced; `nil` while pending.
+        var captureOutcome: Bool?
+
         func withLock<R>(_ body: (TapState) -> R) -> R {
             lock.lock()
             defer { lock.unlock() }
@@ -293,6 +466,10 @@ public final class HotkeyMonitor: Sendable {
     private let eventContinuation: AsyncStream<HotkeyEvent>.Continuation
     private let diagnosticStream: AsyncStream<HotkeyDiagnostic>
     private let diagnosticContinuation: AsyncStream<HotkeyDiagnostic>.Continuation
+    private let gestureStream: AsyncStream<HotkeyGesture>
+    private let gestureContinuation: AsyncStream<HotkeyGesture>.Continuation
+    private let capturedKeyStream: AsyncStream<HotkeyCapturedKey>
+    private let capturedKeyContinuation: AsyncStream<HotkeyCapturedKey>.Continuation
 
     /// Minimum hold before a `.pressed` is emitted (RECON §13, ~120 ms). Below this, the gesture is
     /// treated as an ordinary modifier tap and produces no recording at all.
@@ -310,6 +487,13 @@ public final class HotkeyMonitor: Sendable {
         // Diagnostics are advisory and may have no consumer at all, so they must not grow without bound.
         (diagnosticStream, diagnosticContinuation) =
             AsyncStream<HotkeyDiagnostic>.makeStream(bufferingPolicy: .bufferingNewest(16))
+        // `.bufferingNewest` is right here where it is wrong for `events`: a gesture has no matching
+        // release to lose, and a chord the consumer was too busy to service two seconds ago should
+        // not open a popup over whatever the user has selected *now*.
+        (gestureStream, gestureContinuation) =
+            AsyncStream<HotkeyGesture>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        (capturedKeyStream, capturedKeyContinuation) =
+            AsyncStream<HotkeyCapturedKey>.makeStream(bufferingPolicy: .bufferingNewest(8))
     }
 
     /// Best-effort only. The tap thread's block captures `self` **strongly** on purpose: the tap holds
@@ -318,9 +502,16 @@ public final class HotkeyMonitor: Sendable {
     /// itself alive, so `stop()` is not optional — a caller that simply drops the last reference leaks
     /// the thread and one Mach port. `AppModel`/`DictationController` must call `stop()` on teardown.
     deinit {
-        stop()
+        // `tearingDownCapture: false` on purpose. The capture path's `wake` closure captures `self`,
+        // and forming any reference to an object already inside `deinit` is a crash waiting for a
+        // release build. Nothing is leaked by skipping it: the tap thread's exit path calls
+        // `removeCaptureTap()` unconditionally, and by the time `deinit` can run the thread is
+        // already gone — a running monitor keeps itself alive through the tap's strong capture.
+        stop(tearingDownCapture: false)
         eventContinuation.finish()
         diagnosticContinuation.finish()
+        gestureContinuation.finish()
+        capturedKeyContinuation.finish()
     }
 
     // MARK: Public API
@@ -328,6 +519,15 @@ public final class HotkeyMonitor: Sendable {
     public var events: AsyncStream<HotkeyEvent> { eventStream }
 
     public var diagnostics: AsyncStream<HotkeyDiagnostic> { diagnosticStream }
+
+    /// Gestures that are not dictation. Same one-consumer rule as ``events`` (RECON amendment 32):
+    /// this is a stored stream, so iterate it exactly once and never cancel that consumer on a
+    /// restart.
+    public var gestures: AsyncStream<HotkeyGesture> { gestureStream }
+
+    /// Keystrokes captured for a non-activating panel, while ``beginKeyCapture(shouldCapture:)`` is
+    /// in force. Same one-consumer rule.
+    public var capturedKeys: AsyncStream<HotkeyCapturedKey> { capturedKeyStream }
 
     /// True only when the tap exists *and* the window server still has it enabled. RECON §11: a
     /// `.listenOnly` tap created without Input Monitoring is non-nil but permanently dead, so the
@@ -347,8 +547,14 @@ public final class HotkeyMonitor: Sendable {
     /// - Parameter alternate: the modifier that may be held alongside the hotkey without cancelling
     ///   the hold, whose state is reported on `.pressed(alternate:)`. `nil` restores the strict
     ///   "held alone" rule for every modifier.
-    public func start(key: HotkeyChoice, alternate: HotkeyModifier? = nil) throws {
+    /// - Parameter refine: the chord that opens the refine popup, or `nil` when that feature is off.
+    public func start(
+        key: HotkeyChoice,
+        alternate: HotkeyModifier? = nil,
+        refine: RefineChord? = nil
+    ) throws {
         let binding = HotkeyBinding(key, alternate: alternate)
+        let refineBinding = refine.flatMap { RefineChordBinding($0, dictationKey: key) }
 
         // Gate BEFORE creating. This is the whole point of RECON §11: `.listenOnly` `tapCreate` hands
         // back a non-nil CFMachPort even when access is denied, and five `tapEnable` retries over a
@@ -360,6 +566,8 @@ public final class HotkeyMonitor: Sendable {
 
         let alreadyRunning: Bool = state.withLock { s in
             s.binding = binding
+            s.refine = refineBinding
+            s.qualifierHeld = false
             if s.thread == nil {
                 // A fresh generation gets a fresh watchdog: without this reset, a monitor that died once
                 // and was correctly re-created after the grant arrived would never report a second death.
@@ -399,7 +607,13 @@ public final class HotkeyMonitor: Sendable {
                 // `CFRunLoopRun()` would return instantly on a source-less run loop and busy-spin.
                 CFRunLoopRunInMode(.defaultMode, 0.25, false)
                 runWatchdog()
+                // Belt and braces behind `CFRunLoopPerformBlock`: a request that somehow missed the
+                // wake-up is serviced on the next slice rather than never.
+                serviceCaptureRequest()
             }
+            // Unconditional, and before the hotkey tap goes: a suppressing tap left installed after
+            // its owning thread exited would swallow the user's digits for ever.
+            removeCaptureTap()
             teardown(owned)
         }
         thread.name = "com.edict.hotkey"
@@ -422,30 +636,48 @@ public final class HotkeyMonitor: Sendable {
             hotkey monitor live on \(binding.displayName, privacy: .public) \
             (keyCode \(binding.keyCode)) \
             alternate=\(alternate?.rawValue ?? "none", privacy: .public) \
-            mask=0x\(String(binding.alternateMask, radix: 16), privacy: .public)
+            mask=0x\(String(binding.alternateMask, radix: 16), privacy: .public) \
+            refine=\(refineBinding?.displayName ?? "off", privacy: .public)
             """)
     }
 
     /// Rebinding while running needs no new tap: the mask is identical for every choice, and the
     /// callback reads the binding fresh on every event.
-    public func update(key: HotkeyChoice, alternate: HotkeyModifier? = nil) {
+    public func update(
+        key: HotkeyChoice,
+        alternate: HotkeyModifier? = nil,
+        refine: RefineChord? = nil
+    ) {
         let binding = HotkeyBinding(key, alternate: alternate)
+        let refineBinding = refine.flatMap { RefineChordBinding($0, dictationKey: key) }
         let wasHolding: Bool = state.withLock { s in
             let changed = s.binding?.keyCode != binding.keyCode
             s.binding = binding
+            s.refine = refineBinding
+            // The tracker is keyed to a mask that may just have changed, and a `true` carried across
+            // a rebind would answer the ordering rule for the wrong modifier.
+            s.qualifierHeld = false
             return changed && s.holdStart != nil
         }
         if wasHolding { abortHold(reason: .keyChanged) }
         Log.hotkey.info("""
             hotkey rebound to \(binding.displayName, privacy: .public) \
             alternate=\(alternate?.rawValue ?? "none", privacy: .public) \
-            mask=0x\(String(binding.alternateMask, radix: 16), privacy: .public)
+            mask=0x\(String(binding.alternateMask, radix: 16), privacy: .public) \
+            refine=\(refineBinding?.displayName ?? "off", privacy: .public)
             """)
     }
 
     public func stop() {
+        stop(tearingDownCapture: true)
+    }
+
+    private func stop(tearingDownCapture: Bool) {
         // Aborting first guarantees a `.released` reaches the consumer before the tap goes away.
         if state.withLock({ $0.holdStart != nil }) { abortHold(reason: .tapDisabled) }
+        // A suppressing tap that outlived its thread would keep swallowing the user's digits with
+        // nothing left to deliver them to.
+        if tearingDownCapture { endKeyCapture() }
 
         let (thread, runLoop) = state.withLock { s -> (Thread?, CFRunLoop?) in
             let t = s.thread
@@ -561,6 +793,237 @@ public final class HotkeyMonitor: Sendable {
         CFMachPortInvalidate(resources.port)
     }
 
+    // MARK: Key capture — for a panel that cannot become key
+
+    /// Start swallowing and reporting the keystrokes `shouldCapture` claims.
+    ///
+    /// ## Why this needs a second, *consuming* tap, when RECON §13 says never suppress
+    ///
+    /// §13's rule is about the hotkey: Right Option is AltGr on many layouts, and eating it would
+    /// break dead keys and accented characters system-wide. The popup's digits are a different
+    /// problem with a different answer. The panel is deliberately non-activating, so `1` goes to the
+    /// app the user is looking at — **and that app has text selected**. Typing `1` there replaces the
+    /// selection with `1`, and the refined text then lands beside a stray digit in a document whose
+    /// original words are gone. Listening is not enough; the keystroke has to be stopped.
+    ///
+    /// Measured on this machine before building on it: a `.defaultTap` at `.cgSessionEventTap`
+    /// returning `nil` for keycode 18 was created, enabled with the full requested mask, and a
+    /// downstream listen-only tap at `.cgAnnotatedSessionEventTap` then saw `down kc=19, up kc=19`
+    /// and **nothing** for keycode 18. Suppression works and is selective.
+    ///
+    /// The blast radius is bounded three ways: the tap exists only while a panel is up (at most the
+    /// popup's 8 s choice deadline), it asks `shouldCapture` before touching anything, and everything
+    /// else is returned unmodified.
+    ///
+    /// Note the nil-check *is* a complete permission gate here, unlike RECON §11's listen-only case:
+    /// the requested mask is keyDown|keyUp only, so a window server that strips keyboard events is
+    /// left with an empty mask, and `CGEvent.h` returns NULL for an empty mask.
+    ///
+    /// - Returns: whether keystrokes are now being swallowed. `false` means the caller must not offer
+    ///   a keyboard choice — its digits would reach the user's document.
+    @discardableResult
+    public func beginKeyCapture(
+        shouldCapture: @escaping @Sendable (Int64, UInt64) -> Bool
+    ) async -> Bool {
+        enum Decision { case already, request(CFRunLoop), unavailable }
+        let decision: Decision = state.withLock { s in
+            s.shouldCapture = shouldCapture
+            s.suppressing = true
+            s.suppressedKeys.removeAll()
+            if s.capture != nil { return .already }
+            guard s.thread != nil, let runLoop = s.runLoop else { return .unavailable }
+            s.captureRequest = .install
+            s.captureOutcome = nil
+            return .request(runLoop)
+        }
+
+        switch decision {
+        case .already:
+            return true
+        case .unavailable:
+            Log.hotkey.error("key capture requested with no live tap thread")
+            return false
+        case .request(let runLoop):
+            wake(runLoop)
+            // Polled rather than awaiting a continuation the tap thread resumes: a continuation that
+            // is never resumed — because the thread was cancelled in the same instant — is a hang,
+            // and a hang here is a frozen menu bar. 2 ms steps, 100 ms ceiling; the install measures
+            // well under a millisecond.
+            for _ in 0..<50 {
+                if let outcome = state.withLock({ $0.captureOutcome }) { return outcome }
+                try? await Task.sleep(for: .milliseconds(2))
+            }
+            Log.hotkey.error("key capture install did not complete within 100 ms")
+            return false
+        }
+    }
+
+    /// Keep reporting captured keys but stop swallowing them.
+    ///
+    /// Called when the popup leaves the state that can act on a digit. `RefinePopupSession.handle`
+    /// already refuses a digit in the working state so it "reaches the app underneath instead of
+    /// vanishing" — this is that promise kept at the tap, where it is actually decided.
+    public func setKeyCaptureSuppressing(_ suppressing: Bool) {
+        state.withLock { $0.suppressing = suppressing }
+    }
+
+    /// Remove the capture tap. Idempotent, and safe to call when none was ever installed.
+    public func endKeyCapture() {
+        let runLoop: CFRunLoop? = state.withLock { s in
+            s.shouldCapture = nil
+            s.suppressing = false
+            s.suppressedKeys.removeAll()
+            guard s.capture != nil else {
+                s.captureRequest = .none
+                return nil
+            }
+            s.captureRequest = .remove
+            return s.runLoop
+        }
+        guard let runLoop else { return }
+        wake(runLoop)
+    }
+
+    /// Ask the tap thread to service a pending request now rather than on its next 0.25 s slice.
+    private func wake(_ runLoop: CFRunLoop) {
+        // A strong capture, and safe: the block is one-shot and the run loop drops it after running,
+        // so there is no cycle — and `deinit` deliberately never reaches this (see `deinit`). A
+        // `[weak self]` here would be the bug instead of the fix, because the object it would have to
+        // reference weakly is the one being deallocated.
+        CFRunLoopPerformBlock(runLoop, CFRunLoopMode.commonModes.rawValue) { [self] in
+            serviceCaptureRequest()
+        }
+        CFRunLoopWakeUp(runLoop)
+    }
+
+    /// Tap thread only. The one place the capture port is created or invalidated.
+    private func serviceCaptureRequest() {
+        let request: CaptureRequest = state.withLock { s in
+            guard s.thread === Thread.current else { return .none }
+            let request = s.captureRequest
+            s.captureRequest = .none
+            return request
+        }
+        switch request {
+        case .none: break
+        case .install: installCaptureTap()
+        case .remove: removeCaptureTap()
+        }
+    }
+
+    /// Keyboard only, and only the two types the panel needs. Mixing in anything else would let the
+    /// window server keep the mask non-empty while stripping the keys (RECON §11).
+    private static let captureMask: CGEventMask =
+        (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
+
+    private func installCaptureTap() {
+        guard let runLoop = state.withLock({ s in s.capture == nil ? s.runLoop : nil }) else {
+            state.withLock { $0.captureOutcome = true }
+            return
+        }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        guard let port = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: Self.captureMask,
+            callback: { _, type, event, refcon in
+                guard let refcon else { return Unmanaged.passUnretained(event) }
+                return Unmanaged<HotkeyMonitor>.fromOpaque(refcon)
+                    .takeUnretainedValue()
+                    .handleCapture(type: type, event: event)
+            },
+            userInfo: context
+        ) else {
+            // A `.defaultTap` returns nil rather than a dead port, so this is the whole gate.
+            Log.hotkey.error("could not create the key-capture tap; Accessibility is not granted")
+            state.withLock { $0.captureOutcome = false }
+            return
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, port, 0)
+        CFRunLoopAddSource(runLoop, source, .commonModes)
+        CGEvent.tapEnable(tap: port, enable: true)
+        guard CGEvent.tapIsEnabled(tap: port) else {
+            Log.hotkey.error("key-capture tap created but disabled")
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            CFMachPortInvalidate(port)
+            state.withLock { $0.captureOutcome = false }
+            return
+        }
+        state.withLock { s in
+            s.capture = CaptureResources(runLoop: runLoop, port: port, source: source)
+            s.captureOutcome = true
+        }
+        Log.hotkey.info("key capture installed")
+    }
+
+    /// Same teardown order as the hotkey tap, for the same measured reason (RECON §12): dropping the
+    /// Swift reference leaks one Mach port per tap because the run loop source holds the port.
+    private func removeCaptureTap() {
+        let capture: CaptureResources? = state.withLock { s in
+            let capture = s.capture
+            s.capture = nil
+            s.suppressing = false
+            s.suppressedKeys.removeAll()
+            s.shouldCapture = nil
+            return capture
+        }
+        guard let capture else { return }
+        if let source = capture.source {
+            CFRunLoopRemoveSource(capture.runLoop, source, .commonModes)
+        }
+        CGEvent.tapEnable(tap: capture.port, enable: false)
+        CFMachPortInvalidate(capture.port)
+        Log.hotkey.info("key capture removed")
+    }
+
+    /// The capture tap's callback. Returning `nil` swallows the event.
+    private func handleCapture(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        switch type {
+        case .tapDisabledByTimeout, .tapDisabledByUserInput:
+            // Re-enable, exactly as for the hotkey tap — but *also* tell the panel to go away by
+            // reporting Escape. While this tap was down the user's digits were reaching their
+            // document, and a popup that can no longer protect the selection has no business
+            // offering to replace it.
+            let port: CFMachPort? = state.withLock { $0.capture?.port }
+            if let port { CGEvent.tapEnable(tap: port, enable: true) }
+            Log.hotkey.error("key-capture tap disabled; re-enabled and dismissing the panel")
+            capturedKeyContinuation.yield(HotkeyCapturedKey(keyCode: 53, rawFlags: 0))   // kVK_Escape
+            return nil
+
+        case .keyDown, .keyUp:
+            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            let rawFlags = event.flags.rawValue
+
+            if type == .keyUp {
+                // A key whose down was swallowed must have its up swallowed too, even if suppression
+                // was switched off in between: an unmatched key-up leaves a text field believing a
+                // key is still held.
+                let swallow: Bool = state.withLock { s in s.suppressedKeys.remove(keyCode) != nil }
+                return swallow ? nil : Unmanaged.passUnretained(event)
+            }
+
+            let claim: (capture: Bool, suppress: Bool) = state.withLock { s in
+                guard let shouldCapture = s.shouldCapture, shouldCapture(keyCode, rawFlags) else {
+                    return (false, false)
+                }
+                if s.suppressing { s.suppressedKeys.insert(keyCode) }
+                return (true, s.suppressing)
+            }
+            guard claim.capture else { return Unmanaged.passUnretained(event) }
+            // Autorepeat is swallowed but not re-reported: the panel acted on the first press, and a
+            // held key would otherwise deliver the same choice thirty times a second.
+            if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                capturedKeyContinuation.yield(HotkeyCapturedKey(keyCode: keyCode, rawFlags: rawFlags))
+            }
+            return claim.suppress ? nil : Unmanaged.passUnretained(event)
+
+        default:
+            return Unmanaged.passUnretained(event)
+        }
+    }
+
     /// Belt and braces: the OS can kill a tap without ever delivering `.tapDisabledBy*`, so poll.
     private func runWatchdog() {
         let port: CFMachPort? = state.withLock { s in
@@ -592,6 +1055,10 @@ public final class HotkeyMonitor: Sendable {
             let reason = type == .tapDisabledByTimeout ? "timeout" : "userInput"
             let port: CFMachPort? = state.withLock { s in
                 s.reEnableCount += 1
+                // While the tap was down we may have missed the qualifier's *release*, which is the
+                // one way the tracker can latch. Clearing it costs a gesture the user would have to
+                // repeat; leaving it costs a recording that silently became a popup.
+                s.qualifierHeld = false
                 return s.resources?.port
             }
             if let port { CGEvent.tapEnable(tap: port, enable: true) }
@@ -604,15 +1071,28 @@ public final class HotkeyMonitor: Sendable {
 
         case .keyDown:
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+            let rawFlags = event.flags.rawValue
             let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
             // A `.keyDown` carries the full modifier state too, and for a non-modifier hotkey (F13)
             // this event *is* the start of the hold — so without recording it here the arm sampler
             // would be looking at whatever modifier last toggled instead.
-            let binding: HotkeyBinding? = state.withLock { s in
-                s.lastObservedFlags = event.flags.rawValue
-                return s.binding
+            let down: (binding: HotkeyBinding?, refine: RefineChordBinding?) = state.withLock { s in
+                s.lastObservedFlags = rawFlags
+                // Clearing only, never setting. A `.keyDown` reporting the qualifier bit CLEAR is
+                // proof it is not held, because RECON §9's incidental `maskSecondaryFn` can only
+                // ever add the bit (every arrow and fn-row keyDown carries it) — it can never
+                // remove one. So this direction is a free corrector and the other would be a lie.
+                if let mask = s.refine?.qualifierMask, rawFlags & mask == 0 { s.qualifierHeld = false }
+                return (s.binding, s.refine)
             }
-            if let binding, !binding.isModifier, keyCode == binding.keyCode {
+            // The discrete chord is recognised before the cancellation rule below, which would
+            // otherwise see nothing but "a real key arrived during a hold".
+            if let refine = down.refine, !isRepeat,
+               refine.matchesDiscrete(keyCode: keyCode, rawFlags: rawFlags) {
+                Log.hotkey.info("refine chord \(refine.displayName, privacy: .public) fired")
+                gestureContinuation.yield(.refinePopup)
+            }
+            if let binding = down.binding, !binding.isModifier, keyCode == binding.keyCode {
                 if !isRepeat { beginHold() }
             } else {
                 // A real key during the hold means the user is typing a shortcut, not dictating.
@@ -621,7 +1101,11 @@ public final class HotkeyMonitor: Sendable {
 
         case .keyUp:
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-            let binding = state.withLock { $0.binding }
+            let rawFlags = event.flags.rawValue
+            let binding = state.withLock { s -> HotkeyBinding? in
+                if let mask = s.refine?.qualifierMask, rawFlags & mask == 0 { s.qualifierHeld = false }
+                return s.binding
+            }
             if let binding, !binding.isModifier, keyCode == binding.keyCode { endHold() }
 
         case .flagsChanged:
@@ -629,11 +1113,18 @@ public final class HotkeyMonitor: Sendable {
             let rawFlags = event.flags.rawValue
             // Recorded for every modifier, including the ones that go on to cancel the hold: the arm
             // sampler needs the state of a modifier that is not the hotkey.
-            let binding: HotkeyBinding? = state.withLock { s in
-                s.lastObservedFlags = rawFlags
-                return s.binding
-            }
-            guard let binding else { break }
+            let toggle: (binding: HotkeyBinding?, refine: RefineChordBinding?, qualifierWasHeld: Bool) =
+                state.withLock { s in
+                    let wasHeld = s.qualifierHeld
+                    s.lastObservedFlags = rawFlags
+                    // Rewritten from this event rather than accumulated: every `.flagsChanged`
+                    // carries the complete modifier state, so a release we somehow never saw is
+                    // corrected by the next modifier event of any kind instead of latching "held".
+                    // Only `.flagsChanged` may SET it — see the `.keyDown` branch for why.
+                    if let mask = s.refine?.qualifierMask { s.qualifierHeld = rawFlags & mask != 0 }
+                    return (s.binding, s.refine, wasHeld)
+                }
+            guard let binding = toggle.binding else { break }
             guard binding.isModifier, keyCode == binding.keyCode else {
                 // The designated language modifier is the ONE exemption from chord cancellation, and
                 // it is deliberately narrow. Every other modifier still cancels (that is what stops a
@@ -641,12 +1132,37 @@ public final class HotkeyMonitor: Sendable {
                 // regardless of which modifier is held — see the `.keyDown` branch, which is
                 // untouched. Widening this to "ignore all modifiers" would make ⌘⇧4 start dictating.
                 if binding.alternateKeyCodes.contains(keyCode) { break }
+                // The refine qualifier is the second exemption, and it *is* the other half of the
+                // ordering rule: "if a hold has already armed, do not retroactively cancel the
+                // recording — finish it". Without this, reaching for 🌐 a moment too late would
+                // abort a dictation the user is already speaking into.
+                if let refine = toggle.refine, refine.qualifierKeyCodes.contains(keyCode) { break }
                 // A *different* modifier toggled — Shift for a capital letter, Cmd for a shortcut.
                 cancelHoldIfAny(.chordedWithModifier(keyCode))
                 break
             }
             // RECON §9: raw `UInt64` flags, never `.deviceIndependentFlagsMask`.
-            binding.isHeld(rawFlags: rawFlags) ? beginHold() : endHold()
+            guard binding.isHeld(rawFlags: rawFlags) else {
+                // A release. `endHold` is a no-op when no hold was ever begun, which is exactly what
+                // makes the suppression below safe: the popup gesture leaves nothing to release.
+                endHold()
+                break
+            }
+            // THE ORDERING RULE. Two independent sources, OR-ed, both from the tap: the qualifier bit
+            // carried on this very event (measured present — `kc=61 raw=0x20880040` with 🌐 held), and
+            // the state left by the previous `.flagsChanged`. Either is enough. `flagsState` is
+            // deliberately not a third source; see `TapState.qualifierHeld`.
+            if let refine = toggle.refine, let mask = refine.qualifierMask,
+               rawFlags & mask != 0 || toggle.qualifierWasHeld {
+                Log.hotkey.info("""
+                    refine chord \(refine.displayName, privacy: .public) fired \
+                    (flags=0x\(String(rawFlags, radix: 16), privacy: .public), \
+                    tracked=\(toggle.qualifierWasHeld, privacy: .public)); dictation not armed
+                    """)
+                gestureContinuation.yield(.refinePopup)
+                break
+            }
+            beginHold()
 
         default:
             break

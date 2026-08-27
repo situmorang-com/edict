@@ -92,6 +92,7 @@ public struct SettingsWindow: View {
                 SecondLanguageSection(model: model, locales: locales)
                 BehaviourSection(model: model)
                 RefineSection(model: model)
+                RefineSelectionSection(settings: model.settings)
                 ImportSection(settings: model.settings)
                 DictionarySection(settings: model.settings, dictionary: model.dictionary)
                 LimitsSection(settings: model.settings, history: model.history)
@@ -863,6 +864,93 @@ private struct RefineSection: View {
     }
 }
 
+// MARK: - Refine a selection
+
+/// The chord that opens the refine popup over text selected in *another* app.
+///
+/// This section exists as much for discoverability as for configuration. The gesture has no other
+/// surface — the popup is summoned from inside somebody else's window, and the menu-bar item cannot
+/// offer it, because clicking the menu bar activates Edict and loses the selection the popup is about
+/// to replace. So the chord is printed here, in the same keys it is pressed in.
+///
+/// Live-updating like the dictation key: `DictationController` watches both settings and re-binds the
+/// tap, so writing them *is* the change. There is no Apply key.
+private struct RefineSelectionSection: View {
+
+    let settings: Settings
+
+    var body: some View {
+        PanelSurface("Refine a selection") {
+            VStack(alignment: .leading, spacing: D.space.md) {
+                RockerSwitch(
+                    "Refine selected text",
+                    isOn: Binding(
+                        get: { settings.refineSelectionEnabled },
+                        set: { settings.refineSelectionEnabled = $0 }
+                    ),
+                    caption: "Select text in any app, press the chord below, and pick CLEAN UP, "
+                           + "BULLETS or SUMMARY. The selection is replaced in place."
+                )
+
+                VStack(alignment: .leading, spacing: D.space.sm) {
+                    ForEach(RefineChord.allCases) { chord in
+                        key(chord)
+                    }
+                }
+                .disabled(!settings.refineSelectionEnabled)
+                .opacity(settings.refineSelectionEnabled ? 1 : D.opacity.disabled)
+
+                if let refusal = settings.refineSelectionChord.refusal(dictationKey: settings.hotkey) {
+                    Text(refusal)
+                        .typeStyle(D.type.explain)
+                        .foregroundStyle(D.color.alert)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Text(settings.refineSelectionChord.explanation)
+                    .typeStyle(D.type.explain)
+                    .foregroundStyle(D.color.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(caveat)
+                    .typeStyle(D.type.explain)
+                    .foregroundStyle(D.color.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func key(_ chord: RefineChord) -> some View {
+        let refused = chord.refusal(dictationKey: settings.hotkey) != nil
+        return TapeButton(
+            role: .neutral,
+            isLatched: chord == settings.refineSelectionChord,
+            minWidth: S.keyWidth,
+            action: { settings.refineSelectionChord = chord }
+        ) {
+            HStack(spacing: D.space.sm) {
+                Text(chord.displayName(dictationKey: settings.hotkey))
+                if chord == settings.refineSelectionChord {
+                    Text(refused ? "Unavailable" : "Live")
+                        .typeStyle(D.type.silkscreenTiny)
+                }
+            }
+        }
+        .disabled(refused)
+        .opacity(refused ? D.opacity.disabled : 1)
+        .accessibilityLabel(chord.displayName(dictationKey: settings.hotkey))
+        .accessibilityAddTraits(chord == settings.refineSelectionChord ? .isSelected : [])
+    }
+
+    /// The two things a user has to know before trusting this with their own document, both measured
+    /// rather than hedged.
+    private var caveat: String {
+        """
+        Edict reads the selection through Accessibility where the app allows it and with a copy         where it does not, and it restores your clipboard afterwards. If it cannot prove the         replacement landed, it leaves the refined text on your clipboard and says so rather than         writing twice. While the three keys are showing, Edict does swallow 1, 2, 3 and Esc —         otherwise pressing 1 would type a 1 over the selection it is about to replace. Nothing is         recorded in the log: this is text you already had.
+        """
+    }
+}
+
 // MARK: - Import
 
 /// The one real choice file transcription has: which of Apple's two models runs it.
@@ -1140,6 +1228,11 @@ public enum DualLocaleFixtures {
                 .padding(D.space.sm)
         }
 
+        func refineSelection(_ model: AppModel) -> some View {
+            RefineSelectionSection(settings: model.settings)
+                .padding(D.space.md)
+        }
+
         return [
             sheet("second-language", panel, section(ready())),
             sheet("second-language-collision", panel, section(collided())),
@@ -1152,8 +1245,14 @@ public enum DualLocaleFixtures {
             sheet("second-language-dual-on", CGSize(width: S.column, height: 1_120), section(dualPassOn())),
             sheet("hud-primary", hud, panelHUD(recording(secondary: false))),
             sheet("hud-secondary", hud, panelHUD(recording(secondary: true))),
-            sheet("settings-column", CGSize(width: S.column, height: 2_100),
+            // Taller than it was: the refine-selection panel was added below the refine panel, and a
+            // sheet cropped above the thing being proved proves nothing.
+            sheet("settings-column", CGSize(width: S.column, height: 2_560),
                   SettingsWindow(model: PreviewFixtures.model(), unbounded: true, locales: locales)),
+            sheet("refine-selection-fn", panel, refineSelection(PreviewFixtures.model())),
+            sheet("refine-selection-discrete", panel, refineSelection(discreteChord())),
+            sheet("refine-selection-refused", panel, refineSelection(globeIsTheDictationKey())),
+            sheet("refine-selection-off", panel, refineSelection(refineOff())),
         ]
     }
 
@@ -1170,6 +1269,28 @@ public enum DualLocaleFixtures {
     private static func dualPassOn() -> AppModel {
         let model = ready()
         model.settings.importDualPass = true
+        return model
+    }
+
+    /// A discrete chord chosen, so the explanation line under the keys is the other one.
+    private static func discreteChord() -> AppModel {
+        let model = ready()
+        model.settings.refineSelectionChord = .optionCommandR
+        return model
+    }
+
+    /// The one refusal this picker can produce: Globe cannot qualify Globe. The row goes dead and the
+    /// panel says why, rather than storing a chord that could never fire.
+    private static func globeIsTheDictationKey() -> AppModel {
+        let model = ready()
+        model.settings.hotkey = .fn
+        model.settings.refineSelectionChord = .fnThenDictationKey
+        return model
+    }
+
+    private static func refineOff() -> AppModel {
+        let model = ready()
+        model.settings.refineSelectionEnabled = false
         return model
     }
 

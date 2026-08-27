@@ -214,6 +214,24 @@
 >     disabling the feature. Keep instructions short; a fourth clause measurably diluted the others on
 >     this ~3B model.
 >
+> 42. **Amendment 13 ("`.listenOnly`, never suppress") has exactly one sanctioned exception.** While the
+>     selection popup is on screen, `HotkeyMonitor` installs a **second, consuming** tap on the same
+>     thread and run loop, alive only for that window, so that `1`/`2`/`3`/`Esc` choose an action
+>     instead of typing over the very selection about to be replaced. Without it, pressing `1` replaces
+>     the user's selected text with the character "1" — measured. At idle Edict must hold **exactly one
+>     tap, listen-only**; verify with `CGGetEventTapList` filtered on `getpid()` after any change here.
+>     Suppression anywhere else, and for any other reason, is still forbidden.
+>
+> 43. **`CGEventSource.flagsState` cannot be trusted to say whether a chord is still held.** Measured
+>     latched at `maskCommand` for over three seconds with no key down. The trustworthy signal is
+>     `HotkeyMonitor`'s own event tap. (Amendment 27 already forbids `.privateState`, which blocks
+>     forever; this is about `.combinedSessionState` being stale rather than hanging.)
+>
+> 44. **A replace is destructive where an insert is additive, so it must be stricter.** `SelectionBridge`
+>     refuses when the frontmost app changed under it, and an AX write it cannot verify **stops** the
+>     ladder at `clipboardOnly` rather than pasting over a write that may already have landed. Losing
+>     the user's selected text is a worse failure than not refining it.
+>
 > ### Amended API surface
 >
 > These supersede the signatures below where they conflict:
