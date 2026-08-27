@@ -545,3 +545,111 @@ struct BulletFormattingTests {
         #expect(TextRefiner.bulletList(from: ["  "]).isEmpty)
     }
 }
+
+
+// MARK: - Verbal enumeration
+
+/// Reported bug: an Indonesian dictation that enumerates three questions out loud came back as a
+/// single bullet containing the whole sentence. English "first / second / third" already split
+/// correctly, so this was a language-coverage gap in the instruction, not a general failure.
+///
+/// These call the real model, so they are gated like the other model tests.
+@Suite("Bullets split a spoken list", .enabled(if: ProcessInfo.processInfo.environment["EDICT_MODEL_TESTS"] == "1"))
+struct SpokenListTests {
+
+    private func points(_ text: String, locale: String = "en-US") async throws -> [String] {
+        let refiner = TextRefiner()
+        let r = try await refiner.refine(text, as: .bullets, localeIdentifier: locale)
+        return r.text
+            .split(separator: "\n")
+            .map { String($0.dropFirst(2)) }   // strip the "- " marker
+            .filter { !$0.isEmpty }
+    }
+
+    @Test("Indonesian verbal enumeration becomes one point per item")
+    func indonesianEnumeration() async throws {
+        let p = try await points(
+            "Johan ini daftar yang harus kamu tanya sama guru itu nomor satu berapa biayanya "
+            + "yang berapa lama kelasnya yang tiga apa aja syarat syaratnya",
+            locale: "id-ID")
+        // Three questions, plus the speaker's own framing line ("Johan, this is the list you must
+        // ask the teacher"), which is kept because rule 2 is "lose nothing" — it is content the
+        // speaker said, not a heading the model invented.
+        #expect(p.count >= 3, "the three enumerated questions must be separate; got \(p.count): \(p)")
+        #expect(p.count <= 4, "no more than the framing plus three questions; got \(p.count): \(p)")
+        let joined = p.joined(separator: " ").lowercased()
+        #expect(joined.contains("biaya"), "the cost question survived")
+        #expect(joined.contains("kelas"), "the duration question survived")
+        #expect(joined.contains("syarat"), "the requirements question survived")
+        // No leftover verbal numbering at the head of any point. The model left "yang" and "yang
+        // tiga" attached across four runs; the strip is deterministic for exactly that reason.
+        for point in p {
+            let lower = point.lowercased()
+            #expect(!lower.hasPrefix("nomor "), "leftover enumerator: \(point)")
+            #expect(!lower.hasPrefix("yang tiga "), "leftover enumerator: \(point)")
+        }
+    }
+
+    @Test("English verbal enumeration still splits")
+    func englishEnumeration() async throws {
+        let p = try await points(
+            "ok so three things first we need the budget signed off second marcus has to review "
+            + "the migration and third somebody should book the room")
+        #expect(p.count == 3, "got \(p.count): \(p)")
+    }
+
+    @Test("A genuinely single point is not split into several")
+    func singlePointStaysSingle() async throws {
+        let p = try await points("i think we should move the meeting to thursday")
+        #expect(p.count == 1, "got \(p.count): \(p)")
+    }
+
+    @Test("Two statements without enumeration still give two points")
+    func twoStatementsGiveTwo() async throws {
+        let p = try await points("the plan is we ship the beta on friday i will email the three reviewers")
+        #expect(p.count == 2, "got \(p.count): \(p)")
+    }
+}
+
+
+// MARK: - Enumerator stripping
+
+@Suite("Leading enumerators")
+struct EnumeratorStripTests {
+
+    @Test("Indonesian leftovers the model leaves attached are removed")
+    func indonesianLeftovers() {
+        #expect(TextRefiner.stripLeadingEnumerator("yang tiga apa aja syarat syaratnya") == "apa aja syarat syaratnya")
+        #expect(TextRefiner.stripLeadingEnumerator("yang berapa lama kelasnya") == "berapa lama kelasnya")
+        #expect(TextRefiner.stripLeadingEnumerator("nomor satu berapa biayanya") == "berapa biayanya")
+        #expect(TextRefiner.stripLeadingEnumerator("pertama kita perlu anggaran") == "kita perlu anggaran")
+    }
+
+    @Test("English leftovers are removed")
+    func englishLeftovers() {
+        #expect(TextRefiner.stripLeadingEnumerator("first we need the budget") == "we need the budget")
+        #expect(TextRefiner.stripLeadingEnumerator("and then somebody books the room") == "somebody books the room")
+        #expect(TextRefiner.stripLeadingEnumerator("number two review the migration") == "review the migration")
+    }
+
+    @Test("Longest match wins, so \"yang tiga\" is not left as \"tiga\"")
+    func longestMatchWins() {
+        #expect(TextRefiner.stripLeadingEnumerator("yang tiga apa aja syaratnya") == "apa aja syaratnya")
+    }
+
+    @Test("A point is never reduced to nothing or to a single word")
+    func neverStripsToNothing() {
+        // "dan" heads the list, so the guard has to hold here.
+        #expect(TextRefiner.stripLeadingEnumerator("dan") == "dan")
+        #expect(TextRefiner.stripLeadingEnumerator("yang penting") == "yang penting")
+        #expect(TextRefiner.stripLeadingEnumerator("first thing") == "first thing")
+        #expect(TextRefiner.stripLeadingEnumerator("") == "")
+    }
+
+    @Test("A word that merely starts with an enumerator is untouched")
+    func noPrefixCollisions() {
+        #expect(TextRefiner.stripLeadingEnumerator("firstly we should go home") == "firstly we should go home")
+        #expect(TextRefiner.stripLeadingEnumerator("andrew reviewed the migration") == "andrew reviewed the migration")
+        #expect(TextRefiner.stripLeadingEnumerator("yangon is the old capital") == "yangon is the old capital")
+    }
+}

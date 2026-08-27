@@ -377,9 +377,46 @@ public actor TextRefiner {
         points
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .map { $0.hasPrefix("- ") ? String($0.dropFirst(2)).trimmingCharacters(in: .whitespaces) : $0 }
+            .map(stripLeadingEnumerator)
             .filter { !$0.isEmpty }
             .map { "- \($0)" }
             .joined(separator: "\n")
+    }
+
+    /// Verbal numbering the speaker used to enumerate, left at the head of a point.
+    ///
+    /// Longest first, so "yang tiga" is tried before "yang". Measured on the reported Indonesian
+    /// dictation: the model reliably split the three questions but left "yang" and "yang tiga"
+    /// attached — stable across four runs. Asking the instruction to strip them worked only
+    /// sometimes, and instruction bloat measurably dilutes the other rules on this ~3B model, so the
+    /// strip is deterministic here instead.
+    private static let leadingEnumerators: [String] = [
+        // Indonesian
+        "nomor satu", "nomor dua", "nomor tiga", "nomor empat", "nomor lima",
+        "yang pertama", "yang kedua", "yang ketiga", "yang keempat",
+        "yang satu", "yang dua", "yang tiga", "yang empat", "yang lima",
+        "pertama", "kedua", "ketiga", "keempat", "kelima", "terakhir",
+        "lalu", "terus", "kemudian", "dan juga", "juga", "yang", "dan",
+        // English
+        "number one", "number two", "number three", "number four",
+        "first of all", "first", "second", "third", "fourth", "fifth", "lastly", "finally",
+        "and then", "then", "and also", "also", "next", "and",
+    ].sorted { $0.count > $1.count }
+
+    /// Strip one leading enumerator, and only when something substantial survives.
+    ///
+    /// The guard matters: "and" heads the list too, and a point that is genuinely *about* one word
+    /// must not be reduced to nothing. Requires at least two remaining words, so "dan" alone or
+    /// "yang" alone is left untouched rather than emptied.
+    static func stripLeadingEnumerator(_ point: String) -> String {
+        let lower = point.lowercased()
+        for token in leadingEnumerators where lower.hasPrefix(token + " ") {
+            let rest = String(point.dropFirst(token.count + 1)).trimmingCharacters(in: .whitespaces)
+            let words = rest.split(whereSeparator: \.isWhitespace)
+            guard words.count >= 2 else { return point }
+            return rest
+        }
+        return point
     }
 
     // MARK: - Typography
@@ -614,12 +651,29 @@ public actor TextRefiner {
                 what the speech meant.
                 """
         case .bullets:
+            // "Do not invent structure the speech does not have" was doing real harm. Measured: an
+            // Indonesian dictation enumerating three questions out loud — "nomor satu berapa
+            // biayanya yang berapa lama kelasnya yang tiga apa aja syarat syaratnya" — came back as
+            // ONE point containing the whole sentence, because a run-on sentence does not look like
+            // a list unless the model is told that the speaker's own verbal numbering IS structure.
+            // English "first / second / third" already worked; Indonesian did not, so this was a
+            // language-coverage gap in the wording rather than a general failure.
+            //
+            // The over-splitting risk is guarded by the last line and by fixtures: a genuinely
+            // single-point sentence still returns one point, and two statements still return two.
             specific = """
-                Task: reorganise the content into separate points, one per element. Each point \
-                states something the speaker actually said, in the speaker's own words where \
-                possible. Do not add a heading, an introductory point, or a closing summary point. \
-                Do not invent structure the speech does not have — if the speaker made two points, \
-                return two.
+                Task: split the speech into its separate points, one per element.
+
+                Speech is often one long run-on sentence that still contains a list. Look for the \
+                speaker enumerating out loud — "nomor satu", "yang dua", "yang tiga", "number one", \
+                "first", "second", "and then", "also" — and for a repeated question or clause \
+                shape. Each enumerated or repeated item is one point. Splitting a run-on sentence \
+                at the speaker's own enumeration is not inventing structure; it is recovering \
+                structure the punctuation lost.
+
+                Drop the verbal numbering itself from the point's text. Keep the speaker's own \
+                words otherwise. If the speech genuinely makes one point, return one. Do not add a \
+                heading, an introductory point, or a closing summary.
                 """
         case .summarise:
             specific = """
