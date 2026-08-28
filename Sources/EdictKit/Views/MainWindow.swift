@@ -107,11 +107,23 @@ public struct MainWindow: View {
         case .imports:
             ImportPane(
                 rows: model.importRows,
+                locales: model.importLocales,
+                dictationLocaleIdentifier: model.settings.localeIdentifier,
+                newFileLocaleIdentifier: model.importLocaleOverride,
+                dualPassLocaleIdentifier: model.importDualPassLocaleIdentifier,
                 onEnqueue: { model.enqueueImports($0) },
+                onSetNewFileLocale: { model.importLocaleOverride = $0 },
+                onSetRowLocale: { model.importQueue.setLocale($1, for: $0) },
+                onRerun: { model.importQueue.rerun($0, localeIdentifier: $1) },
                 onCancel: { model.importQueue.cancel($0) },
                 onRetry: { model.importQueue.retry($0) },
                 onClearFinished: { model.importQueue.clearFinished() }
             )
+            // Cheap, idempotent, and it takes no locale reservation — `AssetInventory` allows five
+            // concurrently and `release` matches on the raw identifier string (RECON §6), so a list
+            // read is the one locale operation that cannot leak a slot. Asked here rather than in
+            // the pane because the pane is pure: it takes rows and closures, never a store.
+            .task { await model.importQueue.loadSupportedLocales() }
         case .dictionary: DictionaryPane(model: model)
         case .permissions: PermissionsPane(model: model, unbounded: unbounded)
         }

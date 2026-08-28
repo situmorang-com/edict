@@ -929,3 +929,51 @@ and `fn+N`, and with one input source installed the Globe key's default action h
 
 > Caveat recorded honestly: every chord measurement came from **synthesized** events. An agent cannot
 > press a physical key, so the user's own press is the real confirmation.
+
+---
+
+## Two more `AssetInventory` traps, found while adding per-import languages
+
+**`assetInstallationRequest(supporting:)` takes a reservation as a side effect.** Merely *asking*
+whether a locale's model is installed consumes one of the five slots. Measured: asking about `en-GB`
+added `en_GB` to `reservedLocales`, and the sixth distinct locale in one process throws
+`SFSpeechErrorDomain Code=11 "Too many allocated locales, 5 maximum"`.
+
+> Consequence: an availability check is not free. Prune stale reservations before checking a new
+> locale, or importing in more than four or five distinct languages in one app run starts failing —
+> honestly, with "could not be checked", but failing.
+
+**Installed-state depends on `attributeOptions`.** The same locale reports differently depending on
+what you ask the module for: `fr-FR` on the general module reads **installed** with
+`attributeOptions: []` and **missing** with `[.transcriptionConfidence, .audioTimeRange]` — which is
+what this app always requests, because per-word confidence drives the quality verdict and the
+dictionary suggestions.
+
+> Consequence: only a module built with the *real* options can answer "is this installed". A cheap
+> probe with empty options will tell you yes and then the import fails.
+
+Measured on this machine: only `en-US` and `id-ID` have models for the modules Edict actually builds.
+`en-GB` and `en-AU` are installed for the general module; `es-ES`, `de-DE`, `ja-JP` and `fr-FR` all
+report missing and correctly fail an import with the download sentence.
+
+**A killed `swift test` leaves orphans that poison later runs.** `swiftpm-testing-helper` processes
+survive, holding `localspeechrecognition` XPC connections *and* locale reservations. Seven accumulated
+during one debugging session and made every subsequent run stall globally. Check for and kill them
+before concluding that a speech test is broken.
+
+## Wall-clock assertions are the flakiest thing in this suite
+
+Four timeout tests in `RefinePopupTests` and one in `RefinementSurfaceTests` passed 3/3 in isolation
+(0.42 s) and failed in the full 546-test run: they slept past a deadline and then asserted, which is a
+bet that the timer fires before the sleep ends. Parallel suites starve the run loop and the bet loses.
+
+> Poll for the outcome instead of sleeping past it. The deadline stays real; the assertion stops
+> caring about scheduling.
+
+And one assertion was measuring the wrong thing: `LateLocaleTests` bounded the locale decision at
+`window + 150 ms`, a 37.5% margin on a wall-clock wakeup, failing about one run in three at
+0.556–0.602 s against a 0.55 s ceiling. The property that matters is that the settle beats the
+**release** — that is what makes the HUD correct while speech is still in progress — so the ceiling is
+now the release. A timer that only settles at the end of the hold still fails it.
+
+After both fixes: **ten consecutive full-suite runs, all green.**

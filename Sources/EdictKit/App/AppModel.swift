@@ -560,9 +560,39 @@ public final class AppModel {
     /// to know — that the transcript goes to history and **not** to their cursor — is printed there.
     public func enqueueImports(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
-        let added = importQueue.enqueue(urls)
+        // `nil` means "inherit the dictation language, now, and freeze it onto each row" — see
+        // `ImportQueue.enqueue`. Passing the override through rather than mutating Settings keeps
+        // the two facts separate: the dictation language is what the hotkey uses, and this is what
+        // the next file uses.
+        let added = importQueue.enqueue(urls, localeIdentifier: importLocaleOverride)
         guard !added.isEmpty else { return }
         pane = .imports
+    }
+
+    /// The language files added from now on are transcribed in, or `nil` to follow the dictation
+    /// language.
+    ///
+    /// Deliberately **not** persisted to `Settings`. Two reasons, and the second is the real one.
+    /// The advertised default is "follow my dictation language, and show me", so the resting state
+    /// has to be the one that tracks Settings rather than a stale copy of it; and a language pinned
+    /// months ago in a pane the user has since forgotten is exactly the silent, invisible override
+    /// that transcribed a 70-minute Indonesian meeting with an English model. A per-launch override
+    /// cannot rot. Each row still carries its own frozen copy, so nothing already queued moves.
+    public var importLocaleOverride: String?
+
+    /// Every locale an import can run. Empty until `ImportQueue.loadSupportedLocales()` answers.
+    ///
+    /// Read from the queue rather than from `DictationTranscriber` directly, because the queue is
+    /// what normalises `id_ID` to `id-ID` and orders by display name — and the picker must offer
+    /// exactly the set the queue will accept.
+    var importLocales: [String] { importQueue.supportedLocaleIdentifiers }
+
+    /// The second language a dual-pass import will try, or `nil` when dual pass is off. Mirrors
+    /// `DictationController.importEnvironment`'s `dualPassPartnerLocaleIdentifier` so the pane
+    /// explains the same rule the queue actually applies.
+    var importDualPassLocaleIdentifier: String? {
+        guard settings.dualPassIsActive else { return nil }
+        return settings.effectiveSecondaryLocaleIdentifier
     }
 
     /// Open the file picker, then queue whatever was chosen.
@@ -583,7 +613,15 @@ public final class AppModel {
                 isVideo: item.info?.hasVideo ?? false,
                 state: rowState(for: item),
                 note: note(for: item),
-                warning: item.warning
+                warning: item.warning,
+                // Straight off the item. The queue froze this at enqueue and never re-reads
+                // `Settings.localeIdentifier`, which is the whole point of the field — so the row
+                // must not "helpfully" fall back to the current dictation language either.
+                localeIdentifier: item.localeIdentifier,
+                localeWasChosen: item.localeWasChosen,
+                localeIsEditable: item.localeIsEditable,
+                secondPassLocaleIdentifier: importQueue.secondPassLocaleIdentifier(for: item.id),
+                isRerun: item.rerunOf != nil
             )
         }
     }
@@ -688,10 +726,10 @@ public final class AppModel {
         Self.badge(activeLocaleIdentifier ?? settings.localeIdentifier)
     }
 
-    static func badge(_ identifier: String) -> String {
-        let language = identifier.split(whereSeparator: { $0 == "-" || $0 == "_" }).first ?? ""
-        return language.isEmpty ? identifier.uppercased() : language.uppercased()
-    }
+    /// One implementation, in `LanguageCode`, because the HUD, the import queue and the history log
+    /// all print this and a row that says `EN` in one pane and `en-US` in another reads as two
+    /// different facts about the same transcript.
+    static func badge(_ identifier: String) -> String { LanguageCode.badge(identifier) }
 
     func apply(committed: String, volatile: String) {
         guard committedText != committed || volatileText != volatile else { return }

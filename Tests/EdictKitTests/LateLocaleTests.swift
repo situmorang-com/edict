@@ -407,10 +407,18 @@ struct LanguageWindowClockTests {
         let outcome = await run(modifierAt: offset, releaseAt: 0.9)
         #expect(outcome.settled == expected,
                 "a modifier \(Int(offset * 1000)) ms after key-down should settle \(expected)")
-        // And the decision is not merely correct, it is *early*: never later than the window itself,
-        // so the HUD is settled while the user is still speaking.
-        #expect(outcome.at < Self.window + 0.15,
-                "the decision arrived \(Int(outcome.at * 1000)) ms after key-down")
+        // And the decision is not merely correct, it arrives while the user is still speaking rather
+        // than at the release.
+        //
+        // The bound was `window + 0.15` — a 37.5% margin on a wall-clock wakeup — and it failed about
+        // one full-suite run in three once parallel suites started competing for the run loop, at
+        // 0.556-0.602 s against a 0.55 s ceiling. The number being asserted is a scheduling delay, not
+        // a property of the code: what matters is that the settle beats the *release*, which is what
+        // makes the HUD correct while speech is still in progress. So the ceiling is now the release,
+        // with slack, and a genuinely broken timer — one that only settles when the hold ends — still
+        // fails it.
+        #expect(outcome.at < 0.9,
+                "the decision arrived \(Int(outcome.at * 1000)) ms after key-down, at or after the release")
     }
 
     /// A hold shorter than the window: the decision comes from the release, and it comes early.

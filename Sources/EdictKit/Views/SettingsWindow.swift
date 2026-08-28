@@ -13,8 +13,6 @@ private enum S {
     /// A key inside a sunken tray: the same width less the cap's 1pt seat on each side and room
     /// for an overlay scroller.
     static let trayKeyWidth = keyWidth - D.space.sm                         // 502
-    /// Seven rows of the locale tray. 54 locales cannot be a column of 54 keys.
-    static let localeTrayHeight = D.size.rowHeight * 7                      // 182
     /// The lit window holding a key chord. Wide enough for the longest chord Edict can produce
     /// (`⇧F13`) so the two chord rows line their language names up on one edge.
     static let chordWidth = D.size.buttonHeight * 1.6                       // 48
@@ -178,9 +176,10 @@ private struct SpeechModelSection: View {
             VStack(alignment: .leading, spacing: D.space.sm) {
                 stateRow
 
-                LocaleTray(
-                    locales: locales,
+                LanguageTray(
+                    identifiers: locales.map { $0.identifier(.bcp47) },
                     selected: model.settings.localeIdentifier,
+                    keyMinWidth: S.trayKeyWidth,
                     onPick: { model.settings.localeIdentifier = $0 }
                 )
 
@@ -238,73 +237,6 @@ private struct SpeechModelSection: View {
         }
     }
 
-}
-
-// MARK: - LocaleTray
-
-/// The 54-entry language tray, shared by the primary and the second-language sections.
-///
-/// One component rather than two, and not for brevity: the two trays must look and order the same,
-/// because the whole point of the second one is that the user recognises it as the *same kind of
-/// choice* they already made above. Two copies drift.
-private struct LocaleTray: View {
-
-    let locales: [Locale]
-    let selected: String
-    let onPick: (String) -> Void
-
-    var body: some View {
-        if locales.isEmpty {
-            Text("Reading the list of supported languages\u{2026}")
-                .typeStyle(D.type.explain)
-                .foregroundStyle(D.color.textSecondary)
-        } else {
-            RecessedWell(fill: .list, inset: 0) {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: D.space.xs) {
-                        ForEach(ordered, id: \.identifier) { locale in
-                            key(locale)
-                        }
-                    }
-                    .padding(D.space.xs)
-                }
-                // Definite, not maximum: a `ScrollView` handed an ideal proposal measures
-                // as zero and the tray vanishes.
-                .frame(height: S.localeTrayHeight)
-            }
-        }
-    }
-
-    /// Current first: with 54 entries the one that matters must not be somewhere down a scroll.
-    private var ordered: [Locale] {
-        let isCurrent = { (l: Locale) in
-            l.identifier(.bcp47).caseInsensitiveCompare(selected) == .orderedSame
-        }
-        return locales.filter(isCurrent) + locales.filter { !isCurrent($0) }
-    }
-
-    private func key(_ locale: Locale) -> some View {
-        let identifier = locale.identifier(.bcp47)
-        let isCurrent = identifier.caseInsensitiveCompare(selected) == .orderedSame
-        return TapeButton(
-            role: .neutral,
-            isLatched: isCurrent,
-            minWidth: S.trayKeyWidth,
-            action: { onPick(identifier) }
-        ) {
-            HStack(spacing: D.space.sm) {
-                // Named in the *user's* language, not its own: `العربية (المملكة…)` is unreadable
-                // to someone picking from an English UI, and the BCP-47 tag beside it is the
-                // unambiguous part. Using `Locale.current` for a display string is unrelated to
-                // RECON §7, which is about never deriving the *acoustic model* from it.
-                Text(Locale.current.localizedString(forIdentifier: identifier) ?? identifier)
-                Text(identifier)
-                    .typeStyle(D.type.silkscreenTiny)
-            }
-        }
-        .accessibilityLabel(Locale.current.localizedString(forIdentifier: identifier) ?? identifier)
-        .accessibilityAddTraits(isCurrent ? .isSelected : [])
-    }
 }
 
 // MARK: - Second language
@@ -491,9 +423,10 @@ private struct SecondLanguageSection: View {
             // control twice. This one names what the tray *does* to the key row above it.
             SilkscreenLabel("Switches to", weight: .tiny)
                 .silkscreenDecorative()
-            LocaleTray(
-                locales: locales,
+            LanguageTray(
+                identifiers: locales.map { $0.identifier(.bcp47) },
                 selected: settings.secondaryLocaleIdentifier,
+                keyMinWidth: S.trayKeyWidth,
                 onPick: { settings.secondaryLocaleIdentifier = $0 }
             )
         }

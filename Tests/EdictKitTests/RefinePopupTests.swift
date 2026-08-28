@@ -345,6 +345,27 @@ struct RefinePopupTests {
 
     // MARK: - Timeouts
 
+    /// Wait for a condition instead of sleeping past a deadline and asserting.
+    ///
+    /// These tests arm real millisecond deadlines, so a fixed sleep is a bet that the timer fires
+    /// before the sleep ends. That bet loses under load: all six timeout tests here passed 3/3 in
+    /// isolation (0.42 s) and failed in the full 546-test run, because parallel suites starve the
+    /// run loop and the assertion arrives before the `Task` does. Polling for the outcome keeps the
+    /// deadline real while making the test indifferent to scheduling.
+    @MainActor
+    private func eventually(
+        _ label: String,
+        within limit: Duration = .milliseconds(3000),
+        _ condition: () -> Bool
+    ) async {
+        let deadline = ContinuousClock.now + limit
+        while ContinuousClock.now < deadline {
+            if condition() { return }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        Issue.record("timed out waiting for \(label)")
+    }
+
     /// Real deadlines on millisecond durations. Slow tests are not worth it, and a test that only
     /// reads the constants back proves nothing about the `Task` that arms them.
     private static let brisk = RefinePopupTimeouts(
@@ -357,7 +378,7 @@ struct RefinePopupTests {
     func choiceTimesOut() async throws {
         let harness = Harness(timeouts: Self.brisk)
         harness.session.start()
-        try await Task.sleep(for: .milliseconds(250))
+        await eventually("the choice deadline to dismiss the panel") { harness.closes == 1 }
         #expect(harness.outcomes == [.dismissed(.timedOut)])
         #expect(harness.closes == 1)
         // And the tap must stop being fed by us afterwards.
@@ -369,7 +390,10 @@ struct RefinePopupTests {
         let harness = Harness(timeouts: Self.brisk)
         harness.session.start()
         harness.session.choose(.bullets)
-        try await Task.sleep(for: .milliseconds(250))
+        await eventually("the work watchdog to leave a sentence") {
+            if case .failed = harness.session.state { return true }
+            return false
+        }
         // One outcome, and the *work* watchdog — not the choice timeout — is what fired.
         #expect(harness.outcomes == [.chose(.bullets)])
         guard case .failed = harness.session.state else {
@@ -383,7 +407,7 @@ struct RefinePopupTests {
         let harness = Harness(timeouts: Self.brisk)
         harness.session.start()
         harness.session.choose(.summarise)
-        try await Task.sleep(for: .milliseconds(400))
+        await eventually("the work watchdog to close the panel") { harness.closes == 1 }
         #expect(harness.closes == 1)
     }
 
@@ -392,7 +416,7 @@ struct RefinePopupTests {
         let harness = Harness(timeouts: Self.brisk)
         harness.session.fail("Select some text first.")
         #expect(harness.closes == 0)
-        try await Task.sleep(for: .milliseconds(250))
+        await eventually("the failure dwell to close the panel") { harness.closes == 1 }
         #expect(harness.closes == 1)
     }
 

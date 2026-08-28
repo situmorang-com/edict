@@ -71,6 +71,10 @@ private enum M {
     static let colTime: CGFloat = 42
     static let colDuration: CGFloat = 44
     static let colWords: CGFloat = 40
+    /// The language column. Sized on a full hyphenated tag (`en-GB`) at `D.type.silkscreenTiny`,
+    /// not on a two-letter badge: the column has to hold the disambiguated form without shifting the
+    /// grid, because the one row that needs the long form is the row being checked.
+    static let colLocale: CGFloat = 38
     static let colFlag: CGFloat = 12
     static let colTextMin: CGFloat = 120
     /// The glyph inside a `.icon` cap. Small and semibold so it survives the engraving shadow.
@@ -89,9 +93,15 @@ private enum M {
     /// transition is motion, the dwell is behaviour.
     static let reportDwell: Duration = .milliseconds(1400)
     /// Column degradation thresholds, widest first.
+    ///
+    /// The language column is dropped *last* of the four optional ones (`rowLanguage` is the lowest
+    /// threshold). It is the newest column and the least decorative: RECON amendment 45 is about a
+    /// transcript that looked plausible and was produced by the wrong acoustic model, and the
+    /// language is the only column that answers it. A word count is interesting; this is evidence.
     static let rowWide: CGFloat = 620
     static let rowMedium: CGFloat = 480
     static let rowNarrow: CGFloat = 360
+    static let rowLanguage: CGFloat = 300
 
     // ---- Search field ---------------------------------------------------------------
 
@@ -1633,6 +1643,7 @@ public struct TranscriptRow: View {
     private let outcome: InjectionOutcome
     private let onRetry: (() -> Void)?
     private let isRetrying: Bool
+    private let localeIsAmbiguous: Bool
 
     @Environment(\.edictInkOnDark) private var inkOnDark
     @Environment(\.edictIncreasedContrast) private var increasedContrast
@@ -1650,12 +1661,18 @@ public struct TranscriptRow: View {
     ///   - onRetry: re-inject this text. Supplying it puts a retry key on the row, but only when the
     ///     outcome actually needs recovery: a key offering to fix a row that worked is noise.
     ///   - isRetrying: latches the retry key while its work is in flight.
+    ///   - localeIsAmbiguous: print the whole BCP-47 tag in the language column instead of the
+    ///     two-letter badge, because another row in this table badges the same. Only the *pane* can
+    ///     know that — a row sees one transcript — so it is passed in, exactly as `HUDWindow.tagCode`
+    ///     is handed both configured locales rather than guessing. Defaults to false, which is
+    ///     correct for a log whose transcripts are all one language.
     public init(
         _ transcript: Transcript,
         isSelected: Bool,
         onCopy: @escaping () -> Void,
         outcome: InjectionOutcome? = nil,
         isRetrying: Bool = false,
+        localeIsAmbiguous: Bool = false,
         onRetry: (() -> Void)? = nil
     ) {
         self.transcript = transcript
@@ -1663,6 +1680,7 @@ public struct TranscriptRow: View {
         self.onCopy = onCopy
         self.outcome = outcome ?? transcript.injection
         self.isRetrying = isRetrying
+        self.localeIsAmbiguous = localeIsAmbiguous
         self.onRetry = onRetry
     }
 
@@ -1683,6 +1701,10 @@ public struct TranscriptRow: View {
                 SegmentCounter(.count(transcript.wordCount, unit: "w"), scale: .tiny, seated: false, ink: secondaryInk)
                     .frame(width: M.colWords, alignment: .trailing)
                     .accessibilityHidden(true)
+            }
+            if showsLocale {
+                localeColumn
+                    .frame(width: M.colLocale, alignment: .leading)
             }
             flag
                 .frame(width: M.colFlag)
@@ -1910,6 +1932,48 @@ public struct TranscriptRow: View {
     private var showsWords: Bool { measuredWidth >= M.rowWide }
     private var showsDuration: Bool { measuredWidth >= M.rowMedium }
     private var showsTime: Bool { measuredWidth >= M.rowNarrow }
+    private var showsLocale: Bool { measuredWidth >= M.rowLanguage }
+
+    // MARK: Language column
+
+    /// Which acoustic model produced this text.
+    ///
+    /// Plain type in the secondary ink, in the same idiom as the clock and the word count — not a
+    /// `LanguageTag`, whose lit `.display` well is a glance-while-speaking instrument and would put a
+    /// dark chip on every one of a thousand rows. Here the language is a column of the log.
+    ///
+    /// It is on the row at all because files can now differ: while every transcript came from the
+    /// dictation language, the language was a property of the *app* and belonged in Settings. Now a
+    /// transcript's language is a property of the transcript, and a log that does not print it cannot
+    /// answer the only question worth asking about a plausible-looking wrong transcript.
+    private var localeColumn: some View {
+        Text(localeCode)
+            .typeStyle(D.type.silkscreenTiny)
+            .foregroundStyle(secondaryInk)
+            .lineLimit(1)
+            // Fixed rather than truncating: `en-G…` is worse than a tag that overhangs its nominal
+            // column by a point, and the column is sized for the long form anyway.
+            .fixedSize()
+            .help(localeHelp)
+            .accessibilityHidden(true)
+    }
+
+    /// A trailing `+` marks a transcript more than one language contributed text to — a dual pass.
+    /// `Transcript.localeIdentifier` is the *dominant* language there, not the whole truth, and a
+    /// column that printed it bare would make a mixed transcript claim to be monolingual.
+    private var localeCode: String {
+        let base = LanguageCode.code(transcript.localeIdentifier, ambiguous: localeIsAmbiguous)
+        return transcript.isMixedLanguage ? base + "+" : base
+    }
+
+    private var localeHelp: String {
+        let names = transcript.contributingLocales.map(LanguageCode.name)
+        guard transcript.isMixedLanguage, names.count > 1 else {
+            return "Transcribed in \(LanguageCode.name(transcript.localeIdentifier))"
+        }
+        return "Two languages produced text, most of it "
+            + names.joined(separator: ", then ")
+    }
 
     // MARK: Accessibility
 
@@ -1918,6 +1982,8 @@ public struct TranscriptRow: View {
         var parts = [RowClock.hhmm(transcript.createdAt)]
         parts.append(String(format: "%.1f seconds", max(0, transcript.audioDuration)))
         parts.append(transcript.wordCount == 1 ? "1 word" : "\(transcript.wordCount) words")
+        // Spoken as a name, never as the printed code: VoiceOver reads `EN` letter by letter.
+        parts.append(localeHelp)
         let phrase = Self.flagPhrase(flagKind, corrections: transcript.corrections.count)
         if !phrase.isEmpty { parts.append(phrase) }
         return parts.joined(separator: ", ")
@@ -2352,6 +2418,181 @@ public struct LanguageTag: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Language")
         .accessibilityValue(spoken)
+    }
+}
+
+// MARK: - LanguageCode
+
+/// How a BCP-47 identifier is printed in a fixed-width column, and when two letters are not enough.
+///
+/// One implementation, because the import queue, the history log and the HUD all have to agree: a
+/// row that says `EN` in one pane and `en-US` in another reads as two different facts about the same
+/// transcript. `AppModel.badge` and `HUDWindow.tagCode` both come through here.
+///
+/// The disambiguation is the load-bearing half. RECON amendment 45 is about the wrong *language*
+/// producing confident nonsense, and `EN` against `EN` for `en-US` against `en-GB` would be a column
+/// that indicates nothing while looking like it is working — which is the failure this whole surface
+/// exists to prevent, reproduced one level down.
+public enum LanguageCode {
+
+    /// The language subtag, uppercased: `id-ID` → `ID`. The fastest possible read.
+    public static func badge(_ identifier: String) -> String {
+        let language = identifier.split(whereSeparator: { $0 == "-" || $0 == "_" }).first ?? ""
+        return language.isEmpty ? identifier.uppercased() : language.uppercased()
+    }
+
+    /// The identifier as Edict prints it: hyphenated, never underscored.
+    ///
+    /// `DictationTranscriber.supportedLocales` reports `id_ID` while Settings and history store
+    /// `id-ID`; a readout that prints an underscore one day and a hyphen the next reads as a bug.
+    public static func hyphenated(_ identifier: String) -> String {
+        identifier.replacingOccurrences(of: "_", with: "-")
+    }
+
+    /// True when `identifier`'s badge collides with a *different* identifier's badge in `others`.
+    ///
+    /// Compared on the whole hyphenated tag, not on `Settings.localeKey`, because this is a question
+    /// about what is printed rather than about which asset is reserved.
+    public static func isAmbiguous(_ identifier: String, among others: some Sequence<String>) -> Bool {
+        let mine = hyphenated(identifier)
+        let myBadge = badge(mine)
+        for other in others {
+            let theirs = hyphenated(other)
+            guard theirs.caseInsensitiveCompare(mine) != .orderedSame else { continue }
+            if badge(theirs) == myBadge { return true }
+        }
+        return false
+    }
+
+    /// Two letters when they can only mean one thing here, the whole tag when they cannot.
+    public static func code(_ identifier: String, ambiguous: Bool) -> String {
+        ambiguous ? hyphenated(identifier) : badge(identifier)
+    }
+
+    /// The language's name in the *user's* language, for a tooltip and for VoiceOver.
+    ///
+    /// Never the code: VoiceOver spells `EN` out letter by letter. Using `Locale.current` for a
+    /// display string is unrelated to RECON §7, which forbids deriving the *acoustic model* from it.
+    public static func name(_ identifier: String) -> String {
+        let tag = hyphenated(identifier)
+        return Locale.current.localizedString(forIdentifier: tag) ?? tag
+    }
+}
+
+// MARK: - LanguageTray
+
+/// The scrollable language tray: one key per supported locale, the current one pinned to the top.
+///
+/// One component, shared by the primary and second-language sections in Settings and by the import
+/// pane's language control. Not for brevity: every tray must look and order the same, because the
+/// whole point of the import pane's tray is that the user recognises it as the *same kind of choice*
+/// they already made in Settings. Three copies drift, and a language picker that drifts is how a
+/// 70-minute Indonesian meeting gets transcribed by an English model.
+///
+/// Takes BCP-47 **strings** rather than `Locale` values so that one currency runs through the tray,
+/// the queue's `supportedLocaleIdentifiers` and the history row alike. Callers order the list; the
+/// tray only pins the current entry.
+public struct LanguageTray: View {
+
+    /// Seven rows. 54 locales cannot be a column of 54 keys, and seven is the count Settings has
+    /// always shown. A public constant rather than `M.…` because a `public` default argument may not
+    /// reference a `private` declaration.
+    public static let defaultVisibleRows: CGFloat = 7
+
+    private let identifiers: [String]
+    private let selected: String
+    private let keyMinWidth: CGFloat?
+    private let visibleRows: CGFloat
+    private let scrolls: Bool
+    private let onPick: (String) -> Void
+
+    /// - Parameters:
+    ///   - identifiers: every locale to offer, in the caller's own order.
+    ///   - selected: the current choice. Pinned to the top and latched.
+    ///   - keyMinWidth: `TapeButton` `fixedSize`s its legend, so a key only fills its row when it is
+    ///     given a width. `nil` lets the keys size to their text, which is what a popover wants.
+    ///   - visibleRows: tray height, in row heights. 54 locales cannot be a column of 54 keys.
+    ///   - scrolls: render-harness escape hatch, the same one `HistoryPane.unbounded` and
+    ///     `ImportPane.unbounded` are. `false` drops the `ScrollView` and the height cap so the keys
+    ///     can be rasterised. `ImageRenderer` renders a `ScrollView`'s contents as *empty*, and RECON
+    ///     amendment 40 records that Screen Recording is denied to any process an agent starts — so
+    ///     without this the one thing nobody could ever look at before shipping would be the language
+    ///     list itself. Measured, not assumed: the first render of the re-run popover came back as a
+    ///     correct paragraph above an empty well. Never `false` in the app.
+    ///   - onPick: handed the identifier as the tray holds it.
+    public init(
+        identifiers: [String],
+        selected: String,
+        keyMinWidth: CGFloat? = nil,
+        visibleRows: CGFloat = Self.defaultVisibleRows,
+        scrolls: Bool = true,
+        onPick: @escaping (String) -> Void
+    ) {
+        self.identifiers = identifiers
+        self.selected = selected
+        self.keyMinWidth = keyMinWidth
+        self.visibleRows = visibleRows
+        self.scrolls = scrolls
+        self.onPick = onPick
+    }
+
+    public var body: some View {
+        if identifiers.isEmpty {
+            Text("Reading the list of supported languages\u{2026}")
+                .typeStyle(D.type.explain)
+                .foregroundStyle(D.color.textSecondary)
+        } else {
+            RecessedWell(fill: .list, inset: 0) {
+                if scrolls {
+                    ScrollView { keys }
+                        // Definite, not maximum: a `ScrollView` handed an ideal proposal measures as
+                        // zero and the tray vanishes.
+                        .frame(height: D.size.rowHeight * visibleRows)
+                } else {
+                    keys
+                }
+            }
+        }
+    }
+
+    private var keys: some View {
+        VStack(alignment: .leading, spacing: D.space.xs) {
+            ForEach(ordered, id: \.self) { identifier in
+                key(identifier)
+            }
+        }
+        .padding(D.space.xs)
+    }
+
+    /// Current first: with 54 entries the one that matters must not be somewhere down a scroll.
+    private var ordered: [String] {
+        let isCurrent = { (identifier: String) in
+            LanguageCode.hyphenated(identifier)
+                .caseInsensitiveCompare(LanguageCode.hyphenated(self.selected)) == .orderedSame
+        }
+        return identifiers.filter(isCurrent) + identifiers.filter { !isCurrent($0) }
+    }
+
+    private func key(_ identifier: String) -> some View {
+        let tag = LanguageCode.hyphenated(identifier)
+        let isCurrent = tag.caseInsensitiveCompare(LanguageCode.hyphenated(selected)) == .orderedSame
+        return TapeButton(
+            role: .neutral,
+            isLatched: isCurrent,
+            minWidth: keyMinWidth,
+            action: { onPick(identifier) }
+        ) {
+            HStack(spacing: D.space.sm) {
+                // Named in the *user's* language, not its own: `العربية (المملكة…)` is unreadable to
+                // someone picking from an English UI, and the BCP-47 tag beside it is the
+                // unambiguous part.
+                Text(LanguageCode.name(tag))
+                Text(tag)
+                    .typeStyle(D.type.silkscreenTiny)
+            }
+        }
+        .accessibilityLabel(LanguageCode.name(tag))
+        .accessibilityAddTraits(isCurrent ? .isSelected : [])
     }
 }
 

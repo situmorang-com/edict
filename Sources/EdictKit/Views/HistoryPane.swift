@@ -182,6 +182,9 @@ struct HistoryPane: View {
                                 onCopy: { ViewClipboard.put(transcript.text) },
                                 outcome: model.displayOutcome(for: transcript),
                                 isRetrying: model.retryingTranscriptID == transcript.id,
+                                localeIsAmbiguous: ambiguousLocales.contains(
+                                    LanguageCode.badge(transcript.localeIdentifier)
+                                ),
                                 onRetry: { Task { await model.retryInjection(transcript) } }
                             )
                             // Not a `Button` wrapper: the row already contains one (the copy key),
@@ -210,6 +213,24 @@ struct HistoryPane: View {
     // MARK: Data
 
     private var rows: [Transcript] { model.history.search(query) }
+
+    /// Two-letter badges that more than one language in this log would print.
+    ///
+    /// A row sees one transcript and so cannot know that `en-US` and `en-GB` are both here; only the
+    /// pane can. Without this the language column would print `EN` for both — a column that indicates
+    /// nothing while looking like it works, which is the same class of failure the column was added to
+    /// prevent. Computed over the *filtered* rows, because that is what is on screen: a badge is only
+    /// ambiguous against something the reader can also see.
+    private var ambiguousLocales: Set<String> {
+        var byBadge: [String: Set<String>] = [:]
+        for transcript in rows {
+            for identifier in transcript.contributingLocales {
+                let tag = LanguageCode.hyphenated(identifier)
+                byBadge[LanguageCode.badge(tag), default: []].insert(tag.lowercased())
+            }
+        }
+        return Set(byBadge.filter { $0.value.count > 1 }.keys)
+    }
 
     private var selected: Transcript? {
         guard let selection else { return nil }

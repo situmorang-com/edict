@@ -308,9 +308,15 @@ struct RefinementSurfaceTests {
         let model = RefinementFixtures.model()
         #expect(model.refineElapsed == 0)
         model.apply(phase: .refining)
-        // The ticker publishes at 10 Hz; two periods is enough to see it move without making this
-        // test a timing gamble.
-        try? await Task.sleep(for: .milliseconds(260))
+        // Wait for the tick rather than sleeping two periods and hoping. The comment below used to
+        // say 260 ms was "enough to see it move without making this test a timing gamble" — it was
+        // exactly that gamble, and it lost roughly one full-suite run in three once parallel suites
+        // started competing for the run loop. Polling keeps the 10 Hz ticker real and the assertion
+        // indifferent to scheduling.
+        let deadline = ContinuousClock.now + .milliseconds(3000)
+        while model.refineElapsed == 0, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
         #expect(model.refineElapsed > 0, "the counter never moved, so the HUD would look frozen")
         #expect(model.elapsed == 0, "refinement seconds leaked into the speech counter")
         model.apply(phase: .idle)

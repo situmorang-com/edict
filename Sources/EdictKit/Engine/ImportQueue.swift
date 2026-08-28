@@ -86,6 +86,28 @@ public final class ImportQueue {
         /// Last path component. The full path is deliberately never shown — same rule as
         /// `TranscriptSource.imported(filename:)`.
         public let filename: String
+
+        /// The language this file will be transcribed in.
+        ///
+        /// **Resolved once, at enqueue, and never re-read from `Settings` afterwards.** That is the
+        /// whole point of the field. The old behaviour read `Settings.localeIdentifier` inside
+        /// `transcribeImport`, so a file sitting in the queue changed language under the user if they
+        /// touched the dictation picker, and — far worse — a file whose language was simply *not* the
+        /// dictation language was transcribed by the wrong acoustic model with nothing on screen
+        /// saying so. RECON amendment 45 measured what that costs: the same Indonesian audio came
+        /// back as "Dan ada workshop karena sekarang…" under `id-ID` and as "Then other workshop
+        /// Karna Saka Ito Sanga Dunia…" under `en-US`, because an English lexicon is at its most
+        /// permissive around names. It does not fail; it invents.
+        public var localeIdentifier: String
+
+        /// True when the user picked this language for this file; false when it was inherited from
+        /// the dictation language at enqueue time.
+        ///
+        /// The default is "follow my dictation language, **and show me**", so the surface needs to
+        /// tell an inherited locale from a chosen one — an inherited one is the thing worth
+        /// double-checking before reading 900 words.
+        public var localeWasChosen: Bool
+
         /// Populated as soon as the file has been inspected, which is before any decoding.
         public var info: AudioFileInfo?
         public var state: ItemState
@@ -97,10 +119,22 @@ public final class ImportQueue {
         /// is worth keeping and the UI must say so rather than let the user believe it is complete.
         public var warning: String?
 
-        init(url: URL) {
+        /// Non-nil on a row produced by `rerun`: the id of the row it was re-run from, so the
+        /// surface can present the two transcripts as a pair rather than as two unrelated imports.
+        public var rerunOf: Item.ID?
+
+        /// Whether the language can still be changed. A running or finished item cannot: the
+        /// analyzer is built from one `Locale` and never rebuilt (RECON §3), so the answer for a
+        /// finished row is `rerun`, not a mutation.
+        public var localeIsEditable: Bool { state == .queued }
+
+        init(url: URL, localeIdentifier: String, localeWasChosen: Bool, rerunOf: Item.ID? = nil) {
             self.id = UUID()
             self.url = url
             self.filename = url.lastPathComponent
+            self.localeIdentifier = localeIdentifier
+            self.localeWasChosen = localeWasChosen
+            self.rerunOf = rerunOf
             self.state = .queued
         }
     }
@@ -115,6 +149,15 @@ public final class ImportQueue {
         public var itemID: UUID
         public var url: URL
         public var info: AudioFileInfo
+        /// The language this file was actually transcribed in — the item's locale, not
+        /// `Settings.localeIdentifier`.
+        ///
+        /// Separate from `localeIdentifiers` on purpose. That field answers "which languages
+        /// contributed text", which only a dual pass can answer and which stays empty for a single
+        /// pass; this one answers "which model ran", which is always known and is the thing the
+        /// history entry must be attributed to. Collapsing them would make an ordinary import claim
+        /// a language *contest* it never held.
+        public var localeIdentifier: String
         public var outcome: TranscriptionOutcome
         /// Per-word timings, ready for SRT/VTT export. Derived from
         /// `TranscriptionOutcome.words`, which carry `audioTimeRange` because
@@ -169,13 +212,21 @@ public final class ImportQueue {
     /// Everything the queue needs from the rest of the app. Injected rather than reached for, so
     /// the queue is testable with three closures and no frameworks running.
     public struct Environment: Sendable {
-        /// `SpeechEngine.bestAudioFormat()`. Asked once per file, because the engine only knows the
-        /// answer after `prepare(localeIdentifier:)` and the locale can change between files.
-        public var analyzerFormat: @Sendable () async -> AVAudioFormat?
+        /// `SpeechEngine.bestAudioFormat(for:)` for one locale. Asked once per file, because
+        /// `availableCompatibleAudioFormats` is a property of the module and the module is resolved
+        /// from the **item's** locale — a queue holding one `en-US` file and one `id-ID` file runs two
+        /// different modules and must convert each file for the one that will read it.
+        public var analyzerFormat: @Sendable (String) async -> AVAudioFormat?
 
-        /// `SpeechEngine.transcribe(input:onUpdate:)`, curried. The queue hands over a stream and
-        /// an update callback and gets back the finished outcome.
+        /// `SpeechEngine.transcribe(input:pass:…)`, curried, for one locale. The queue hands over the
+        /// item's locale, a stream and an update callback and gets back the finished outcome.
+        ///
+        /// The locale is a parameter and not a captured setting because that is the bug this whole
+        /// feature exists to close: whoever implements this closure must resolve the module from the
+        /// identifier it is given, and must **fail** rather than substitute a different language when
+        /// that language's assets are missing.
         public var transcribe: @Sendable (
+            String,
             AsyncStream<AnalyzerInput>,
             @escaping @Sendable (TranscriptionUpdate) -> Void
         ) async throws -> TranscriptionOutcome
@@ -195,10 +246,63 @@ public final class ImportQueue {
         /// streaming reader the single-pass route uses is not applicable. Returning `nil` *from the
         /// closure* means "not this file" — a second language whose model is still downloading, say —
         /// and the queue quietly runs the ordinary single pass instead rather than failing the file.
+        /// The second argument is the **item's** locale, which becomes the first pass's language.
+        /// See `ImportQueue.dualPassRule` for what a per-item locale means when dual pass is on.
         public var dualPass: (
-            @Sendable (URL, DualPassImporter.Reporting) async throws -> DualPassJob?
+            @Sendable (URL, String, DualPassImporter.Reporting) async throws -> DualPassJob?
         )?
 
+        /// The dictation language, read at the moment of an `enqueue` that did not name one.
+        ///
+        /// A closure rather than a stored string because the queue is built once at launch and the
+        /// user can change the dictation picker at any time: "inherit" has to mean "inherit *now*",
+        /// which is exactly one read, at enqueue, of a value that is then frozen onto the item.
+        public var dictationLocaleIdentifier: @MainActor @Sendable () -> String
+
+        /// Every language a file may be imported in.
+        ///
+        /// `DictationTranscriber.supportedLocales` is the superset — 54 identifiers against
+        /// `SpeechTranscriber`'s 45 — and the right list to offer, because the module is resolved
+        /// *from* the locale rather than the other way round: a locale only the dictation module
+        /// covers (`id-ID`) is fully supported, it simply runs the other model.
+        public var supportedLocaleIdentifiers: @Sendable () async -> [String]
+
+        /// The second language a dual pass would also try, or `nil` when dual pass is off.
+        /// Rendered by the surface next to the item's own locale; see `ImportQueue.dualPassRule`.
+        public var dualPassPartnerLocaleIdentifier: @MainActor @Sendable () -> String?
+
+        public init(
+            analyzerFormat: @Sendable @escaping (String) async -> AVAudioFormat?,
+            transcribe: @Sendable @escaping (
+                String,
+                AsyncStream<AnalyzerInput>,
+                @escaping @Sendable (TranscriptionUpdate) -> Void
+            ) async throws -> TranscriptionOutcome,
+            cancelActive: (@Sendable () async -> Void)? = nil,
+            dualPass: (
+                @Sendable (URL, String, DualPassImporter.Reporting) async throws -> DualPassJob?
+            )? = nil,
+            dictationLocaleIdentifier: @MainActor @Sendable @escaping () -> String,
+            supportedLocaleIdentifiers: @Sendable @escaping () async -> [String] = {
+                await DictationTranscriber.supportedLocales.map(\.identifier)
+            },
+            dualPassPartnerLocaleIdentifier: @MainActor @Sendable @escaping () -> String? = { nil }
+        ) {
+            self.analyzerFormat = analyzerFormat
+            self.transcribe = transcribe
+            self.cancelActive = cancelActive
+            self.dualPass = dualPass
+            self.dictationLocaleIdentifier = dictationLocaleIdentifier
+            self.supportedLocaleIdentifiers = supportedLocaleIdentifiers
+            self.dualPassPartnerLocaleIdentifier = dualPassPartnerLocaleIdentifier
+        }
+
+        /// The locale-blind shape, for a test that has no language to express.
+        ///
+        /// Kept as a real initialiser rather than deleted because a fake engine that returns one
+        /// canned outcome genuinely does not care which language it was asked for, and making every
+        /// such test thread an identifier through would be noise. Everything it builds inherits
+        /// `Settings.Default.localeIdentifier`, which is `en-US`.
         public init(
             analyzerFormat: @Sendable @escaping () async -> AVAudioFormat?,
             transcribe: @Sendable @escaping (
@@ -208,16 +312,36 @@ public final class ImportQueue {
             cancelActive: (@Sendable () async -> Void)? = nil,
             dualPass: (@Sendable (URL, DualPassImporter.Reporting) async throws -> DualPassJob?)? = nil
         ) {
-            self.analyzerFormat = analyzerFormat
-            self.transcribe = transcribe
+            self.analyzerFormat = { _ in await analyzerFormat() }
+            self.transcribe = { _, stream, onUpdate in try await transcribe(stream, onUpdate) }
             self.cancelActive = cancelActive
-            self.dualPass = dualPass
+            // Written out rather than `map`-ed: wrapping an `async throws` closure inside a closure
+            // inside `Optional.map` defeats the type-checker outright — it reports "failed to produce
+            // diagnostic for expression" rather than an error anyone can read.
+            if let job = dualPass {
+                let wrapped: @Sendable (URL, String, DualPassImporter.Reporting) async throws -> DualPassJob? = {
+                    url, _, reporting in try await job(url, reporting)
+                }
+                self.dualPass = wrapped
+            } else {
+                self.dualPass = nil
+            }
+            self.dictationLocaleIdentifier = { Settings.Default.localeIdentifier }
+            self.supportedLocaleIdentifiers = { [Settings.Default.localeIdentifier] }
+            self.dualPassPartnerLocaleIdentifier = { nil }
         }
     }
 
     // MARK: - Observable state
 
     public private(set) var items: [Item] = []
+
+    /// Every language a file may be imported in, hyphenated and sorted by display name.
+    ///
+    /// Empty until `loadSupportedLocales()` has run — the framework's answer is an `await` and the
+    /// picker has to render before it arrives. A surface must therefore fall back to the item's own
+    /// locale rather than assuming this list contains it.
+    public private(set) var supportedLocaleIdentifiers: [String] = []
 
     /// The item currently being transcribed, if any.
     public private(set) var runningItemID: Item.ID?
@@ -324,31 +448,193 @@ public final class ImportQueue {
 
     /// Add files to the back of the queue and start work if nothing is running.
     ///
-    /// URLs already present and not yet finished are ignored, so dropping the same file twice while
-    /// it is still queued does not transcribe it twice. Re-dropping a *finished* file does re-run
-    /// it, which is what someone retrying a failure expects.
+    /// URLs already present in the same language and not yet finished are ignored, so dropping the
+    /// same file twice while it is still queued does not transcribe it twice. Re-dropping a
+    /// *finished* file does re-run it, which is what someone retrying a failure expects.
+    ///
+    /// - Parameters:
+    ///   - localeIdentifier: the language every file in this batch is transcribed in, or `nil` to
+    ///     inherit the dictation language **at this moment** and freeze it onto each row. One locale
+    ///     for the batch and not one for the queue: dropping five files must not force one language
+    ///     on all of them for ever, so each row carries its own copy and `setLocale` moves them
+    ///     one at a time.
     @discardableResult
-    public func enqueue(_ urls: [URL]) -> [Item.ID] {
+    public func enqueue(_ urls: [URL], localeIdentifier: String? = nil) -> [Item.ID] {
+        let locale = normalised(localeIdentifier ?? environment.dictationLocaleIdentifier())
+        let wasChosen = localeIdentifier != nil
+        // Keyed on (url, language), not on url alone. Two rows for the same file in two languages is
+        // a legitimate thing to ask for — it is the whole comparison this feature exists to make —
+        // while two rows for the same file in the *same* language is the accident the dedup is for.
         // Seeded from the rows already in flight and then *grown as we go*, so a batch that carries
-        // the same file twice enqueues it once. Checking only the pre-existing rows would let
+        // the same file twice enqueues it once; checking only the pre-existing rows would let
         // `enqueue([url, url])` through, which is reachable from a drag whose provider registered a
         // file under two type identifiers.
-        var seen = Set(items.filter { !$0.state.isTerminal }.map(\.url))
+        var seen = Set(
+            items.filter { !$0.state.isTerminal }
+                .map { LocalisedFile(url: $0.url, localeKey: Settings.localeKey($0.localeIdentifier)) }
+        )
         var added: [Item.ID] = []
-        for url in urls where seen.insert(url).inserted {
-            let item = Item(url: url)
-            items.append(item)
-            added.append(item.id)
+        for url in urls
+        where seen.insert(LocalisedFile(url: url, localeKey: Settings.localeKey(locale))).inserted {
+            items.append(Item(url: url, localeIdentifier: locale, localeWasChosen: wasChosen))
+            added.append(items[items.count - 1].id)
         }
         if !added.isEmpty {
-            Log.data.info("import queue: enqueued \(added.count, privacy: .public) file(s)")
+            Log.data.info("""
+                import queue: enqueued \(added.count, privacy: .public) file(s) as \
+                \(locale, privacy: .public)\(wasChosen ? "" : " (inherited)", privacy: .public)
+                """)
             startWorkerIfNeeded()
         }
         return added
     }
 
     @discardableResult
-    public func enqueue(_ url: URL) -> Item.ID? { enqueue([url]).first }
+    public func enqueue(_ url: URL, localeIdentifier: String? = nil) -> Item.ID? {
+        enqueue([url], localeIdentifier: localeIdentifier).first
+    }
+
+    /// One file in one language, for the dedup key.
+    private struct LocalisedFile: Hashable {
+        let url: URL
+        let localeKey: String
+    }
+
+    // MARK: - Per-item language
+
+    /// Change the language of a row that has not started yet.
+    ///
+    /// Refused once the item is running or terminal, and that is not a limitation to work around:
+    /// the analyzer is built from exactly one `Locale` and is never reused (RECON §3), so there is
+    /// no such thing as changing the language of a transcription in flight. For a finished row the
+    /// answer is `rerun`.
+    ///
+    /// - Returns: true when the row changed.
+    @discardableResult
+    public func setLocale(_ identifier: String, for id: Item.ID) -> Bool {
+        guard let index = items.firstIndex(where: { $0.id == id }), items[index].localeIsEditable
+        else { return false }
+        let locale = normalised(identifier)
+        guard Settings.localeKey(locale) != Settings.localeKey(items[index].localeIdentifier) else {
+            // Still record the intent: a user who explicitly picks the language that was already
+            // inherited has *checked* it, and the row should stop flagging itself as a default.
+            items[index].localeWasChosen = true
+            return false
+        }
+        Log.data.info("""
+            import queue: \(self.items[index].filename, privacy: .public) \
+            \(self.items[index].localeIdentifier, privacy: .public) -> \(locale, privacy: .public)
+            """)
+        items[index].localeIdentifier = locale
+        items[index].localeWasChosen = true
+        return true
+    }
+
+    /// Re-run a finished row in another language, as a **new row**.
+    ///
+    /// The original row and its history entry are left exactly where they are. That is deliberate and
+    /// it is the point of the feature: the reason to re-run is that the first transcript looked
+    /// plausible and wrong — RECON amendment 45's "Kanaya Sushma Manga Cheil Danka" — and the user
+    /// cannot tell the second one is better without the first one still on screen to compare it
+    /// against. Overwriting would destroy the evidence that motivated the click. `onFinish` is called
+    /// again, so a second `Transcript` is appended to history rather than the first being edited.
+    ///
+    /// The file is re-read from disk and re-decoded. Nothing is cached between runs, and that is the
+    /// right trade rather than a shortcut: decoding measured 570–4300x realtime (a 377 s m4a fully
+    /// read in 90 ms) against transcription's 15–66x, so the decode is ~2 % of the wall clock, while
+    /// caching the decoded PCM for a 70-minute file would hold 134 MB of Int16 at 16 kHz for as long
+    /// as the row stayed on screen. The URL itself is already retained by the row — the app is not
+    /// sandboxed, so there is no security-scoped bookmark to keep alive and re-running costs nothing
+    /// but the re-read. A file the user has since moved or deleted fails the new row with the
+    /// reader's own message, which is the honest outcome.
+    ///
+    /// - Returns: the new row's id, or `nil` when `id` is not a finished row.
+    @discardableResult
+    public func rerun(_ id: Item.ID, localeIdentifier: String) -> Item.ID? {
+        guard let index = items.firstIndex(where: { $0.id == id }), items[index].state.isTerminal
+        else { return nil }
+        let source = items[index]
+        let locale = normalised(localeIdentifier)
+        let item = Item(
+            url: source.url,
+            localeIdentifier: locale,
+            localeWasChosen: true,
+            // The row this one exists to be compared against. Chained through, so re-running a
+            // re-run still points back at the original rather than at the middle of a chain.
+            rerunOf: source.rerunOf ?? source.id
+        )
+        // Straight after its source rather than at the back of the queue, so the pair the user is
+        // comparing stays adjacent even in a tray of twenty rows.
+        items.insert(item, at: index + 1)
+        Log.data.info("""
+            import queue: re-running \(source.filename, privacy: .public) as \
+            \(locale, privacy: .public) (was \(source.localeIdentifier, privacy: .public))
+            """)
+        startWorkerIfNeeded()
+        return item.id
+    }
+
+    /// The language pair the surface must explain for one row, when dual pass is on.
+    ///
+    /// See `dualPassRule`. `nil` means one pass in the row's own language, which is the common case.
+    public func secondPassLocaleIdentifier(for id: Item.ID) -> String? {
+        guard let item = items.first(where: { $0.id == id }),
+              let partner = environment.dualPassPartnerLocaleIdentifier() else { return nil }
+        guard Settings.localeKey(partner) != Settings.localeKey(item.localeIdentifier) else { return nil }
+        return partner
+    }
+
+    /// What a per-item locale means when dual pass is switched on, in one sentence for the UI.
+    ///
+    /// **The rule: the item's locale replaces the first pass's language; the second pass stays the
+    /// configured second dictation language; if the two would be the same, dual pass is skipped and
+    /// the row runs a single pass in its own language.**
+    ///
+    /// The alternative — "the per-item locale pins the file to one language and turns dual pass off"
+    /// — was rejected because it makes the two features fight over the same row: a user who has dual
+    /// pass on for a bilingual meeting and then corrects one file's language would silently lose the
+    /// comparison on exactly the file they were paying attention to. Substituting the *first* pass
+    /// keeps both features doing what they say: the per-item choice decides which languages are
+    /// tried, and dual pass decides that more than one is.
+    public static let dualPassRule = """
+        This file's language is the first of the two tried. The second stays your second dictation \
+        language, and the transcript keeps whichever section-by-section result reads more like the \
+        language that produced it.
+        """
+
+    /// The identifier as Edict writes it: hyphenated, trimmed.
+    ///
+    /// `DictationTranscriber.supportedLocales` reports **underscored** identifiers (`id_ID`) while
+    /// Settings and history store hyphenated ones (`id-ID`), and `Transcript.localeIdentifier` is
+    /// what the history pane shows. Normalising on the way in keeps one spelling in the queue, in
+    /// history and in the picker; `Settings.localeKey` is still what any *comparison* goes through,
+    /// because RECON §6 records `AssetInventory.release` matching on the raw string.
+    private func normalised(_ identifier: String) -> String {
+        let trimmed = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return Settings.Default.localeIdentifier }
+        return trimmed.replacingOccurrences(of: "_", with: "-")
+    }
+
+    /// Load the language list the picker offers. Cheap, and safe to call more than once.
+    public func loadSupportedLocales() async {
+        let identifiers = await environment.supportedLocaleIdentifiers()
+        var seen = Set<String>()
+        supportedLocaleIdentifiers = identifiers
+            .map { $0.replacingOccurrences(of: "_", with: "-") }
+            .filter { seen.insert(Settings.localeKey($0)).inserted }
+            .sorted { Self.localeDisplayName($0) < Self.localeDisplayName($1) }
+        Log.data.debug("import queue: \(self.supportedLocaleIdentifiers.count, privacy: .public) import locales")
+    }
+
+    /// A language name a user will recognise, for a picker row and for a queue row's badge.
+    ///
+    /// Named in English rather than in the user's own locale, matching `SpeechEngine`'s own
+    /// `languageName` — the rest of Edict's interface is English, and a half-translated picker reads
+    /// as a bug. Falls back to the identifier, which is still more use than an empty label.
+    public nonisolated static func localeDisplayName(_ identifier: String) -> String {
+        let hyphenated = identifier.replacingOccurrences(of: "_", with: "-")
+        return Locale(identifier: "en-US").localizedString(forIdentifier: hyphenated) ?? hyphenated
+    }
 
     // MARK: - Cancellation
 
@@ -396,11 +682,21 @@ public final class ImportQueue {
     /// does not leave the tray holding two rows the user has to tell apart.
     public func retry(_ id: Item.ID) {
         guard let index = items.firstIndex(where: { $0.id == id }), items[index].state.isTerminal else { return }
-        let url = items[index].url
+        let previous = items[index]
         items.remove(at: index)
         // Dropped so the fresh run is not cancelled the instant it starts by the old id's flag.
         cancelledIDs.remove(id)
-        enqueue([url])
+        // The row's own language, never the dictation language of the moment. RETRY means "try that
+        // again", and silently changing the language on a retry because the picker moved in between
+        // would be the original bug wearing a different hat.
+        let added = enqueue([previous.url], localeIdentifier: previous.localeIdentifier)
+        // `enqueue` marks anything it was handed a locale for as chosen; a retry has to keep the
+        // *original* provenance, or a row that inherited its language would start claiming the user
+        // picked it and stop being flagged as worth checking.
+        if let newID = added.first, let index = items.firstIndex(where: { $0.id == newID }) {
+            items[index].localeWasChosen = previous.localeWasChosen
+            items[index].rerunOf = previous.rerunOf
+        }
     }
 
     public func remove(_ id: Item.ID) {
@@ -445,6 +741,10 @@ public final class ImportQueue {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         let url = items[index].url
         let filename = items[index].filename
+        // Read once, from the item, and carried through both routes. Never re-read from `Settings`
+        // and never re-read from `items` after an await, so a picker change mid-transcription cannot
+        // make the row's badge disagree with the model that actually ran.
+        let locale = items[index].localeIdentifier
 
         runningItemID = id
         runningText = ""
@@ -473,14 +773,21 @@ public final class ImportQueue {
         // reader is built. It declines — returns nil — for a file it cannot serve, and the ordinary
         // single pass then runs as though the switch had been off.
         if let dualPass = environment.dualPass,
-           await runDualPass(id, url: url, filename: filename, began: began, job: dualPass) {
+           await runDualPass(
+               id, url: url, filename: filename, locale: locale, began: began, job: dualPass
+           ) {
             return
         }
 
         // Only the single pass needs the elapsed-time estimate: a dual pass reports measured
         // progress and a ticker fighting it would only make the bar less honest.
         startTicker(for: id)
-        let importer = AudioFileImporter(url: url, analyzerFormat: await environment.analyzerFormat())
+        // The format is asked for *this item's* locale: the two modules are built per locale and
+        // `availableCompatibleAudioFormats` is a property of the module, so a mixed batch converts
+        // each file for the model that is going to read it. `nil` falls back to 16 kHz mono Int16
+        // inside the importer, and the real error — a language whose model is not on disk — then
+        // surfaces from `transcribe` with a sentence the user can act on.
+        let importer = AudioFileImporter(url: url, analyzerFormat: await environment.analyzerFormat(locale))
         runningImporter = importer
 
         do {
@@ -493,7 +800,7 @@ public final class ImportQueue {
                 Task { @MainActor [weak self] in self?.setProgress(id, fraction) }
             })
 
-            let outcome = try await transcribeWithRetry(stream: stream, id: id)
+            let outcome = try await transcribeWithRetry(stream: stream, id: id, locale: locale)
 
             let readFailure = await importer.readFailure
             let stats = await importer.statistics
@@ -521,6 +828,7 @@ public final class ImportQueue {
                 itemID: id,
                 url: url,
                 info: info,
+                localeIdentifier: locale,
                 outcome: outcome,
                 segments: segments,
                 stats: stats,
@@ -557,7 +865,7 @@ public final class ImportQueue {
             }
             Log.data.info(
                 """
-                import done: \(filename, privacy: .public) \
+                import done: \(filename, privacy: .public) [\(locale, privacy: .public)] \
                 \(String(format: "%.1f", info.duration), privacy: .public)s audio in \
                 \(String(format: "%.1f", result.wallSeconds), privacy: .public)s \
                 (\(String(format: "%.1f", result.realtimeFactor), privacy: .public)x) \
@@ -591,8 +899,9 @@ public final class ImportQueue {
         _ id: Item.ID,
         url: URL,
         filename: String,
+        locale: String,
         began: ContinuousClock.Instant,
-        job: @Sendable @escaping (URL, DualPassImporter.Reporting) async throws -> DualPassJob?
+        job: @Sendable @escaping (URL, String, DualPassImporter.Reporting) async throws -> DualPassJob?
     ) async -> Bool {
         let reporting = DualPassImporter.Reporting(
             onProgress: { [weak self] fraction in
@@ -615,7 +924,10 @@ public final class ImportQueue {
         // Wrapped in a `Task` purely so `cancel(_:)` has something to cancel: the dual pass owns its
         // decode privately, so there is no importer for the queue to reach into, and
         // `DualPassImporter.run` checks for cancellation between sections.
-        let task = Task { try await job(url, reporting) }
+        // The item's locale goes in as the *first* pass's language — see `dualPassRule`. The closure
+        // returns nil when it cannot serve the pair (dual pass off, no second language, or the second
+        // language is the same as this item's), and the single pass then runs in the item's language.
+        let task = Task { try await job(url, locale, reporting) }
         runningDualTask = task
 
         let outcome: DualPassJob?
@@ -663,6 +975,10 @@ public final class ImportQueue {
             itemID: id,
             url: url,
             info: info,
+            // The row's language, which for a dual pass is the first of the two tried. Which one
+            // actually *won* is `localeIdentifiers`, below, and that is the one history attributes
+            // the transcript to.
+            localeIdentifier: locale,
             // A dual pass has no single `TranscriptionOutcome` — it has one per section per language —
             // so this is the stitched equivalent, assembled so every existing reader of `Result`
             // keeps working unchanged.
@@ -833,7 +1149,8 @@ public final class ImportQueue {
     /// that resolves itself in a second.
     private func transcribeWithRetry(
         stream: AsyncStream<AnalyzerInput>,
-        id: Item.ID
+        id: Item.ID,
+        locale: String
     ) async throws -> TranscriptionOutcome {
         let relay = TranscriptRelay { [weak self] committed in
             Task { @MainActor [weak self] in
@@ -844,7 +1161,7 @@ public final class ImportQueue {
         var attempt = 0
         while true {
             do {
-                return try await environment.transcribe(stream, { update in
+                return try await environment.transcribe(locale, stream, { update in
                     relay.publish(update.finalText)
                 })
             } catch SpeechEngineError.sessionAlreadyRunning {
@@ -931,6 +1248,33 @@ public final class ImportQueue {
             }
             .sorted { $0.start < $1.start }
     }
+}
+
+// MARK: - Locale availability
+
+/// A file's chosen language cannot be transcribed right now.
+///
+/// Thrown rather than papered over, and that is the whole reason it exists. The tempting failure mode
+/// is to notice a missing model and quietly use one that *is* installed — which does not produce an
+/// error, it produces fluent nonsense: RECON amendment 45 measured the same Indonesian audio coming
+/// back as "Then other workshop Karna Saka Ito Sanga Dunia interested in workshop to my DR info"
+/// under `en-US`, 19 of 23 words low-confidence, against a word-perfect `id-ID` transcript of the
+/// same clip. So an import either runs in the language it was given, or it fails saying so, and the
+/// row shows that instead of 900 plausible words.
+///
+/// `reason` is already user-facing — it comes from `SpeechEngine.ImportPassResolution.unavailable`,
+/// which distinguishes "Downloading the Indonesian speech model. Try this file again in a moment."
+/// from "Indonesian is not one of the languages this Mac can transcribe."
+public struct ImportLocaleUnavailable: LocalizedError, Sendable, Hashable {
+    public let localeIdentifier: String
+    public let reason: String
+
+    public init(localeIdentifier: String, reason: String) {
+        self.localeIdentifier = localeIdentifier
+        self.reason = reason
+    }
+
+    public var errorDescription: String? { reason }
 }
 
 // MARK: - Live text relay

@@ -134,8 +134,16 @@ public final class DictationController {
 
     private var didBootstrap = false
 
-    /// Which module the *next* import will use. Resolved once per file by `resolvedImportModule()`
-    /// and memoised in `SpeechEngine`, so the format query and the transcribe call cannot disagree.
+    /// Which module ran for each import language, keyed by `Settings.localeKey`.
+    ///
+    /// Keyed by language rather than kept as one "last module" because a queue can now hold files in
+    /// different languages, and the two languages can resolve to *different* modules — `en-US` to
+    /// `SpeechTranscriber`, `id-ID` to `DictationTranscriber`, since Indonesian is one of the nine
+    /// locales the general module does not cover. One shared slot would attribute a finished
+    /// Indonesian transcript to whichever model the file after it happened to use.
+    private var importModuleByLocale: [String: TranscriptionModule] = [:]
+    /// The module of the most recent import, for the one case where the per-locale answer is missing
+    /// (a dual pass whose winning section cannot be matched back to a candidate).
     private var lastImportModule: TranscriptionModule = .dictation
 
     // MARK: Tuning
@@ -1119,10 +1127,16 @@ public final class DictationController {
     /// owner of the engine's single-session rule.
     public func importEnvironment() -> ImportQueue.Environment {
         ImportQueue.Environment(
-            analyzerFormat: { [weak self] in await self?.importAnalyzerFormat() },
-            transcribe: { [weak self] stream, onUpdate in
+            analyzerFormat: { [weak self] locale in
+                await self?.importAnalyzerFormat(localeIdentifier: locale)
+            },
+            transcribe: { [weak self] locale, stream, onUpdate in
                 guard let self else { throw CancellationError() }
-                return try await self.transcribeImport(stream: stream, onUpdate: onUpdate)
+                return try await self.transcribeImport(
+                    localeIdentifier: locale,
+                    stream: stream,
+                    onUpdate: onUpdate
+                )
             },
             // Without this, cancelling a long file only closes the *reader*; the analyzer already
             // holds every remaining chunk in its unbounded input queue and would spend its full run
@@ -1132,12 +1146,41 @@ public final class DictationController {
             // launch and the switch can be flipped at any time, so the *closure* has to be the thing
             // that reads it. It returns nil when dual pass is off or unavailable, which the queue
             // treats as "run the ordinary single pass".
-            dualPass: { [weak self] url, reporting in
+            dualPass: { [weak self] url, locale, reporting in
                 guard let self else { throw CancellationError() }
-                return try await self.runDualPass(url: url, reporting: reporting)
+                return try await self.runDualPass(
+                    url: url,
+                    primaryLocaleIdentifier: locale,
+                    reporting: reporting
+                )
+            },
+            // Read at each `enqueue` that did not name a language, which is what makes the default
+            // "follow my dictation language" mean *now* rather than "whatever it says when the file
+            // finally reaches the front of the queue".
+            dictationLocaleIdentifier: { [weak self] in
+                self?.settings.localeIdentifier ?? Settings.Default.localeIdentifier
+            },
+            // `DictationTranscriber`'s 54 locales, the superset — the picker's job is to offer every
+            // language a file *can* be transcribed in, and the module is then resolved from the
+            // choice (RECON: `SpeechTranscriber` covers 45 and `id-ID` is in the gap).
+            supportedLocaleIdentifiers: { [weak self] in
+                guard let self else { return [] }
+                return await self.engine.supportedLocales.map(\.identifier)
+            },
+            dualPassPartnerLocaleIdentifier: { [weak self] in
+                guard let self, self.settings.dualPassIsActive else { return nil }
+                return self.settings.effectiveSecondaryLocaleIdentifier
             }
         )
     }
+
+    /// The engine behind the import path, for the one test that needs a live dictation and an import
+    /// contending for the *same* analyzer slot.
+    ///
+    /// Internal rather than public, and narrow on purpose: `SpeechEngine`'s slot is per instance, so
+    /// two engines would never contend and "a live dictation wins the slot and the import retries"
+    /// would pass without proving anything. See `ImportLocaleTests.liveDictationWinsTheSlot`.
+    var engineForTesting: SpeechEngine { engine }
 
     /// One file, decoded once and transcribed twice per section.
     ///
@@ -1145,17 +1188,26 @@ public final class DictationController {
     /// apply: the switch is off, there is no second language configured, or one of the two languages
     /// has no model on disk yet. Each of those must degrade to a single-pass transcript, because the
     /// user dropped a file to get a transcript and an error about a language contest is not one.
+    /// - Parameter primaryLocaleIdentifier: the queue item's own language, which becomes the **first**
+    ///   pass. See `ImportQueue.dualPassRule` for the rule and why this is the composition chosen:
+    ///   the per-item choice decides which languages are tried, dual pass decides that more than one
+    ///   is. When the item's language *is* the second dictation language there is no pair left to
+    ///   compare, so this returns nil and the file gets one honest pass in the language it was
+    ///   dropped as.
     private func runDualPass(
         url: URL,
+        primaryLocaleIdentifier: String,
         reporting: DualPassImporter.Reporting
     ) async throws -> ImportQueue.DualPassJob? {
         guard settings.dualPassIsActive,
-              let secondaryIdentifier = settings.effectiveSecondaryLocaleIdentifier else { return nil }
+              let secondaryIdentifier = settings.effectiveSecondaryLocaleIdentifier,
+              Settings.localeKey(secondaryIdentifier) != Settings.localeKey(primaryLocaleIdentifier)
+        else { return nil }
 
         let began = ContinuousClock.now
         let primary = await engine.resolveImportPass(
             preferGeneral: settings.importUsesGeneralModel,
-            localeIdentifier: settings.localeIdentifier
+            localeIdentifier: primaryLocaleIdentifier
         )
         let secondary = await engine.resolveImportPass(
             // The second language is offered the general model on exactly the same terms as the
@@ -1168,6 +1220,8 @@ public final class DictationController {
         )
         guard let primaryPass = primary.pass, let secondaryPass = secondary.pass else {
             let reason = primary.reason ?? secondary.reason ?? "a language could not be prepared"
+            // Falling back to one pass, **never to another language**: the single pass that follows
+            // runs in this item's own locale and fails outright if that locale's model is missing.
             Log.stt.notice("dual pass unavailable, using one model: \(reason, privacy: .public)")
             return nil
         }
@@ -1240,42 +1294,67 @@ public final class DictationController {
         )
     }
 
-    /// The format the importer must convert to. Asked per file because the answer depends on which
-    /// module will run, and that depends on the locale, which the user can change between files.
-    private func importAnalyzerFormat() async -> AVAudioFormat? {
-        let module = await resolvedImportModule()
-        return await engine.bestAudioFormat(for: module)
+    /// The format the importer must convert to, for one file's language.
+    ///
+    /// Asked per file, and per *that file's* locale rather than the dictation language: the module is
+    /// resolved from the locale, `availableCompatibleAudioFormats` is a property of the module, and a
+    /// batch of three files in three languages can therefore want three answers. Returns nil when the
+    /// language cannot be served at all — the importer then uses its 16 kHz mono fallback and the real
+    /// error arrives from `transcribeImport`, with a sentence the user can act on.
+    private func importAnalyzerFormat(localeIdentifier: String) async -> AVAudioFormat? {
+        guard let pass = try? await resolvedImportPass(localeIdentifier) else { return nil }
+        return await engine.bestAudioFormat(for: pass)
     }
 
-    /// Resolve (and prepare) the module for the next import. Memoised inside `SpeechEngine`, so
-    /// calling this twice per file — once for the format, once for the transcribe — costs one
-    /// dictionary lookup the second time.
-    @discardableResult
-    private func resolvedImportModule() async -> TranscriptionModule {
-        let module = await engine.resolveImportModule(
+    /// Resolve, reserve and asset-check the module for one import language.
+    ///
+    /// `resolveImportPass` rather than `resolveImportModule`, and that is the substantive change:
+    /// `resolveImportModule` can only ever answer "general or dictation" for a language it assumes is
+    /// available, so a locale whose assets are missing quietly ran on whatever was on disk. This one
+    /// is allowed to answer `.unavailable`, which is the only honest answer for a language this Mac
+    /// cannot transcribe yet — it starts the download and says so. Transcribing Indonesian with the
+    /// English model does not fail, it invents proper nouns (RECON amendment 45), so **no silent
+    /// fallback to a different language is permissible here**. A fallback between the two *modules* of
+    /// the same language still is, and `resolveImportPass` makes exactly that one.
+    ///
+    /// Memoised inside `SpeechEngine` by requested identifier, so asking twice per file — once for the
+    /// format, once for the transcribe — costs one dictionary lookup the second time. That also means
+    /// the locale reservation is taken once per language per app run, which matters: RECON §6 allows
+    /// only 5 concurrent reservations, and `SpeechEngine.reserve` evicts the ones Edict does not need.
+    private func resolvedImportPass(_ localeIdentifier: String) async throws -> SpeechEngine.ImportPass {
+        let resolution = await engine.resolveImportPass(
             preferGeneral: settings.importUsesGeneralModel,
-            localeIdentifier: settings.localeIdentifier
+            localeIdentifier: localeIdentifier
         )
-        lastImportModule = module
-        return module
+        switch resolution {
+        case .ready(let pass):
+            importModuleByLocale[Settings.localeKey(localeIdentifier)] = pass.module
+            lastImportModule = pass.module
+            return pass
+        case .unavailable(let reason):
+            throw ImportLocaleUnavailable(localeIdentifier: localeIdentifier, reason: reason)
+        }
     }
 
     private func transcribeImport(
+        localeIdentifier: String,
         stream: AsyncStream<AnalyzerInput>,
         onUpdate: @escaping @Sendable (TranscriptionUpdate) -> Void
     ) async throws -> TranscriptionOutcome {
-        let module = await resolvedImportModule()
+        // The locale comes from the queue item, never from `Settings`. That single change is what the
+        // per-item locale *is*: a file's language is decided when it is enqueued and travels with it.
+        let pass = try await resolvedImportPass(localeIdentifier)
         // Biasing is passed explicitly rather than staged with `setBiasing`, so a file cannot
         // inherit — or clobber — the list a live dictation froze at key-down. It is also empty for
         // the general module, where RECON §1 measured contextual strings as a complete no-op.
-        let biasing = module.supportsBiasing
+        let biasing = pass.module.supportsBiasing
             ? dictionary.biasingStrings(limit: settings.effectiveBiasingLimit)
             : []
         // `SpeechEngineError.sessionAlreadyRunning` must escape unwrapped: `ImportQueue` retries on
         // exactly that error while a live dictation holds the engine's one session.
         return try await engine.transcribe(
             input: stream,
-            module: module,
+            pass: pass,
             biasing: biasing,
             onUpdate: onUpdate
         )
@@ -1310,14 +1389,19 @@ public final class DictationController {
         // alone would be a false claim. A single-pass one keeps the locale the user chose, which is
         // the only one that could have produced anything.
         let locales = result.localeIdentifiers
-        let dominant = locales.first ?? settings.localeIdentifier
+        // `result.localeIdentifier`, not `settings.localeIdentifier`: the row's own language is what
+        // ran, and reading the setting here would re-open the exact hole this feature closes — a
+        // finished Indonesian import filed under `en-US` because the picker moved while it ran.
+        let dominant = locales.first ?? result.localeIdentifier
         // The module recorded is the one that produced the dominant language's text. For a
         // single-locale import that is the only module that ran; for a mixed one it is the majority,
         // and `segments` carry the per-section truth.
         let module = result.sections
             .first(where: { $0.chosenLocale == dominant })?
             .candidates.first(where: { $0.localeIdentifier == dominant })?
-            .module ?? lastImportModule
+            .module
+            ?? importModuleByLocale[Settings.localeKey(dominant)]
+            ?? lastImportModule
 
         let transcript = Transcript(
             rawText: raw,
