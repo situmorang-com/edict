@@ -404,12 +404,17 @@ extension HotkeyModifier {
 /// - Never suppress (RECON §13). Right Option is AltGr on many layouts; eating it would break dead keys
 ///   and accented characters system-wide. Ambiguity is resolved in software instead: the key must be held
 ///   alone, and held for at least `armDelay`.
-/// - **Two taps at idle** (RECON amendment 50), and this is the only widening of §13 that stands:
-///   the listen-only hotkey tap above, plus a **consuming, keyDown-only** tap that exists to swallow
-///   the refine trigger's `fn + /`. The second one returns `nil` for that one shape and passes every
-///   other keystroke through unchanged. It is a *separate port* rather than a mode on the hotkey tap
-///   for a reason that is not stylistic: the hotkey tap watches modifier holds, and a consuming tap
-///   on `.flagsChanged` would eat the user's Option key.
+/// - **Two taps at idle with the shipped default** (RECON amendment 50), and this is the only
+///   widening of §13 that stands: the listen-only hotkey tap above, plus a **consuming, keyDown-only**
+///   tap that exists to swallow the refine trigger's `fn + /`. The second one returns `nil` for that
+///   one shape and passes every other keystroke through unchanged. It is a *separate port* rather than
+///   a mode on the hotkey tap for a reason that is not stylistic: the hotkey tap watches modifier
+///   holds, and a consuming tap on `.flagsChanged` would eat the user's Option key.
+///
+///   The second tap is held only while a setting is buying something with it — see
+///   `wantsTriggerTap`. With the refine feature off, or on one of the three chords that insert
+///   nothing, there is **one** tap and it is listen-only, and `update(key:alternate:refine:)`
+///   installs or removes the second one as the setting moves rather than waiting for a relaunch.
 /// - A dedicated `.userInteractive` thread with its own CFRunLoop (RECON §12). Measured: with the main
 ///   thread blocked 3 s, a dedicated run loop serviced 151/150 expected ticks and the main run loop
 ///   serviced 0/150. On the main run loop any SwiftUI hitch delays press/release by the hitch duration
@@ -464,12 +469,13 @@ public final class HotkeyMonitor: Sendable {
         }
     }
 
-    /// The refine trigger's consuming tap: keyDown only, alive for as long as the monitor is.
+    /// The refine trigger's consuming tap: keyDown only, alive for as long as a setting needs it.
     ///
     /// Same shape as `CaptureResources` and deliberately not the same type. The capture tap is
-    /// installed and removed on request while a panel is up; this one is part of the tap thread's own
-    /// lifecycle, created straight after the hotkey tap and torn down on the way out. Sharing one
-    /// field would mean one of them could invalidate the other's port.
+    /// installed and removed at a panel's request; this one follows the refine chord — created
+    /// straight after the hotkey tap when the chord has a shape that must be swallowed, installed or
+    /// removed mid-flight when that setting changes, and torn down on the thread's way out. Sharing
+    /// one field would mean one of them could invalidate the other's port.
     private final class TriggerResources: @unchecked Sendable {
         let runLoop: CFRunLoop
         let port: CFMachPort
@@ -483,6 +489,21 @@ public final class HotkeyMonitor: Sendable {
     }
 
     private enum CaptureRequest: Sendable {
+        case none, install, remove
+    }
+
+    /// What the tap thread should do with the refine trigger's consuming tap next.
+    ///
+    /// Three identical cases to ``CaptureRequest`` and deliberately not the same type, for the same
+    /// reason ``TriggerResources`` is not ``CaptureResources``: the capture tap is installed and
+    /// removed on a panel's request, this one *follows a setting*, and one shared field would let
+    /// either of them cancel the other's pending work.
+    ///
+    /// Internal rather than private so ``TriggerHarness`` can assert on it. The reconciliation is the
+    /// only part of this mechanism a test process can reach — creating the real port needs
+    /// Accessibility, and a consuming tap in front of the user's keyboard is not something a test may
+    /// install.
+    enum TriggerRequest: Sendable, Hashable {
         case none, install, remove
     }
 
@@ -525,8 +546,19 @@ public final class HotkeyMonitor: Sendable {
         var runLoop: CFRunLoop?
         var resources: TapResources?
         /// The consuming keyDown-only tap for the refine trigger. Non-nil for the whole life of a
-        /// healthy tap thread; `nil` means `fn + /` cannot be swallowed, and therefore must not fire.
+        /// healthy tap thread **whose setting needs it**; `nil` means `fn + /` cannot be swallowed,
+        /// and therefore must not fire.
+        ///
+        /// `nil` is the correct steady state whenever `refine?.needsConsumingTap` is false — the
+        /// feature switched off, or one of the three chords that insert nothing and are served by the
+        /// listen-only tap's `matchesListenOnly`. A `.defaultTap` sits in the synchronous delivery
+        /// path of every keyDown on the machine, so it is held only while something is being bought
+        /// with it (RECON amendments 13, 42, 50).
         var trigger: TriggerResources?
+        /// What the tap thread should do to bring `trigger` in line with `refine`. Set by
+        /// `update(key:alternate:refine:)`, serviced on the tap thread, because the port has to be
+        /// created and invalidated on the thread that owns the run loop.
+        var triggerRequest: TriggerRequest = .none
 
         /// Non-nil while the key is physically down.
         var holdStart: CFAbsoluteTime?
@@ -729,7 +761,7 @@ public final class HotkeyMonitor: Sendable {
             throw HotkeyError.permissionDenied
         }
 
-        let alreadyRunning: Bool = state.withLock { s in
+        let running: (already: Bool, wake: CFRunLoop?) = state.withLock { s in
             s.binding = binding
             s.refine = refineBinding
             s.qualifierHeld = false
@@ -740,10 +772,18 @@ public final class HotkeyMonitor: Sendable {
                 s.holdStart = nil
                 s.armed = false
                 s.chorded = false
+                // A request left over from an `update()` made while stopped must not survive into a
+                // generation whose gate below already installs from the setting — a stale `.remove`
+                // would take out the tap the gate had just put in.
+                s.triggerRequest = .none
+                return (false, nil)
             }
-            return s.thread != nil
+            // Re-`start`ing a live monitor is a rebind (see below), and a rebind can change whether
+            // the consuming tap is needed at all, exactly as `update()` can.
+            return (true, requestTriggerReconciliation(s))
         }
-        if alreadyRunning {
+        if running.already {
+            if let runLoop = running.wake { wake(runLoop) }
             Log.hotkey.info("start: already running, rebound to \(binding.displayName, privacy: .public)")
             return
         }
@@ -769,7 +809,16 @@ public final class HotkeyMonitor: Sendable {
                 // has no business outliving the thing it exists to serve. Installing it *after* also
                 // puts it nearer the head of the chain — which is convenient rather than
                 // load-bearing, because the two taps claim disjoint shapes (`RefineChordBinding`).
-                if owned != nil { installTriggerTap(on: runLoop) }
+                //
+                // And only if the *setting* asks for it. `needsConsumingTap` is the gate, not
+                // `refine != nil`: with the feature off there is nothing to swallow, and the three
+                // chords that insert nothing (`⌘⌥/`, `⌥⌘R`, `⌃⌥R`) are already served by the
+                // listen-only tap's `matchesListenOnly`. Suppression is bought where it is needed and
+                // nowhere else (RECON amendment 13, widened by 42 and 50 for this one shape only), so
+                // "two taps at idle" is the default-on inventory rather than the invariant.
+                if owned != nil, state.withLock({ Self.wantsTriggerTap($0) }) {
+                    installTriggerTap(on: runLoop)
+                }
             }
             ready.signal()
 
@@ -780,13 +829,19 @@ public final class HotkeyMonitor: Sendable {
                 runWatchdog()
                 // Belt and braces behind `CFRunLoopPerformBlock`: a request that somehow missed the
                 // wake-up is serviced on the next slice rather than never.
-                serviceCaptureRequest()
+                serviceTapRequests()
             }
-            // Unconditional, and before the hotkey tap goes: a suppressing tap left installed after
-            // its owning thread exited would swallow the user's digits — or the user's slashes —
-            // for ever.
+            // Reached on every exit path, and before the hotkey tap goes: a suppressing tap left
+            // installed after its owning thread exited would swallow the user's digits — or the
+            // user's slashes — for ever.
             removeCaptureTap()
-            removeTriggerTap()
+            // Only this thread's own port, because `s.trigger` is one shared field while the threads
+            // are not: after a `stop()`-then-`start()` with no join (that is `restartHotkey()`) it can
+            // already hold the *next* generation's port, and invalidating that would leave a live
+            // monitor whose `fn + /` types a slash into the user's document with no popup and nothing
+            // in `s.trigger` for the watchdog to notice. `CFRunLoopGetCurrent()` is the same object
+            // `installTriggerTap` recorded, because both run on this thread.
+            removeTriggerTap(ownedBy: CFRunLoopGetCurrent())
             teardown(owned)
         }
         thread.name = "com.edict.hotkey"
@@ -807,11 +862,9 @@ public final class HotkeyMonitor: Sendable {
 
         // `trigger=` is worth a word in the same line as the binding: a chord whose only usable shape
         // needs swallowing is silent without that tap, and this is where a "the chord does nothing"
-        // report gets answered in one grep.
-        let trigger: String = state.withLock { s in
-            guard let refine = s.refine, refine.needsConsumingTap else { return "not needed" }
-            return s.trigger == nil ? "MISSING" : "live"
-        }
+        // report gets answered in one grep. Verified — both taps are installed by the time `start`
+        // returns — which is what `triggerStateDescription` exists to keep true of every `trigger=`.
+        let trigger: String = state.withLock { Self.triggerStateDescription($0) }
         Log.hotkey.notice("""
             hotkey monitor live on \(binding.displayName, privacy: .public) \
             (keyCode \(binding.keyCode)) \
@@ -822,8 +875,15 @@ public final class HotkeyMonitor: Sendable {
             """)
     }
 
-    /// Rebinding while running needs no new tap: the mask is identical for every choice, and the
-    /// callback reads the binding fresh on every event.
+    /// Rebinding while running needs no new *hotkey* tap: its mask is identical for every choice, and
+    /// the callback reads the binding fresh on every event.
+    ///
+    /// The refine trigger's consuming tap is the exception, because it is the one tap whose very
+    /// existence is a setting. Switching the feature off — or moving to one of the chords that insert
+    /// nothing — has to actually take the `.defaultTap` out of the delivery path of every keyDown on
+    /// the machine, and switching back on has to put it there without a relaunch. `DictationController`
+    /// routes every settings change here rather than through `stop()`/`start()`, so anything this
+    /// method does not reconcile cannot be changed until the next launch.
     public func update(
         key: HotkeyChoice,
         alternate: HotkeyModifier? = nil,
@@ -831,21 +891,30 @@ public final class HotkeyMonitor: Sendable {
     ) {
         let binding = HotkeyBinding(key, alternate: alternate)
         let refineBinding = refine.flatMap { RefineChordBinding($0, dictationKey: key) }
-        let wasHolding: Bool = state.withLock { s in
+        let outcome: (wasHolding: Bool, request: TriggerRequest, wake: CFRunLoop?) = state.withLock { s in
             let changed = s.binding?.keyCode != binding.keyCode
             s.binding = binding
             s.refine = refineBinding
             // The tracker is keyed to a mask that may just have changed, and a `true` carried across
             // a rebind would answer the ordering rule for the wrong modifier.
             s.qualifierHeld = false
-            return changed && s.holdStart != nil
+            let wake = requestTriggerReconciliation(s)
+            return (changed && s.holdStart != nil, s.triggerRequest, wake)
         }
-        if wasHolding { abortHold(reason: .keyChanged) }
+        if outcome.wasHolding { abortHold(reason: .keyChanged) }
+        // The port must be created and invalidated on the thread that owns the run loop, so this is
+        // the same request-and-wake plumbing the capture tap uses rather than a call from here.
+        if let runLoop = outcome.wake { wake(runLoop) }
+        // `triggerRequest=`, never `trigger=`: this is what the tap thread has been *asked* for,
+        // logged before it has serviced anything and therefore before an install can have failed.
+        // `trigger=` is reserved for the verified outcome (`start`, and `serviceTriggerRequest` after
+        // the install returns), so that one key in this stream never carries two vocabularies.
         Log.hotkey.info("""
             hotkey rebound to \(binding.displayName, privacy: .public) \
             alternate=\(alternate?.rawValue ?? "none", privacy: .public) \
             mask=0x\(String(binding.alternateMask, radix: 16), privacy: .public) \
-            refine=\(refineBinding?.displayName ?? "off", privacy: .public)
+            refine=\(refineBinding?.displayName ?? "off", privacy: .public) \
+            triggerRequest=\(String(describing: outcome.request), privacy: .public)
             """)
     }
 
@@ -987,7 +1056,104 @@ public final class HotkeyMonitor: Sendable {
     /// return makes the nil-check a complete permission gate here.
     private static let triggerMask: CGEventMask = 1 << CGEventType.keyDown.rawValue
 
-    /// Tap thread only. Installed once per generation, straight after the hotkey tap.
+    /// The whole gate on the consuming tap, in one expression that both the install and the runtime
+    /// reconciliation read — two copies of this test would be two things that can drift.
+    ///
+    /// False means the tap must not exist: `refine == nil` is the feature switched off, and a non-nil
+    /// binding answering false is one of the shapes that insert nothing (`⌘⌥/`, `⌥⌘R`, `⌃⌥R`, and the
+    /// `⌃⌘/` alias left over when Globe is the dictation key and the `fn` shape is dropped). Those are
+    /// served by the listen-only tap's `matchesListenOnly`, so a `.defaultTap` held for them is
+    /// suppression nobody bought.
+    ///
+    /// The naive gate is `refine != nil`, and it is wrong in a way that is invisible: it would keep a
+    /// consuming tap alive for `⌘⌥/`, whose whole selling point (RECON amendment 47) is that a
+    /// Command chord inserts nothing and therefore needs no suppression at all.
+    private static func wantsTriggerTap(_ s: TapState) -> Bool {
+        s.refine?.needsConsumingTap == true
+    }
+
+    /// The consuming tap's *verified* state, in the one vocabulary the log's `trigger=` key carries.
+    /// **Call with the state lock already held** — `NSLock` is not recursive.
+    ///
+    /// Every site that logs `trigger=` reads this, so the key cannot come to mean two things in one
+    /// stream: it is always an outcome, computed after the port either exists or does not. The queued
+    /// request is a different question with a different answer — a request logged before the tap thread
+    /// has serviced it cannot know whether the install failed — so `update()` logs it under
+    /// `triggerRequest=` instead. A "the chord does nothing" report is then one grep either way.
+    private static func triggerStateDescription(_ s: TapState) -> String {
+        guard wantsTriggerTap(s) else { return "not needed" }
+        return s.trigger == nil ? "MISSING" : "live"
+    }
+
+    /// What has to happen to the consuming tap for the setting and the world to agree. Pure over two
+    /// booleans, so the decision table is testable in a process that can hold no tap at all.
+    static func triggerRequest(wanted: Bool, installed: Bool) -> TriggerRequest {
+        switch (wanted, installed) {
+        case (true, false): .install
+        case (false, true): .remove
+        default: .none
+        }
+    }
+
+    /// Record what the tap thread must do, and return the run loop to wake, or `nil` when there is
+    /// nothing to do. **Call with the state lock already held** — `NSLock` is not recursive.
+    private func requestTriggerReconciliation(_ s: TapState) -> CFRunLoop? {
+        guard s.thread != nil else {
+            // Nothing is running, so nothing can be pending. `start` installs from the gate directly.
+            s.triggerRequest = .none
+            return nil
+        }
+        // Assigned unconditionally, `.none` included: a request the tap thread has not serviced yet
+        // must be *cancelled* when the setting moves back inside one 0.25 s slice, or turning the
+        // feature off and on again would leave an install queued that the settings no longer ask for.
+        // Deriving it from the world (`s.trigger`) rather than accumulating makes that free.
+        s.triggerRequest = Self.triggerRequest(wanted: Self.wantsTriggerTap(s), installed: s.trigger != nil)
+        guard s.triggerRequest != .none else { return nil }
+        return s.runLoop
+    }
+
+    /// Tap thread only. The one place the trigger port is created or invalidated after `start`.
+    ///
+    /// The install goes through the same `installTriggerTap` the thread's own start-up uses, checks
+    /// included, rather than a lighter re-creation path. That is not tidiness: a tap created while the
+    /// grant is missing can come back looking fine and be permanently dead (RECON §11), and a runtime
+    /// install is *more* exposed to that than a start-up one — the user may have revoked
+    /// Accessibility since launch. The honest outcome there is `s.trigger == nil`, an error in the
+    /// log, and a chord whose `fn` half stays silent rather than one that types slashes.
+    private func serviceTriggerRequest() {
+        let work: (request: TriggerRequest, runLoop: CFRunLoop?) = state.withLock { s in
+            guard s.thread === Thread.current else { return (.none, nil) }
+            let request = s.triggerRequest
+            s.triggerRequest = .none
+            return (request, s.runLoop)
+        }
+        switch work.request {
+        case .none: break
+        case .install:
+            guard let runLoop = work.runLoop else { break }
+            installTriggerTap(on: runLoop)
+            // Logged *after*, and in `start`'s vocabulary rather than the request's: an install can
+            // come back empty-handed from a grant revoked since launch (RECON §11), can be blocked by
+            // a departing generation's port, and can find the setting has moved under it. `update()`
+            // logs the queued request under its own key for the same reason — it runs before any of
+            // that can be known. One key, one meaning: `trigger=` is only ever an outcome.
+            let outcome = state.withLock { Self.triggerStateDescription($0) }
+            Log.hotkey.notice("refine trigger reconciled: trigger=\(outcome, privacy: .public)")
+        case .remove:
+            // This thread's own run loop: `s.thread === Thread.current` above makes `s.runLoop` it.
+            removeTriggerTap(ownedBy: work.runLoop)
+        }
+    }
+
+    /// Both request-driven taps in one call, because the thread's slice loop and the
+    /// `CFRunLoopPerformBlock` wake-up need exactly the same pair.
+    private func serviceTapRequests() {
+        serviceCaptureRequest()
+        serviceTriggerRequest()
+    }
+
+    /// Tap thread only. Installed straight after the hotkey tap when the chord in force needs it, and
+    /// on request from `serviceTriggerRequest` when a settings change makes it needed later.
     ///
     /// ## Why this exists at all, when RECON §13 says never suppress
     ///
@@ -1006,6 +1172,28 @@ public final class HotkeyMonitor: Sendable {
     /// everything else, and it never allocates — RECON §12's sub-millisecond budget is what keeps
     /// `.tapDisabledByTimeout` from firing and leaving the tap deaf.
     private func installTriggerTap(on runLoop: CFRunLoop) {
+        // Idempotent, and it earns its keep now that a setting can queue an install: `update()` can
+        // ask for one while this thread is already inside `tapCreate` for the previous request, and a
+        // second `tapCreate` against a field that is already full is a round trip to the window server
+        // for a port that would only be discarded again. This is the cheap early-out and not the
+        // guarantee: the lock is released for the whole of that round trip, so the check that has to be
+        // right is the one `publishTriggerTap` makes under the lock that stores the port.
+        //
+        // A port left behind by a *departing* generation is the case that needs more than an early-out,
+        // because adopting it is wrong.
+        // `DictationController.restartHotkey()` is `stop()` immediately followed by `start()` with no
+        // join, so this thread can arrive while the previous one is still inside its 0.25 s slice with
+        // its own trigger port still published — a port that dies in that thread's exit path.
+        // Returning "already installed" for it would leave this generation with no consuming tap and
+        // nothing left to ask for one, which is `fn + /` typing a slash into the user's document with
+        // no popup (amendment 50's failure mode). Re-queue instead: the old thread has already been
+        // cancelled and woken, so a later slice finds the field clear. It terminates for that reason.
+        let blocked: Bool = state.withLock { s in
+            guard let existing = s.trigger else { return false }
+            if existing.runLoop !== runLoop, Self.wantsTriggerTap(s) { s.triggerRequest = .install }
+            return true
+        }
+        if blocked { return }
         // `passUnretained`, for the same reason as the hotkey tap: `CGEventTapCreate` never releases
         // `userInfo`, so `passRetained` would be an unconditional leak with nowhere to balance it.
         let context = Unmanaged.passUnretained(self).toOpaque()
@@ -1038,16 +1226,116 @@ public final class HotkeyMonitor: Sendable {
             CFMachPortInvalidate(port)
             return
         }
-        state.withLock { $0.trigger = TriggerResources(runLoop: runLoop, port: port, source: source) }
-        Log.hotkey.info("refine trigger tap installed (keyDown only, consuming)")
+        switch publishTriggerTap(runLoop: runLoop, port: port, source: source) {
+        case .published:
+            Log.hotkey.info("refine trigger tap installed (keyDown only, consuming)")
+        case .publishedButStale:
+            // Published and queued for removal, not removed here: see `publishTriggerTap`.
+            Log.hotkey.info("refine trigger tap installed after the setting moved; queued for removal")
+        case .blockedByAnotherGeneration:
+            // Nothing published, so nothing else will ever tear this port down — and this thread
+            // created it, which is the one thread allowed to (RECON §12). Same order as every other
+            // teardown here: source out, tap disabled, port invalidated. Dropping the references
+            // instead leaks one Mach port, 1:1, and leaves a `.defaultTap` the window server still
+            // reports in `CGGetEventTapList` with nobody left to service it.
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            CGEvent.tapEnable(tap: port, enable: false)
+            CFMachPortInvalidate(port)
+            Log.hotkey.info("refine trigger tap discarded: another generation's port is installed; re-queued")
+        }
+    }
+
+    /// What became of a finished trigger port when it reached the shared field.
+    ///
+    /// Internal rather than private so ``TriggerHarness`` can assert on it: the three outcomes are the
+    /// whole of what a test process can observe about an install, since creating the real port needs
+    /// Accessibility.
+    enum TriggerPublication: Sendable, Hashable {
+        /// In the field, and the setting still wants it. The steady state.
+        case published
+        /// In the field, but the setting moved while the port was being created. A `.remove` is queued.
+        case publishedButStale
+        /// **Not** in the field: another generation's port was already there. The caller owns the port
+        /// it just created and must tear it down.
+        case blockedByAnotherGeneration
+    }
+
+    /// Store a finished trigger port, re-reading the gate under the **same lock** that stores it.
+    /// Tap thread only.
+    ///
+    /// Separate from `installTriggerTap` because it is the one step that has to be atomic with the
+    /// gate. Everything between that method's idempotence guard and this call runs with the lock
+    /// *released*: `CGEvent.tapCreate` is a round trip to the window server, and `CFRunLoopAddSource` /
+    /// `tapEnable` / `tapIsEnabled` follow it, none of them with this install's port in `s.trigger`
+    /// yet. An `update()` landing in
+    /// that window therefore computes wanted=false, installed=false → `.none` and wakes nobody, and
+    /// without this re-read the install would then publish a consuming `.defaultTap` the settings no
+    /// longer ask for, with nothing to remove it until the next settings change or quit — finding #29's
+    /// exact condition in a smaller window. Whoever holds the lock last decides.
+    ///
+    /// The same released lock is why the store is not unconditional. `s.trigger` is one field where the
+    /// tap threads are two, and two of them can be inside `tapCreate` with it empty. The route is a
+    /// *runtime* install: `serviceTriggerRequest` has a live thread inside `installTriggerTap` when
+    /// `restartHotkey()` arrives, and `stop()` cancels that thread without joining while `tapCreate`
+    /// does not look at cancellation — so it publishes anyway, possibly after the arriving generation's
+    /// own start-up install has already read the field as empty. (A *start-up* install cannot
+    /// interleave: `start()` blocks on `ready` until the thread has finished installing both taps.)
+    /// Storing over whichever port got there first would drop the only reference to it, and RECON §12
+    /// measured teardown as thread-bound and one leaked Mach port per un-invalidated tap, 1:1 — its
+    /// owner's exit path then skips it, because the field no longer names that run loop. So the second
+    /// publish loses, which it can afford to: its creating thread is still inside `installTriggerTap`,
+    /// the one place allowed to invalidate that port, and the install is re-queued for the slice that
+    /// finds the field clear.
+    @discardableResult
+    private func publishTriggerTap(
+        runLoop: CFRunLoop,
+        port: CFMachPort,
+        source: CFRunLoopSource?
+    ) -> TriggerPublication {
+        state.withLock { s in
+            // Necessarily a foreign generation's, never this thread's own: `installTriggerTap` is not
+            // reentrant on one thread and returns early when the field is already taken, so the only
+            // writer that can have got in since that check is another thread's publish. That is also
+            // what makes the re-queue terminate — the blocking thread has been cancelled and woken, so
+            // its exit path clears the field.
+            if s.trigger != nil {
+                if Self.wantsTriggerTap(s) { s.triggerRequest = .install }
+                return .blockedByAnotherGeneration
+            }
+            s.trigger = TriggerResources(runLoop: runLoop, port: port, source: source)
+            guard !Self.wantsTriggerTap(s) else { return .published }
+            // Queued rather than torn down inline, so there stays exactly one path that invalidates a
+            // *published* port. The slice loop reaches it within 0.25 s whichever caller installed —
+            // the thread's own start-up runs before the loop exists, so an inline removal here would
+            // need a second teardown call site for no gain. Nothing is swallowed in the meantime:
+            // `handleTrigger` asks `s.refine?.matchesConsuming(...) ?? false`, and the setting that
+            // made this install stale is what makes that answer false for every keystroke.
+            s.triggerRequest = .remove
+            return .publishedButStale
+        }
     }
 
     /// Same teardown order as every other tap here, for the same measured reason (RECON §12):
     /// dropping the Swift reference leaks one Mach port per tap, 1:1, because the run loop source
     /// holds the port.
-    private func removeTriggerTap() {
+    ///
+    /// Called from the thread's exit path and from `serviceTriggerRequest` when the user switches the
+    /// feature off — mid-flight, with the thread carrying on afterwards. Idempotent, which is what
+    /// makes both callers safe.
+    ///
+    /// - Parameter ownedBy: the run loop of the generation asking, or `nil` for "whatever is there".
+    ///   Both real callers pass their own generation's, for the reason `teardown(_:)` matches on
+    ///   `s.resources === resources`: `s.trigger` is one shared field while the tap threads are not.
+    ///   `restartHotkey()` is `stop()` immediately followed by `start()` with no join, so a departing
+    ///   thread can reach its exit path *after* the new one has published its own port — and tearing
+    ///   that down would leave a live monitor whose `fn + /` types a slash into the user's document
+    ///   with no popup and no error, which is the failure amendment 50's tap exists to prevent. A port
+    ///   that fails the check is not leaked: it belongs to a generation whose own exit path removes it,
+    ///   and an install that finds it there is refused rather than stored over (`publishTriggerTap`).
+    private func removeTriggerTap(ownedBy runLoop: CFRunLoop? = nil) {
         let trigger: TriggerResources? = state.withLock { s in
-            let trigger = s.trigger
+            guard let trigger = s.trigger else { return nil }
+            if let runLoop, trigger.runLoop !== runLoop { return nil }
             s.trigger = nil
             return trigger
         }
@@ -1197,7 +1485,7 @@ public final class HotkeyMonitor: Sendable {
         // `[weak self]` here would be the bug instead of the fix, because the object it would have to
         // reference weakly is the one being deallocated.
         CFRunLoopPerformBlock(runLoop, CFRunLoopMode.commonModes.rawValue) { [self] in
-            serviceCaptureRequest()
+            serviceTapRequests()
         }
         CFRunLoopWakeUp(runLoop)
     }
@@ -1747,14 +2035,161 @@ public final class HotkeyMonitor: Sendable {
 
     var holdHarness: HoldHarness { HoldHarness(monitor: self) }
 
+    // MARK: The trigger tap's decision, without a tap
+
+    /// Drives the consuming tap's install/remove decision with no port, no permission and no thread.
+    ///
+    /// The same reasoning as `HoldHarness`: the real inputs are a `CGEvent.tapCreate` that needs
+    /// Accessibility and a keyboard nobody in a test process is holding. Here there is a second, harder
+    /// reason a test may not simply create the thing — a `.defaultTap` on `keyDown` sits in front of
+    /// every keystroke on the machine, so a test that installed one would be suppressing the *user's*
+    /// typing to prove a point about a setting. `HotkeyChordLive.tapInventory` and its neighbours ask
+    /// the window server for the real inventory, and they are gated behind `EDICT_TAP_TESTS=1` for
+    /// exactly that reason.
+    ///
+    /// What is left, and what this reaches, is the part that shipped wrong: *whether* a tap is wanted,
+    /// and what `update(key:alternate:refine:)` asks the tap thread to do when the answer changes. It
+    /// drives the production `update` and reads the production gate, not copies of them.
+    struct TriggerHarness {
+        let monitor: HotkeyMonitor
+
+        /// Resolve and bind a refine chord as `start`/`update` would. `nil` is the feature off.
+        func bind(_ chord: RefineChord?, dictationKey: HotkeyChoice) {
+            let binding = chord.flatMap { RefineChordBinding($0, dictationKey: dictationKey) }
+            monitor.state.withLock { $0.refine = binding }
+        }
+
+        /// Whether a healthy tap thread would hold the consuming tap for the setting now in force.
+        /// This is the expression the install gate and the reconciliation both read.
+        var wantsConsumingTap: Bool {
+            monitor.state.withLock { HotkeyMonitor.wantsTriggerTap($0) }
+        }
+
+        /// What the tap thread has been asked to do and has not yet done.
+        var pendingRequest: TriggerRequest {
+            monitor.state.withLock { $0.triggerRequest }
+        }
+
+        /// Whether a port is published. "A port is in the field", not "a tap is alive" — the ports this
+        /// harness publishes are bare `CFMachPort`s, for the reason in the type's own note.
+        var tapIsInstalled: Bool {
+            monitor.state.withLock { $0.trigger != nil }
+        }
+
+        /// The run loop recorded as the published port's owner, or `nil` when the field is empty.
+        ///
+        /// The only way to tell *which* port is in the field from outside, which is what distinguishes
+        /// "a port survived" from "the right one survived" when two generations are in play.
+        var installedTapRunLoop: CFRunLoop? {
+            monitor.state.withLock { $0.trigger?.runLoop }
+        }
+
+        /// The `trigger=` value the log carries, from the production helper that every site logging
+        /// that key reads.
+        var loggedTriggerState: String {
+            monitor.state.withLock { HotkeyMonitor.triggerStateDescription($0) }
+        }
+
+        /// Stand in for a live tap thread, so `update` reconciles instead of returning early.
+        ///
+        /// A `Thread` that is never started, deliberately: `stop()` cancels whatever is in this field,
+        /// and cancelling a thread that never ran is a no-op — where handing it `Thread.current` would
+        /// have `stop()` cancel the test's own thread. `runLoop` stays `nil`, so nothing is ever woken
+        /// and no block is queued anywhere.
+        func pretendThreadIsLive() {
+            let idle = Thread {}
+            monitor.state.withLock { $0.thread = idle }
+        }
+
+        /// Stand in for an installed consuming tap: a bare `CFMachPort` with no callback, never added
+        /// to a run loop and never enabled as a tap. `s.trigger != nil` is the only thing the
+        /// reconciliation asks of it, and this is the one way to answer that truthfully without
+        /// suppressing the user's keyboard.
+        ///
+        /// - Parameter runLoop: the run loop to record as the port's owner. Defaults to the caller's;
+        ///   pass another thread's to stand in for a port a *different* generation of the tap thread
+        ///   published, which is the only thing the ownership checks look at.
+        /// - Returns: false if the port could not be created, in which case the caller has nothing to
+        ///   assert about the remove path.
+        @discardableResult
+        func pretendTapIsInstalled(onRunLoop runLoop: CFRunLoop? = nil) -> Bool {
+            guard let port = CFMachPortCreate(kCFAllocatorDefault, nil, nil, nil) else { return false }
+            monitor.state.withLock {
+                $0.trigger = TriggerResources(
+                    runLoop: runLoop ?? CFRunLoopGetCurrent(),
+                    port: port,
+                    source: nil
+                )
+            }
+            return true
+        }
+
+        /// Run the production *publish* step — the tail of `installTriggerTap`, from the point
+        /// `CGEvent.tapCreate` has returned — with a bare `CFMachPort` standing in for the real tap.
+        ///
+        /// This reaches the half of the install window a test process can reach. The other half is
+        /// `CGEvent.tapCreate` itself, which needs Accessibility and would put a consuming `keyDown`
+        /// tap in front of the user's own typing; `HotkeyChordLive` owns that end, gated behind
+        /// `EDICT_TAP_TESTS=1`. What is provable here is the part that shipped wrong: which way the
+        /// gate is read at the moment the port is stored.
+        ///
+        /// - Parameter runLoop: the run loop to record as the port's owner. Defaults to the caller's,
+        ///   which is what a healthy install does; pass another thread's to stand in for a generation
+        ///   that is not this one.
+        /// - Returns: `nil` if the port could not be created, in which case the caller has nothing to
+        ///   assert; otherwise the production outcome. A port the production path refuses is
+        ///   invalidated here, because that path would call `CGEvent.tapEnable` on something that was
+        ///   never a tap.
+        func publishPretendTap(onRunLoop runLoop: CFRunLoop? = nil) -> TriggerPublication? {
+            guard let port = CFMachPortCreate(kCFAllocatorDefault, nil, nil, nil) else { return nil }
+            let outcome = monitor.publishTriggerTap(
+                runLoop: runLoop ?? CFRunLoopGetCurrent(),
+                port: port,
+                source: nil
+            )
+            if outcome == .blockedByAnotherGeneration { CFMachPortInvalidate(port) }
+            return outcome
+        }
+
+        /// Run the production teardown as a tap thread whose own run loop is `runLoop` would on its way
+        /// out — which is how a *departing* generation is told apart from the live one.
+        ///
+        /// Safe with a bare port only in the not-owned case, which returns before touching it. The
+        /// owned case is exercised for real by `HotkeyChordLive.noPortGrowth`.
+        func removeTapAsThreadExit(ownedBy runLoop: CFRunLoop) {
+            monitor.removeTriggerTap(ownedBy: runLoop)
+        }
+
+        /// Drop the stand-in and invalidate its port, so a test leaks nothing. `removeTriggerTap`
+        /// cannot do this job: it would call `CGEvent.tapEnable` on a port that is not a tap.
+        func forgetPretendTap() {
+            let trigger: TriggerResources? = monitor.state.withLock {
+                let trigger = $0.trigger
+                $0.trigger = nil
+                return trigger
+            }
+            if let trigger { CFMachPortInvalidate(trigger.port) }
+        }
+
+        /// Forget the stand-in thread too, so `deinit` has nothing to cancel.
+        func forgetPretendThread() {
+            monitor.state.withLock { $0.thread = nil }
+        }
+    }
+
+    var triggerHarness: TriggerHarness { TriggerHarness(monitor: self) }
+
     // MARK: Diagnostics
 
     /// Every tap one process has installed, as the window server sees it. Needs no permission.
     ///
-    /// The authority on Edict's own tap inventory, which is an invariant now that there are two of
-    /// them (RECON amendment 50): at idle this must report exactly two — one `.listenOnly` on
-    /// keyDown|keyUp|flagsChanged, one `.defaultTap` on keyDown alone. Anything else is either a leak
-    /// or a suppression Edict has no business holding, and both are invisible from inside the app.
+    /// The authority on Edict's own tap inventory, which is an invariant now that there can be two of
+    /// them (RECON amendment 50). At idle this must report the `.listenOnly` tap on
+    /// keyDown|keyUp|flagsChanged, **plus** the `.defaultTap` on keyDown alone *if and only if* the
+    /// refine chord in force has a shape that must be swallowed (`RefineChordBinding.needsConsumingTap`
+    /// — true for the shipped default `fn + /`, false with the feature off and for the three chords
+    /// that insert nothing). Anything else is either a leak or a suppression Edict has no business
+    /// holding, and both are invisible from inside the app.
     static func installedTaps(forPID pid: pid_t) -> [CGEventTapInformation] {
         var count: UInt32 = 0
         _ = CGGetEventTapList(0, nil, &count)

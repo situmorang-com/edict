@@ -933,20 +933,104 @@ public final class DictationController {
             watchdog?.cancel()
             // Invariant 2. Unconditional, and before anything that could itself fail.
             if audioStarted { await capture.stop() }
-            // `abort()` is what hands the engine's analyzer slot back, and it does it for *this*
-            // session only. There used to be an `await engine.cancel()` after this line as a
-            // belt-and-braces; it is gone deliberately. `cancel()` aborts whatever the engine
-            // currently holds, which after this session released is either nothing or a *different*
-            // utterance — a file import, or the next press that was already waiting for the slot —
-            // so on the one path where it did anything at all, what it did was wrong.
-            await session?.abort()
 
-            let message = Self.friendlyMessage(for: error)
-            Log.engine.error("utterance failed: \(Self.describe(error), privacy: .public)")
+            // Everything else about the failure — including keeping what the engine had already
+            // heard — is in `failUtterance`, which is where the test drives it from.
+            let message = await failUtterance(
+                session: session,
+                error: error,
+                target: unit.target,
+                corrector: unit.corrector,
+                localeIdentifier: unit.decision?.localeIdentifier ?? unit.provisional.localeIdentifier,
+                dropped: max(0, capture.statsSnapshot.dropped - unit.droppedBaseline)
+            )
             utterance = nil
             model?.apply(phase: .error(message))
             playFeedback(.fault)
         }
+    }
+
+    /// Tear a failed utterance down without throwing away what was already transcribed.
+    ///
+    /// The loss this closes is total and silent: a throw from
+    /// `finalizeAndFinishThroughEndOfInput()`, or a results-consumer failure at the end of a
+    /// three-minute dictation, used to end here with `.error` and nothing written anywhere — words
+    /// the HUD had been showing the whole time, because `AppModel.apply(phase:)` clears only the
+    /// active-locale fields on `.error`. RECON never observed either throw, so this is rare; when it
+    /// fires the whole utterance is gone and there is no second copy of speech.
+    ///
+    /// **Nothing is injected.** The fallback ladder is not safe on an error path — the paste rung
+    /// posts a synthetic ⌘V and the AX rung writes into whatever now has focus, neither of which is
+    /// defensible when the app has just failed and the user is not expecting text. The recovery is
+    /// the history row's own COPY key.
+    ///
+    /// `internal` and taking the session rather than reading it out of the `Utterance`, for the same
+    /// reason `refineBeforeInserting` is: this is a branch that decides whether a long dictation
+    /// survives, and it is otherwise reachable only by making a real analyzer fail on demand, which
+    /// nothing can do. `EngineRecoveryTests` drives it with a fake session.
+    ///
+    /// - Returns: the sentence for the error phase.
+    @discardableResult
+    func failUtterance(
+        session: (any TranscriptionSession)?,
+        error: Error,
+        target: InjectionTarget,
+        corrector: Corrector,
+        localeIdentifier: String,
+        dropped: Int
+    ) async -> String {
+        // Read the sink BEFORE the abort, and never try to drain it. Two traps here, both worth the
+        // lines: `finishAndCommit` sets `terminated` first, so the `abort()` below returns at its
+        // already-done guard and does no draining at all — and a *deliberate* drain would be worse,
+        // because after `finalizeAndFinishThroughEndOfInput()` has thrown, nothing has measured
+        // whether the module's results sequence ever terminates, and awaiting a task that never
+        // finishes would hang the utterance for ever. `snapshot` is a lock-guarded read of what has
+        // already arrived, which is the most that can be salvaged safely.
+        let salvaged = session?.snapshot.finalText ?? ""
+        // `abort()` is what hands the engine's analyzer slot back, and it does it for *this*
+        // session only. There used to be an `await engine.cancel()` after this line as a
+        // belt-and-braces; it is gone deliberately. `cancel()` aborts whatever the engine
+        // currently holds, which after this session released is either nothing or a *different*
+        // utterance — a file import, or the next press that was already waiting for the slot —
+        // so on the one path where it did anything at all, what it did was wrong.
+        await session?.abort()
+
+        let message = Self.friendlyMessage(for: error)
+        Log.engine.error("utterance failed: \(Self.describe(error), privacy: .public)")
+
+        guard !salvaged.trimmed.isEmpty else { return message }
+
+        // Layer 2 still runs: the row's text is what would have been inserted, and that is what the
+        // user will copy out of it. Dictionary hit counts are deliberately *not* recorded — those
+        // describe corrections that reached a document, and nothing reached one here.
+        let corrected = corrector.isEmpty
+            ? CorrectionResult(text: salvaged, hits: [])
+            : corrector.apply(to: salvaged)
+        let transcript = Transcript(
+            rawText: salvaged,
+            text: corrected.text,
+            corrections: corrected.hits,
+            localeIdentifier: localeIdentifier,
+            targetBundleID: target.bundleID,
+            targetAppName: target.appName,
+            injection: .failed,
+            droppedBuffers: dropped
+        )
+        history.append(transcript)
+        Log.engine.notice("""
+            kept \(transcript.wordCount, privacy: .public) salvaged words in history \
+            after a failed utterance
+            """)
+        return Self.salvageMessage(message, words: transcript.wordCount)
+    }
+
+    /// The error sentence, plus where the words went. Never claims an insertion — nothing was
+    /// inserted, and the history row is the only place they exist.
+    static func salvageMessage(_ message: String, words: Int) -> String {
+        let counted = words == 1
+            ? "The 1 word heard so far is"
+            : "The \(words) words heard so far are"
+        return "\(message) \(counted) in Edict's history, not in your document."
     }
 
     private func finishCancelled(_ unit: Utterance) {
@@ -1261,8 +1345,15 @@ public final class DictationController {
             DualPassImporter.Pass(
                 localeIdentifier: pass.requestedIdentifier,
                 module: pass.module,
+                // The *retrying* variant, and that is not a refinement. `SpeechEngine` allows one
+                // analyzer at a time, so a section that starts while the user is holding the
+                // dictation key is refused with `.sessionAlreadyRunning` after 1.5 s of waiting —
+                // and `DualPassImporter` catches a failed pass, logs it and carries on, so the
+                // section simply vanished from the transcript with nothing said. Roughly one section
+                // per 3 s of hold. The single-pass route has had this ladder all along
+                // (`ImportQueue.transcribeWithRetry`); this route reached the engine bare.
                 transcribe: { stream in
-                    try await engine.transcribe(
+                    try await engine.transcribeWaitingForSlot(
                         input: stream,
                         pass: pass,
                         biasing: pass.module.supportsBiasing ? biasing : [],
@@ -1308,19 +1399,21 @@ public final class DictationController {
 
     /// Resolve, reserve and asset-check the module for one import language.
     ///
-    /// `resolveImportPass` rather than `resolveImportModule`, and that is the substantive change:
-    /// `resolveImportModule` can only ever answer "general or dictation" for a language it assumes is
-    /// available, so a locale whose assets are missing quietly ran on whatever was on disk. This one
-    /// is allowed to answer `.unavailable`, which is the only honest answer for a language this Mac
+    /// `resolveImportPass` replaced an earlier `resolveImportModule`, now deleted, and that was the
+    /// substantive change: that method could only ever answer "general or dictation" for a language
+    /// it assumed was available, so a locale whose assets were missing quietly ran on whatever was on
+    /// disk. This one is allowed to answer `.unavailable`, which is the only honest answer for a language this Mac
     /// cannot transcribe yet — it starts the download and says so. Transcribing Indonesian with the
     /// English model does not fail, it invents proper nouns (RECON amendment 45), so **no silent
     /// fallback to a different language is permissible here**. A fallback between the two *modules* of
     /// the same language still is, and `resolveImportPass` makes exactly that one.
     ///
     /// Memoised inside `SpeechEngine` by requested identifier, so asking twice per file — once for the
-    /// format, once for the transcribe — costs one dictionary lookup the second time. That also means
-    /// the locale reservation is taken once per language per app run, which matters: RECON §6 allows
-    /// only 5 concurrent reservations, and `SpeechEngine.reserve` evicts the ones Edict does not need.
+    /// format, once for the transcribe — costs one dictionary lookup the second time. The memo is
+    /// **not** for the life of the app: RECON §6 allows only 5 concurrent reservations and they
+    /// persist across launches, so `resolveImportPass` keeps the two most recent import languages and
+    /// re-resolves any older one that comes back. A batch of four languages therefore pays four
+    /// resolutions rather than running out of slots on the fourth.
     private func resolvedImportPass(_ localeIdentifier: String) async throws -> SpeechEngine.ImportPass {
         let resolution = await engine.resolveImportPass(
             preferGeneral: settings.importUsesGeneralModel,

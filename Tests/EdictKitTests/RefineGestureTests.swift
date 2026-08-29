@@ -722,8 +722,12 @@ struct HotkeyChordLiveTests {
     /// * one `.defaultTap` on `keyDown` **alone** — the refine trigger. keyDown is the minimum
     ///   surface that can swallow a character, and anything wider is unearned suppression.
     ///
+    /// The inventory is **conditional on the setting**, which is what the three tests after this one
+    /// are for: two taps is the shipped-default steady state, not the invariant. The invariant is that
+    /// the consuming one exists if and only if the chord in force has a shape that must be swallowed.
+    ///
     /// Posts nothing, so unlike its neighbours in this suite it cannot touch the user's keyboard.
-    @Test("at idle the monitor holds exactly two taps: one listen-only, one consuming keyDown-only")
+    @Test("with fn+/ the monitor holds exactly two taps: one listen-only, one consuming keyDown-only")
     func tapInventory() throws {
         let monitor = HotkeyMonitor(armDelay: 0.12)
         defer { monitor.stop() }
@@ -744,6 +748,115 @@ struct HotkeyChordLiveTests {
         #expect(listenOnly.first?.eventsOfInterest == keyDown | keyUp | flags)
         #expect(consuming.first?.eventsOfInterest == keyDown)
         #expect(taps.allSatisfy { $0.enabled })
+    }
+
+    /// The other side of the inventory, and the one that was wrong: with the refine feature off there
+    /// is nothing to swallow, so the `.defaultTap` must not exist at all. It used to, for the whole
+    /// process lifetime, because the install read `if owned != nil` with no reference to the setting.
+    ///
+    /// Posts nothing.
+    @Test("with the refine feature off the monitor holds only the listen-only tap")
+    func refineOffHoldsOnlyTheListenOnlyTap() throws {
+        let monitor = HotkeyMonitor(armDelay: 0.12)
+        defer { monitor.stop() }
+        try monitor.start(key: .rightOption, alternate: .shift, refine: nil)
+
+        let taps = HotkeyMonitor.installedTaps(forPID: getpid())
+        #expect(taps.count == 1, "tap inventory is \(taps.count): \(Self.describe(taps))")
+        #expect(taps.first?.options == .listenOnly, Comment(rawValue: Self.describe(taps)))
+    }
+
+    /// A chord that inserts nothing is served by the listen-only tap's `matchesListenOnly`, so it buys
+    /// no suppression either — `refine != nil` is the wrong gate, `needsConsumingTap` is the right one.
+    ///
+    /// Posts nothing.
+    @Test("a chord that inserts nothing holds only the listen-only tap",
+          arguments: [RefineChord.commandOptionSlash, .optionCommandR, .controlOptionR])
+    func nonInsertingChordHoldsOnlyTheListenOnlyTap(chord: RefineChord) throws {
+        let monitor = HotkeyMonitor(armDelay: 0.12)
+        defer { monitor.stop() }
+        try monitor.start(key: .rightOption, alternate: .shift, refine: chord)
+
+        let taps = HotkeyMonitor.installedTaps(forPID: getpid())
+        #expect(taps.count == 1, "tap inventory is \(taps.count): \(Self.describe(taps))")
+        #expect(taps.first?.options == .listenOnly, Comment(rawValue: Self.describe(taps)))
+    }
+
+    /// The half of the finding that is more than hygiene. `DictationController` routes every settings
+    /// change on a live monitor to `update(key:alternate:refine:)`, so if that method does not install
+    /// and remove the tap, toggling the feature cannot take effect until the next launch.
+    ///
+    /// The polling is because the port is created and invalidated on the tap thread: `update` queues a
+    /// request and wakes the run loop, and the window server sees the change a moment later. Posts
+    /// nothing.
+    @Test("toggling the feature at runtime installs and removes the consuming tap")
+    func togglingTheFeatureAtRuntimeMovesTheTap() throws {
+        let monitor = HotkeyMonitor(armDelay: 0.12)
+        defer { monitor.stop() }
+        try monitor.start(key: .rightOption, alternate: .shift, refine: nil)
+        #expect(HotkeyMonitor.installedTaps(forPID: getpid()).count == 1)
+
+        monitor.update(key: .rightOption, alternate: .shift, refine: .fnSlash)
+        try Self.waitForTapCount(2)
+        let installed = HotkeyMonitor.installedTaps(forPID: getpid())
+        #expect(installed.filter { $0.options == .defaultTap }.count == 1,
+                Comment(rawValue: Self.describe(installed)))
+
+        monitor.update(key: .rightOption, alternate: .shift, refine: nil)
+        try Self.waitForTapCount(1)
+        let remaining = HotkeyMonitor.installedTaps(forPID: getpid())
+        #expect(remaining.first?.options == .listenOnly, Comment(rawValue: Self.describe(remaining)))
+    }
+
+    /// A regression guard for the one thing `s.trigger` lacks and `TapResources` has: an owner.
+    ///
+    /// `DictationController.restartHotkey()` is `stop()` immediately followed by `start()` with no
+    /// join — `stop()` cancels the thread and wakes its run loop, then returns — so two tap threads can
+    /// be alive at once: the departing one inside its last 0.25 s slice, the arriving one already
+    /// installing. Two orderings used to go wrong, because `s.trigger` is a single shared field. The
+    /// arriving thread could find the departing one's port there and return "already installed",
+    /// leaving itself no consuming tap; or it could publish first and have the departing thread's exit
+    /// path invalidate *its* port. Both end the same way: `fn + /` types a slash into the user's
+    /// document with no popup and no error, and nothing is left in `s.trigger` for the watchdog to
+    /// notice. The fixes are an ownership check on teardown (matched by run loop, as `teardown(_:)`
+    /// matches `TapResources` by identity) and a re-queued install when a foreign port blocks one.
+    ///
+    /// A guard rather than a reproduction, and labelled as one: the interleaving is timing-dependent,
+    /// so a run where the departing thread finishes first passes either way. It cannot fail
+    /// spuriously in the other direction — both orderings now converge inside one slice, which is what
+    /// `waitForTapCount`'s 1 s ceiling covers. The deterministic half of this is
+    /// `TriggerTapGate.aDepartingThreadLeavesTheLiveTapAlone`, which needs no port and no permission.
+    ///
+    /// Posts nothing.
+    @Test("a restart with no join leaves exactly one consuming tap installed")
+    func restartKeepsExactlyOneConsumingTap() throws {
+        let monitor = HotkeyMonitor(armDelay: 0.12)
+        defer { monitor.stop() }
+        try monitor.start(key: .rightOption, alternate: .shift, refine: .fnSlash)
+        try Self.waitForTapCount(2)
+
+        // Exactly `restartHotkey()`, with nothing in between.
+        monitor.stop()
+        try monitor.start(key: .rightOption, alternate: .shift, refine: .fnSlash)
+
+        // The departing generation's own two taps may still be in the inventory for a moment, so this
+        // waits for the count to settle rather than reading it straight away.
+        try Self.waitForTapCount(2)
+        let taps = HotkeyMonitor.installedTaps(forPID: getpid())
+        #expect(taps.filter { $0.options == .defaultTap }.count == 1,
+                Comment(rawValue: Self.describe(taps)))
+        #expect(taps.allSatisfy { $0.enabled }, Comment(rawValue: Self.describe(taps)))
+    }
+
+    /// 2 ms steps to a 1 s ceiling. The service happens on the tap thread's next `CFRunLoopPerformBlock`
+    /// — measured well under a millisecond — but the 0.25 s slice is the fallback path, so the ceiling
+    /// has to clear it.
+    private static func waitForTapCount(_ expected: Int) throws {
+        for _ in 0..<500 where HotkeyMonitor.installedTaps(forPID: getpid()).count != expected {
+            usleep(2_000)
+        }
+        let taps = HotkeyMonitor.installedTaps(forPID: getpid())
+        #expect(taps.count == expected, "tap inventory settled at \(describe(taps))")
     }
 
     /// RECON §12 measured 500 taps created without `CFMachPortInvalidate` leaking exactly 500 Mach

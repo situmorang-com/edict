@@ -424,7 +424,36 @@ public final class HistoryStore {
     public static let shared = HistoryStore(fileURL: AppPaths.historyFile)
 
     public private(set) var transcripts: [Transcript] = []
+    /// One sentence-or-three about the last load, or `nil` when it went normally.
+    ///
+    /// Deliberately **non-nil after a successful recovery**, because a recovery is news: it is the
+    /// only place the app says how many entries came back and where the bytes it could not read were
+    /// put. Read it together with `recoveredEntryCount` — a reader that treats non-nil as "failed"
+    /// tells the user their history could not be read while they are looking at it.
     public private(set) var lastLoadError: String?
+    /// How many entries the last load rescued from `history.json.bak`, or `nil` when nothing was
+    /// rescued — which is every ordinary launch.
+    ///
+    /// Exists so the UI can tell a recovery from a failure without matching substrings of
+    /// `lastLoadError`, which would make the message's wording load-bearing.
+    public private(set) var recoveredEntryCount: Int?
+    /// Where the bytes that could not be read were moved to, or `nil` when nothing was moved.
+    ///
+    /// `nil` covers two different situations and the UI must not conflate them: an ordinary load
+    /// (nothing to move) and a quarantine that *failed* (`lastLoadError` says so in words, and the
+    /// bytes are still at `fileURL`).
+    public private(set) var quarantinedFileURL: URL?
+
+    /// The quarantine file's name on its own, for a message that must not print a home directory.
+    public var quarantinedFileName: String? { quarantinedFileURL?.lastPathComponent }
+
+    /// Why the terminal flush could not write, or `nil` if it has not failed.
+    ///
+    /// Exists so the failure is assertable and, later, showable. `flushPendingSave()` runs from
+    /// `applicationWillTerminate` with no UI left to report to, so the log is the only channel at the
+    /// time — but the log is also not something a test can read, and an untestable error path is how
+    /// this one stayed a bare `try?` for as long as it did.
+    public private(set) var lastFlushError: String?
 
     public let fileURL: URL
     /// Injected so tests can supply a fixed limit without touching the real `Settings`.
@@ -437,14 +466,20 @@ public final class HistoryStore {
 
     @ObservationIgnored private var saveTask: Task<Void, Never>?
 
-    private static let encoder: JSONEncoder = {
+    /// Built per write rather than held in a `static let`.
+    ///
+    /// The debounced path encodes off the main actor, and a `@MainActor` class's statics are
+    /// main-actor-isolated too — so a shared encoder would have to be `nonisolated(unsafe)` on a
+    /// mutable Foundation class, which is exactly the kind of hole this project does not open for a
+    /// few object allocations. Construction is four property assignments; the encode is the cost.
+    nonisolated private static func makeEncoder() -> JSONEncoder {
         let e = JSONEncoder()
         // Not pretty-printed: history is machine-owned and can reach thousands of entries, where
         // indentation is pure disk cost. dictionary.json is the hand-editable one.
         e.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         e.dateEncodingStrategy = .iso8601
         return e
-    }()
+    }
 
     private static let decoder: JSONDecoder = {
         let d = JSONDecoder()
@@ -454,34 +489,217 @@ public final class HistoryStore {
 
     public func load() throws {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            transcripts = []
-            lastLoadError = nil
+            // An absent file is the *most likely* way a store goes missing — an external delete, a
+            // half-finished restore, a sync client, or the reinstating `save()` in `recover` failing
+            // after a successful quarantine — and it was the one shape that never consulted the
+            // backup. `decodeBackup` was reachable only from `recover`, which requires the file to be
+            // PRESENT, so finding #2's own headline ("the `.bak` that would save it is never read")
+            // stayed open for precisely the case that reaches it soonest.
+            //
+            // Nothing is quarantined here, and the message says "is not there" rather than "could not
+            // be read": there is no file to move aside, and inventing a mystery file to explain its
+            // own absence is the litter `recover` refuses to create for a 0-byte store.
+            if let recovered = decodeBackup() {
+                transcripts = recovered
+                recoveredEntryCount = recovered.count
+                quarantinedFileURL = nil
+                lastLoadError = "\(fileURL.lastPathComponent) is not there."
+                    + " Recovered \(recovered.count) entr\(recovered.count == 1 ? "y" : "ies")"
+                    + " from the backup."
+                Log.data.notice("recovered \(recovered.count, privacy: .public) history entries from the backup; the store file was absent")
+                // Reinstate now. `writeAtomically` skips `keepPreviousVersion` when the destination
+                // is absent, so THIS write does not consume the backup — but the second save would
+                // copy the reinstated file straight over it, so a recovery that is not written back
+                // is one dictation away from being lost anyway.
+                do { try save() } catch {
+                    Log.data.error("could not reinstate history.json after recovering from the backup: \(error.localizedDescription, privacy: .public)")
+                }
+                return
+            }
+            presentEmptyStore()
             return
         }
-        let data = try Data(contentsOf: fileURL)
-        guard !data.isEmpty else {
-            transcripts = []
-            lastLoadError = nil
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            // This read used to sit outside the `do` below, so an *unreadable* file — as opposed to
+            // an undecodable one — skipped the quarantine and the backup entirely and was then
+            // replaced by the next save. Same enemy, same treatment.
+            Log.data.error("History read failed: \(error.localizedDescription, privacy: .public)")
+            try recover(from: .unreadable(error))
             return
         }
+
+        if data.isEmpty {
+            // A 0-byte file is not an empty store. It is the characteristic output of a truncating
+            // external writer, which is the trigger the recovery was built for — and reading it as
+            // "the user has no history" was the worst hole in that recovery: no quarantine, no
+            // backup, `lastLoadError` nil so the UI said nothing, and then the first append's save
+            // had `keepPreviousVersion` copy the 0 bytes over the `.bak`. The history was gone on
+            // the first dictation instead of surviving one write of grace.
+            try recover(from: .empty)
+            return
+        }
+
         do {
             let loaded = try Self.decoder.decode([Transcript].self, from: data)
             // Sort rather than trust: an externally-touched file, or a schema migration, should still
             // present newest-first.
             transcripts = loaded.sorted { $0.createdAt > $1.createdAt }
-            lastLoadError = nil
+            clearLoadDiagnostics()
         } catch {
-            lastLoadError = "history.json could not be read: \(error.localizedDescription)"
             Log.data.error("History decode failed: \(error.localizedDescription, privacy: .public)")
-            throw error
+            try recover(from: .undecodable(error))
         }
     }
 
+    /// A load that found nothing to load: no file, or a 0-byte file with no backup worth adopting.
+    private func presentEmptyStore() {
+        transcripts = []
+        clearLoadDiagnostics()
+    }
+
+    private func clearLoadDiagnostics() {
+        lastLoadError = nil
+        recoveredEntryCount = nil
+        quarantinedFileURL = nil
+    }
+
+    /// The one generation `AppPaths.writeAtomically` keeps.
+    ///
+    /// Read here and nowhere else. Before this, a grep across `Sources/` found one write site for
+    /// `.bak` and *zero* reads, so the only backup Edict has was reachable only by a user who knew
+    /// the path, knew to quit first, and knew to rename it — which is to say, not reachable.
+    private var backupURL: URL { fileURL.appendingPathExtension("bak") }
+
+    /// `history.json` is present and could not become the store. Move the bytes out of the way of
+    /// the next save, then try the backup.
+    ///
+    /// Two orderings matter and only one of them is the intuitive one.
+    ///
+    /// The `.bak` is read *before* the quarantine, which is safe because they touch different files
+    /// and buys the one decision the quarantine cannot make for itself: whether a 0-byte
+    /// `history.json` is worth keeping at all. It is not, unless a recovery is actually happening —
+    /// otherwise the support directory collects mystery files that hold nothing and that no message
+    /// explains, because a bare 0-byte file is also what a legitimately emptied store looks like.
+    ///
+    /// The quarantine still happens before anything is *written*, and for the two non-empty shapes it
+    /// happens even with no backup to adopt. The file's real enemy is not the failure that got us
+    /// here, it is the next `append` — `scheduleSave` fires 500 ms later and `save()` writes the whole
+    /// store — so an unreadable file left in place is an overwritten file, which is amendment 39's
+    /// incident with a decode error standing in for the stray verification run. See
+    /// `AppPaths.quarantineUnreadableFile` for why refusing to save instead is the wrong trade.
+    ///
+    /// On a failed recovery `transcripts` is deliberately left untouched rather than emptied: at
+    /// launch it is already empty, and on any later call it holds entries this process appended,
+    /// which are the only copy of themselves.
+    private func recover(from kind: UnusableStoreFile) throws {
+        let recovered = decodeBackup()
+        let quarantined = (recovered != nil || !kind.isEmptyFile)
+            ? AppPaths.quarantineUnreadableFile(at: fileURL)
+            : nil
+        quarantinedFileURL = quarantined
+        var message = kind.sentence(about: fileURL.lastPathComponent)
+
+        if let recovered {
+            transcripts = recovered
+            recoveredEntryCount = recovered.count
+            message += " Recovered \(recovered.count) entr\(recovered.count == 1 ? "y" : "ies") from the backup."
+            if let quarantined {
+                message += " The unreadable file is kept as \(quarantined.lastPathComponent)."
+                lastLoadError = message
+                Log.data.notice("Recovered \(recovered.count, privacy: .public) history entries from the backup")
+                // Write the recovered entries back now. Without this the recovery lasts exactly as
+                // long as the process: `load()` returns early when `history.json` is absent, so the
+                // next launch would read a missing file, find nothing, and leave the `.bak` unread —
+                // the very unreachable-backup bug this method exists to close.
+                do { try save() } catch {
+                    Log.data.error("could not reinstate history.json after recovery: \(error.localizedDescription, privacy: .public)")
+                }
+            } else {
+                // The quarantine failed, so `history.json` still holds the only copy of the bytes
+                // nobody could read — and writing now would be worse than not writing.
+                // `writeAtomically` would take the tmp-plus-replace branch, `keepPreviousVersion`
+                // would copy those unreadable bytes straight over the `.bak` this recovery came
+                // from, and the next dictation 500 ms later would copy the reinstated file over that.
+                // The original bytes would be gone in two writes: "exactly one write of grace",
+                // which is the phrase for the bug the quarantine exists to remove. So the reinstating
+                // save is skipped, and the message says so rather than quietly dropping a clause.
+                message += " Edict could not move it aside, so those bytes are still in"
+                    + " \(fileURL.lastPathComponent) and the recovered entries were not written back."
+                    + " Copy that file somewhere safe — the next dictation will replace it."
+                lastLoadError = message
+                Log.data.error("recovered history from the backup but could not quarantine \(self.fileURL.lastPathComponent, privacy: .public); skipped the reinstating save")
+            }
+            return
+        }
+
+        if kind.isEmptyFile {
+            // Nothing to adopt and nothing to report: this is the empty store `load()` has always
+            // presented for a 0-byte file, reached now with the backup genuinely consulted first.
+            //
+            // Guarded on `transcripts.isEmpty` so the doc above stays true. `load()` is called once,
+            // from `bootstrap`, so today this only ever runs against an empty store — but it is
+            // `public`, and a second call that found a 0-byte file with no usable backup would
+            // otherwise discard entries this process appended, which at that moment are the only
+            // copy of themselves. A rule that holds only because of a call-site count is not a rule.
+            if transcripts.isEmpty {
+                presentEmptyStore()
+            } else {
+                lastLoadError = "\(fileURL.lastPathComponent) is empty and there is no usable"
+                    + " backup. The \(transcripts.count) entr\(transcripts.count == 1 ? "y" : "ies")"
+                    + " already in this session are kept."
+            }
+            return
+        }
+
+        message += quarantined.map { " No usable backup; the unreadable file is kept as \($0.lastPathComponent)." }
+            // Not silence. Before this, a failed move just omitted the clause, so the message named
+            // no file at all and the only pointer to the user's bytes was the unified log.
+            // The warning matters MOST here and was the one branch that omitted it: with no backup
+            // to adopt, that file holds the user's only copy of those bytes.
+            ?? (" No usable backup, and Edict could not move the unreadable file aside — those bytes"
+                + " are still in \(fileURL.lastPathComponent). Copy that file somewhere safe: the"
+                + " next dictation will replace it.")
+        lastLoadError = message
+        // Still thrown. The caller logs it, and the load genuinely did not produce the user's history.
+        if let error = kind.underlyingError { throw error }
+    }
+
+    /// Decode `history.json.bak`, or `nil` when there is nothing usable in it.
+    ///
+    /// An empty array counts as nothing usable: adopting it would let the app report "recovered 0
+    /// entries" as though something had been rescued, and this project's rule is never to claim an
+    /// outcome the code did not verify.
+    private func decodeBackup() -> [Transcript]? {
+        guard let data = try? Data(contentsOf: backupURL), !data.isEmpty,
+              let loaded = try? Self.decoder.decode([Transcript].self, from: data),
+              !loaded.isEmpty
+        else { return nil }
+        // Sorted the way any load sorts, and trimmed to `historyLimit` — which `load()` itself does
+        // *not* do. The asymmetry is deliberate rather than an oversight: this store is written
+        // straight back to disk a few lines below, so an untrimmed recovery would persist entries
+        // above the user's own limit that the very next `append` would then drop anyway.
+        let sorted = loaded.sorted { $0.createdAt > $1.createdAt }
+        let limit = max(1, limitProvider())
+        return sorted.count > limit ? Array(sorted.prefix(limit)) : sorted
+    }
+
+    /// Encode and write on the calling actor.
+    ///
+    /// Synchronous on purpose: `flushPendingSave()` runs from `applicationWillTerminate`, which
+    /// cannot await, and it is the only reason a dictation made in the last 500 ms reaches disk.
     public func save() throws {
         saveTask?.cancel()
         saveTask = nil
-        let data = try Self.encoder.encode(transcripts)
+        let data = try Self.makeEncoder().encode(transcripts)
         try AppPaths.writeAtomically(data, to: fileURL)
+        // Cleared only on the far side of a successful write. `lastFlushError` is surfaced long after
+        // it is set — there is no UI at termination — so leaving a stale one behind meant the first
+        // time the user ever saw it, it could describe a failure a later save had already fixed.
+        lastFlushError = nil
     }
 
     private func scheduleSave() {
@@ -489,17 +707,88 @@ public final class HistoryStore {
         saveTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled, let self else { return }
+
+            // Snapshot on the main actor, encode off it. `save()` re-encodes the *entire* store on
+            // every debounced write, and `Transcript.segments` are inlined — one imported file adds
+            // ~129 KB — so a few hundred retained imports turn this into a visible hitch on the actor
+            // that draws the window. Measured 6–8 ms at the user's real 450 KB store, which is why
+            // this is a shape fix rather than an urgent one.
+            //
+            // Capping the store by bytes to keep the encode small is the wrong fix and is not done
+            // here: it deletes entries the user's own `historyLimit` told the app to keep, which is
+            // the class of loss amendment 39 exists to prevent.
+            let snapshot = self.transcripts
+            let data: Data
+            do {
+                data = try await Self.encodeOffActor(snapshot)
+            } catch {
+                Log.data.error("History encode failed: \(error.localizedDescription, privacy: .public)")
+                // `saveTask` is deliberately left alone. Clearing it here — as this branch used to,
+                // with none of the cancellation care the write branch below takes — could disarm
+                // `flushPendingSave()` for a task this one no longer owns: a `save()` that arrived
+                // during the encode has already cancelled this task and installed its own state, and
+                // niling the field would tell the terminal flush there was nothing pending.
+                // Leaving it non-nil is also the safer failure on its own terms: the flush at quit
+                // then retries the encode synchronously instead of standing down.
+                return
+            }
+
+            // The write deliberately stays on the main actor, and `saveTask` deliberately stays
+            // non-nil across the await above. Both hold the same invariant: every write to
+            // `history.json` is issued from one actor in one order. Moving the write off too would
+            // let a `flushPendingSave()` arriving mid-encode run `writeAtomically` concurrently with
+            // this one, and `replaceItemAt` promises atomicity, not ordering — so the older snapshot
+            // could land last. That is amendment 39's failure (writing the wrong contents)
+            // reintroduced by a fix for latency nobody can perceive. Cancellation is the handshake:
+            // `save()` cancels this task before writing, and the guard below stands down for it.
+            guard !Task.isCancelled else { return }
             self.saveTask = nil
-            do { try self.save() } catch {
+            do {
+                try AppPaths.writeAtomically(data, to: self.fileURL)
+                // Same reason as in `save()`: a write that worked is the evidence that an earlier
+                // terminal-flush failure is no longer the current state of the disk.
+                self.lastFlushError = nil
+            } catch {
+                // Record it, and do NOT leave the flush disarmed. `saveTask` was cleared above, so
+                // `flushPendingSave()`'s `guard saveTask != nil` would stand down at quit and this
+                // transcript would never be retried — which is the policy the encode-failure branch
+                // above argues for in writing, so breaking it here would leave the file stating one
+                // rule in one branch and the opposite in the next. Re-arming costs one synchronous
+                // retry at quit; not re-arming costs the dictation.
+                self.lastFlushError = error.localizedDescription
+                self.saveTask = Task { @MainActor [weak self] in _ = self }
                 Log.data.error("History save failed: \(error.localizedDescription, privacy: .public)")
             }
         }
     }
 
+    /// Encode away from the main actor.
+    ///
+    /// `nonisolated` plus `Task.detached`: a plain `async` method on this class would inherit
+    /// `@MainActor` and run the encode exactly where it runs today. The array is passed by value and
+    /// `Transcript` is `Sendable`, so the encode cannot observe a half-mutated store.
+    nonisolated private static func encodeOffActor(_ transcripts: [Transcript]) async throws -> Data {
+        try await Task.detached(priority: .utility) {
+            try makeEncoder().encode(transcripts)
+        }.value
+    }
+
     /// Force any pending debounced write to disk now. Call before termination.
     public func flushPendingSave() {
         guard saveTask != nil else { return }
-        try? save()
+        // NOT `try?`. This runs from `applicationWillTerminate` — which is the only reason
+        // `NSSupportsSuddenTermination` is false — so it is the last chance the work of the previous
+        // 500 ms has to reach disk, and there is no UI left to report to. Swallowing the error here
+        // made a lost transcript invisible rather than merely lost; every other write path in
+        // this file logs its failures, so the bare `try?` was an inconsistency, not a policy.
+        do {
+            try save()
+        } catch {
+            lastFlushError = error.localizedDescription
+            Log.data.error(
+                "terminal transcript flush failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     public func append(_ transcript: Transcript) {

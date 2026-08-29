@@ -45,7 +45,34 @@ swiftc -O "$WORK/MakeIcon.swift" -o "$WORK/makeicon"
 "$WORK/makeicon" "$WORK/icon.png"
 
 SET="$WORK/AppIcon.iconset"; mkdir -p "$SET"
-# iconutil requires EXACTLY these ten names, or it dies with "Failed to generate ICNS."
+# These ten are the conventional full set, NOT a requirement — the comment that used to sit here
+# claimed iconutil "requires EXACTLY these ten names, or it dies", and that is false. Measured
+# against iconutil on macOS 26, from this script's own 1024 master:
+#   * Any subset converts. A directory holding only icon_512x512@2x.png produced a valid
+#     621,571-byte icns; a six-name set produced 772,115 bytes; a five-name @1x-only set, 181,996.
+#   * The numbers in the filename are ignored. iconutil matches the shape icon_<W>x<H>[@2x].png,
+#     then picks the icns slot from the file's REAL pixel dimensions and the presence of @2x —
+#     a 16 px image named icon_512x512.png landed in ic04 (16x16), a 512 px one named
+#     icon_16x16.png landed in ic09. So the numbers below document intent to a reader; the sips
+#     line above them is what actually decides where each rep goes.
+#   * Anything iconutil cannot place is dropped in silence — an unrecognised name (banana.png),
+#     or a recognised one whose pixels have no home for its family (@1x takes 16/32/128/256/512 px
+#     and @2x takes 32/64/256/512/1024, so a 64 px file with no @2x fits nowhere). Adding either
+#     to the ten produced a byte-identical icns.
+#   * "Failed to generate ICNS." therefore means NOTHING in the directory landed in a slot. That
+#     is the whole of the RECON incident: a quoting bug left one file literally named ".png", so
+#     the set was effectively empty. The ten names were never the point — an empty directory and a
+#     lone unplaceable file fail identically.
+#
+# The ten stay anyway, and the reason is not the false rule. Four of them are pure duplication
+# when every rep is scaled from one square master — ic13 comes out byte-identical to ic08 (34,082
+# bytes, same md5) and ic14 to ic09 (133,745) — so ~168 KB of the 976 KB icns is the same two PNGs
+# stored twice. Cutting them changes which rep the Dock and the Finder pick at each size, and
+# CONTRACTS amendment 40 forbids an agent screenshotting the running UI, so nobody but the user
+# could confirm the result. 168 KB of one developer's disk does not buy a rendering regression
+# that only the user can see. Note also that the obvious cut is wrong on its own terms: dropping
+# the "redundant" names takes icon_32x32@2x with them, and its 64 px rep duplicates nothing — it
+# is exactly what a 32 pt row needs on a Retina display.
 while read -r name px; do
   sips -z "$px" "$px" "$WORK/icon.png" --out "$SET/$name.png" >/dev/null
 done <<'SIZES'

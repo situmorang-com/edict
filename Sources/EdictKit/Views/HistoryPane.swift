@@ -66,6 +66,7 @@ struct HistoryPane: View {
     var body: some View {
         VStack(alignment: .leading, spacing: D.space.md) {
             controls
+            loadNotice
             table
             if let transcript = selected {
                 detail(for: transcript)
@@ -134,12 +135,6 @@ struct HistoryPane: View {
 
             Spacer(minLength: D.space.sm)
 
-            if model.history.lastLoadError != nil {
-                Text("history.json could not be read")
-                    .typeStyle(D.type.caption)
-                    .foregroundStyle(D.color.alert)
-            }
-
             // Two-stage rather than a system confirmation dialog: an `NSAlert` in the middle of a
             // machined panel is exactly the macOS chrome this app is built to avoid, and a key that
             // must be pressed twice is how a tape deck guards an erase.
@@ -165,6 +160,51 @@ struct HistoryPane: View {
             .help(armedClear
                   ? "Press again to erase every transcript."
                   : "Erases every transcript. Press twice.")
+        }
+    }
+
+    // MARK: The load notice
+
+    /// What actually happened to `history.json` at launch, in the store's own words.
+    ///
+    /// This replaces a hardcoded `Text("history.json could not be read")` shown whenever
+    /// `lastLoadError != nil`, which was wrong in both directions. After a **successful** recovery
+    /// `lastLoadError` is deliberately non-nil — it is the only channel carrying "Recovered N entries
+    /// from the backup" and the quarantine filename — so the pane told the user their history could
+    /// not be read while they were looking at the recovered log. And it discarded the message, so the
+    /// one pointer to where the user's bytes went existed only in the unified log: the unreachable
+    /// backup all over again, displaced by one step.
+    ///
+    /// `recoveredEntryCount` rather than a substring match on the message, so the wording is not
+    /// load-bearing. No line limit: the recovery and quarantine sentences are at the *end* of the
+    /// message, which is exactly what a truncating limit removes.
+    @ViewBuilder private var loadNotice: some View {
+        if let message = model.history.lastLoadError {
+            let recovered = model.history.recoveredEntryCount
+            PanelSurface(recovered == nil ? "Log file" : "Recovered") {
+                HStack(alignment: .top, spacing: D.space.md) {
+                    Text(message)
+                        .typeStyle(D.type.caption)
+                        // Red is for a load that produced nothing. A recovery is news, not a fault:
+                        // the log below it is real.
+                        .foregroundStyle(recovered == nil ? D.color.alert : D.color.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    // With a quarantine file now genuinely on disk, naming it without offering a way
+                    // to reach it would leave the user retyping a timestamped filename into a Finder
+                    // search. Absent when the move failed — there is nothing to reveal, and the
+                    // message says where the bytes actually are.
+                    if let quarantined = model.history.quarantinedFileURL {
+                        TapeButton("Reveal") {
+                            NSWorkspace.shared.activateFileViewerSelecting([quarantined])
+                        }
+                        .help("Shows \(quarantined.lastPathComponent) in the Finder.")
+                        .accessibilityLabel("Show the quarantined history file in the Finder")
+                    }
+                }
+            }
         }
     }
 

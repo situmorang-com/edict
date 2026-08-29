@@ -152,6 +152,13 @@ struct DictionaryStoreTests {
         #expect(throws: (any Error).self) { try store.load() }
         #expect(store.entries.count == seeded)
         #expect(store.lastLoadError != nil)
+        // The launch load now moves the unreadable bytes aside instead of leaving them for the next
+        // debounced save to replace. There is no `.bak` on this path — the seed was the first write —
+        // so there is nothing to recover from and the load still fails. See `StoreRecoveryTests` for
+        // the recovery case and for why the file *watcher's* reload deliberately does not do this.
+        let asideBytes = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("dictionary.unreadable-") }
+        #expect(asideBytes.count == 1)
     }
 
     // MARK: Mutation

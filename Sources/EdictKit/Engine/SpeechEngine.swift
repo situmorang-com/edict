@@ -95,27 +95,43 @@ public actor SpeechEngine: TranscriptionEngine {
     /// Whether the second language's assets are on disk. **Never used to fall back to the primary
     /// model** — see `beginSession`.
     private var secondaryAssetsReady = false
-    /// The one in-flight download of the secondary assets, so a user leaning on the shortcut cannot
-    /// start five of them.
-    private var secondaryDownload: Task<Void, Never>?
-    /// The `SpeechTranscriber` half of the same two facts. Resolved lazily, the first time a file
-    /// import asks for the general module — live dictation never touches it.
-    private var generalLocale: Locale?
-    private var generalFormat: AVAudioFormat?
-    /// Memoised answer to "which module serves this locale for an import". Keyed by the *requested*
-    /// identifier, because that is what the caller has; the resolved canonical form is stored in
-    /// `generalLocale`.
-    private var importModuleByLocale: [String: TranscriptionModule] = [:]
+    /// Asset downloads in flight, keyed by the framework's canonical identifier.
+    ///
+    /// **Keyed rather than one slot, because the languages downloading here are not one language.**
+    /// A single `secondaryDownload` slot was shared between the live secondary dictation language
+    /// and every import language, and all three consequences were real: a secondary-language press
+    /// during an import's download threw "the <secondary language> model is still downloading" —
+    /// about the wrong language, and it started no download for the language actually asked for;
+    /// `clearSecondary()` cancelled an import's download; and a third language's *successful*
+    /// download flipped `secondaryAssetsReady` for a model that is not on disk, which is the one
+    /// flag `requireSecondaryAssets()` may never be wrong about (it is what stops Indonesian speech
+    /// being handed to the English model and typed out as invented English names).
+    private var downloads: [String: Task<Void, Never>] = [:]
+    /// The terminal asset state of an *import* language, keyed by canonical identifier.
+    ///
+    /// Deliberately not `secondaryModelState`, which belongs to the live secondary dictation
+    /// language and is what the UI shows. This one exists so the second attempt at the same file
+    /// reports the real reason the model never arrived, instead of repeating "Downloading… Try this
+    /// file again in a moment." for ever with the error only in the log.
+    private var importModelStates: [String: ModelState] = [:]
     /// Resolved dual-pass import passes, keyed by the *requested* identifier.
     ///
-    /// Deliberately separate from `generalLocale` / `importModuleByLocale`, which serve the ordinary
-    /// single-pass import and hold exactly one general locale. A dual pass resolves **two** locales,
-    /// and if the second one happened to be another `SpeechTranscriber` language it would overwrite
-    /// the first's `generalLocale` and silently transcribe one of the two passes in the wrong
-    /// language — a failure with no symptom except a nonsense transcript.
+    /// A dual pass resolves **two** locales, and each carries its own module: `en-US` may resolve to
+    /// `SpeechTranscriber` while `id-ID` can only ever be `DictationTranscriber`. Keying by the
+    /// requested identifier is what stops one pass's resolution overwriting the other's and
+    /// silently transcribing a section in the wrong language — a failure with no symptom except a
+    /// nonsense transcript.
     private var importPasses: [String: ImportPass] = [:]
     private var importPassLocales: [String: Locale] = [:]
     private var importPassFormats: [String: AVAudioFormat] = [:]
+    /// Requested identifiers in least-recently-used order, oldest first.
+    ///
+    /// The memos above used to be permanent, and so were the reservations behind them: every import
+    /// language ever resolved held one of the five slots for the rest of the process (and, because
+    /// reservations persist across launches, beyond it). This is the eviction order — see
+    /// `pruneImportPasses(reserving:)`, which drops a memo and releases its reservation in the same
+    /// step so a memo can never outlive the reservation it depends on.
+    private var importPassOrder: [String] = []
     /// Staged for the *next* utterance. RECON §2: `setContext` mid-stream is a silent no-op, so context can only
     /// be handed to `SpeechAnalyzer.init(analysisContext:)`. Read the dictionary at key-down.
     private var biasingStrings: [String] = []
@@ -240,18 +256,83 @@ public actor SpeechEngine: TranscriptionEngine {
     /// every future launch of the app.
     public func clearSecondary() async {
         guard let locale = secondaryLocale else { return }
-        secondaryDownload?.cancel()
-        secondaryDownload = nil
+        // This language's download only. Cancelling whatever happened to be in a single shared slot
+        // is how turning the language shortcut off used to kill an import's model download for an
+        // unrelated language.
+        downloads.removeValue(forKey: locale.identifier)?.cancel()
         secondaryLocale = nil
         secondaryFormat = nil
         secondaryAssetsReady = false
         secondaryModelState = .unavailable("not prepared")
 
+        // Not released if an import still needs this exact language — the user who dictates in
+        // Indonesian is also the user who imports Indonesian files, and dropping the reservation
+        // under a memoised `.ready` import pass would leave the memo pointing at an unreserved
+        // module (RECON §6: "will be an error in a future release").
+        guard !keepSet().contains(locale.identifier) else {
+            Log.stt.info("""
+                kept \(locale.identifier, privacy: .public) reserved: an import pass still needs it
+                """)
+            return
+        }
         for reserved in await AssetInventory.reservedLocales
         where reserved.identifier == locale.identifier {
             let released = await AssetInventory.release(reservedLocale: reserved)
             Log.stt.info("released \(reserved.identifier, privacy: .public): \(released, privacy: .public)")
         }
+    }
+
+    /// Every reservation Edict currently depends on, by canonical identifier.
+    ///
+    /// One function rather than three copies, because the copies drifted and the drift was the bug:
+    /// `pruneReservations` and `reserve`'s eviction ladder both listed `generalLocale` — which is
+    /// always nil in production, so it spared nothing — and both omitted the import pass locales,
+    /// which are the ones genuinely in use. An import of a French file followed by a touch of the
+    /// language picker was therefore enough to release the reservation behind a memoised pass, and
+    /// on a machine importing while dictating it could release the language the user was speaking.
+    ///
+    /// Split into this reader and the pure `static` below for the reason the last round paid for:
+    /// every test that could see the keep set at all was in the gated reservation suite, which
+    /// cannot run on this machine — so a one-line body returning only the two dictation locales
+    /// shipped green underneath a ten-line comment promising the import passes. The static takes its
+    /// four inputs as values and touches no framework, so `KeepSetTests` pins the contents on every
+    /// machine, every run.
+    ///
+    /// `importPassLocales`, not `importPasses`: the memo is keyed by the identifier the CALLER asked
+    /// for ("en-GB"), while the reservation is held under the canonical one the framework handed back
+    /// ("en_GB"), and `AssetInventory.release` matches on the raw string (RECON §6). Keying the sweep
+    /// off the request would spare nothing and release everything.
+    private func keepSet() -> Set<String> {
+        Self.keepSet(
+            canonical: canonicalLocale?.identifier,
+            secondary: secondaryLocale?.identifier,
+            importPassLocales: importPassLocales.values.map(\.identifier),
+            downloading: Array(downloads.keys)
+        )
+    }
+
+    /// The keep set as a value: the two dictation languages, every resolved import pass's locale, and
+    /// every language whose model is downloading.
+    ///
+    /// Every argument is a **canonical** identifier — the underscored form the framework stores and
+    /// the only form `release(reservedLocale:)` will match (RECON §6).
+    ///
+    /// In-flight downloads are kept as well: releasing the slot under a running
+    /// `downloadAndInstall()` is not a case anything has measured, and the cost of being wrong is a
+    /// model that never arrives.
+    ///
+    /// An empty result is legitimate and load-bearing — it is how `pruneReservations` recognises "no
+    /// language is prepared yet" and releases nothing rather than everything.
+    static func keepSet(
+        canonical: String?,
+        secondary: String?,
+        importPassLocales: [String],
+        downloading: [String]
+    ) -> Set<String> {
+        var keep = Set([canonical, secondary].compactMap { $0 })
+        keep.formUnion(importPassLocales)
+        keep.formUnion(downloading)
+        return keep
     }
 
     /// The reservation state as the framework sees it, for the launch log and for diagnostics.
@@ -277,11 +358,7 @@ public actor SpeechEngine: TranscriptionEngine {
     /// - Returns: the identifiers that were released.
     @discardableResult
     public func pruneReservations() async -> [String] {
-        let keep = Set([
-            canonicalLocale?.identifier,
-            secondaryLocale?.identifier,
-            generalLocale?.identifier,
-        ].compactMap { $0 })
+        let keep = keepSet()
         // Never run this before anything is prepared: an empty keep set would release the primary.
         guard !keep.isEmpty else { return [] }
 
@@ -337,18 +414,17 @@ public actor SpeechEngine: TranscriptionEngine {
             // `false` means "already reserved" and is not an error.
             _ = try await AssetInventory.reserve(locale: canonical)
         } catch {
-            // SFSpeechErrorDomain Code=11 "Too many allocated locales, 5 maximum". Evict everything else and
-            // retry. `generalLocale` is spared as well as the one being reserved, because evicting the
-            // import model's slot here would silently demote every later import back to the dictation
-            // module — and `secondaryLocale` too, because evicting *that* is how the language shortcut
-            // would start throwing halfway through a session for no reason the user could see.
+            // SFSpeechErrorDomain Code=11 "Too many allocated locales, 5 maximum". Evict everything
+            // outside `keepSet()` and retry. Everything Edict is actually using is spared: the two
+            // dictation languages, because evicting `secondaryLocale` is how the language shortcut
+            // would start throwing halfway through a session for no reason the user could see, and
+            // the resolved import pass locales, because evicting one of those releases the slot
+            // under a memo that still says `.ready`. If all five are in the keep set this now
+            // throws rather than evicting something in use — which is the honest outcome, and the
+            // reason `resolveImportPass` prunes *before* it asks for a sixth.
             Log.stt.warning("reserve(\(canonical.identifier, privacy: .public)) failed, evicting: \(Self.describe(error), privacy: .public)")
-            let keep = Set([
-                canonical.identifier,
-                canonicalLocale?.identifier,
-                secondaryLocale?.identifier,
-                generalLocale?.identifier,
-            ].compactMap { $0 })
+            var keep = keepSet()
+            keep.insert(canonical.identifier)
             for stale in await AssetInventory.reservedLocales where !keep.contains(stale.identifier) {
                 _ = await AssetInventory.release(reservedLocale: stale)
             }
@@ -415,25 +491,20 @@ public actor SpeechEngine: TranscriptionEngine {
     /// The same question for a named module. The two modules are asked separately rather than
     /// assumed identical: `availableCompatibleAudioFormats` is a property of the module, and the
     /// import path must convert to whatever the module it is actually going to use accepts.
+    /// Only `.dictation` has an engine-wide prepared locale, so `.general` answers `nil` here.
+    /// A general-module session always arrives through a resolved `ImportPass`, which carries its
+    /// own locale and is asked through `bestAudioFormat(for pass:)`. There used to be a single
+    /// app-wide `generalLocale` beside it; it was written by one method that nothing called, so in
+    /// production it was permanently nil and this branch permanently returned nil anyway.
     public func bestAudioFormat(for module: TranscriptionModule) async -> AVAudioFormat? {
-        switch module {
-        case .dictation:
-            if let cachedFormat { return cachedFormat }
-            guard let locale = canonicalLocale else { return nil }
-            let format = await SpeechAnalyzer.bestAvailableAudioFormat(
-                compatibleWith: [Self.build(module: .dictation, locale: locale).module]
-            )
-            cachedFormat = format
-            return format
-        case .general:
-            if let generalFormat { return generalFormat }
-            guard let locale = generalLocale else { return nil }
-            let format = await SpeechAnalyzer.bestAvailableAudioFormat(
-                compatibleWith: [Self.build(module: .general, locale: locale).module]
-            )
-            generalFormat = format
-            return format
-        }
+        guard module == .dictation else { return nil }
+        if let cachedFormat { return cachedFormat }
+        guard let locale = canonicalLocale else { return nil }
+        let format = await SpeechAnalyzer.bestAvailableAudioFormat(
+            compatibleWith: [Self.build(module: .dictation, locale: locale).module]
+        )
+        cachedFormat = format
+        return format
     }
 
     // MARK: - Biasing
@@ -507,6 +578,14 @@ public actor SpeechEngine: TranscriptionEngine {
         // building a session.
         let serial = try await claimSlot(module: module, locale: which)
 
+        // Hoisted above the `do` for one reason: `SpeechAnalyzer(inputSequence:…)` **starts
+        // analysing at init** — the app never calls `start()` anywhere, which is why the analyzer is
+        // per-utterance — so between that initializer and the `SpeechSession` that owns its teardown
+        // there is a window where a throw would drop a *running* analyzer, its results task and a
+        // `modelRetention: .processLifetime` model on the floor with nobody left holding a reference
+        // to finish them. `prepareToAnalyze(in:)` is the throw that reaches it.
+        var halfBuilt: (AsyncStream<AnalyzerInput>.Continuation, SpeechAnalyzer)?
+
         do {
             // An explicitly-resolved locale has already been reserved and asset-checked by
             // `resolveImportPass`, so the secondary-asset gate below does not apply to it.
@@ -514,7 +593,11 @@ public actor SpeechEngine: TranscriptionEngine {
             if secondary { try await requireSecondaryAssets() }
 
             let prepared: Locale? = switch (module, which) {
-            case (.general, _): generalLocale
+            // The general module has no engine-wide prepared locale: it is reachable only through a
+            // resolved `ImportPass`, which supplies `explicitLocale`. Without one this throws
+            // `.notPrepared`, which is the right answer rather than a fallback — see
+            // `resolveImportPass` for why substituting a language is never allowed here.
+            case (.general, _): nil
             case (.dictation, .primary): canonicalLocale
             case (.dictation, .secondary): secondaryLocale
             }
@@ -546,6 +629,7 @@ public actor SpeechEngine: TranscriptionEngine {
                 options: SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .processLifetime),
                 analysisContext: context
             )
+            halfBuilt = (continuation, analyzer)
             try await analyzer.prepareToAnalyze(in: format)
             // Only the primary counts as warm: `warmUp()` loads the primary model, and letting a
             // secondary utterance set this flag would mean the *English* model stays cold until the
@@ -578,6 +662,9 @@ public actor SpeechEngine: TranscriptionEngine {
                 }
             )
             activeSession = session
+            // From here the session owns the teardown, so the catch below must not do it as well:
+            // `abort()` would be called on an analyzer the caller is about to drive.
+            halfBuilt = nil
             Log.stt.debug("""
                 slot #\(serial, privacy: .public) session built \
                 module=\(module.rawValue, privacy: .public) \
@@ -589,9 +676,69 @@ public actor SpeechEngine: TranscriptionEngine {
             // Anything above can throw — a missing secondary asset, a locale that is not prepared,
             // `prepareToAnalyze`. The claim was taken before all of it, so it has to be handed back
             // here or the next press inherits a slot nobody is using.
-            releaseSlot(serial: serial, reason: "begin failed: \(Self.describe(error))")
+            let why = "begin failed: \(Self.describe(error))"
+            guard let (continuation, analyzer) = halfBuilt else {
+                // Nothing was built, so there is nothing to tear down and no await to get in the
+                // way: hand the slot straight back.
+                releaseSlot(serial: serial, reason: why)
+                throw error
+            }
+
+            Log.stt.warning("""
+                slot #\(serial, privacy: .public) tearing down a half-built analyzer: \
+                \(Self.describe(error), privacy: .public)
+                """)
+            // Finishing the input stream comes first, in the order `SpeechSession.abort()` uses and
+            // RECON §5 verified. The order is not cosmetic — finishing the stream is what keeps the
+            // cancellation below off RECON §3's `finalize(through:)` deadlock, which blocks for ever
+            // while the stream is still open — and it is synchronous, so it costs the slot nothing.
+            continuation.finish()
+            // The remaining half of the teardown is an `await`, and the slot goes back *before* it.
+            // See `abandonHalfBuilt` for what that buys and what it costs.
+            await abandonHalfBuilt(serial: serial, reason: why) {
+                // `cancelAndFinishNow` discards the pending final, which is exactly right here:
+                // this utterance has already failed and there is nothing to salvage from it.
+                await analyzer.cancelAndFinishNow()
+            }
             throw error
         }
+    }
+
+    /// Hand the analyzer slot back, and only *then* await the teardown of a half-built analyzer.
+    ///
+    /// The order is the entire content of this function, which is why it is a function rather than
+    /// two lines at the call site. `SpeechAnalyzer(inputSequence:…)` starts analysing at init, so a
+    /// throw from `prepareToAnalyze(in:)` leaves a *running* analyzer that has to be finished — and
+    /// `cancelAndFinishNow()` on an analyzer whose `prepareToAnalyze` has just thrown is a state
+    /// nothing on this machine has measured. If it never returned while the slot was still held,
+    /// `slotHolder` would stay set with `activeSession` still nil, and `claimSlot`'s stale-holder
+    /// reclaim requires a **non-nil** `activeSession` — so it could never fire, and every later
+    /// press would fail with `.sessionAlreadyRunning` for the rest of the process.
+    ///
+    /// Releasing first costs two things, both smaller than that:
+    ///
+    /// * A following press can claim the slot and build its own analyzer while this doomed one is
+    ///   still cancelling, so two analyzers can be alive for that moment. RECON §3 forbids
+    ///   *reusing* an analyzer, not having two, and the doomed one is fed nothing — its stream is
+    ///   already finished — and is reachable from nowhere.
+    /// * `beginSession` itself can still hang inside the teardown, which loses the one press that
+    ///   failed. That is a bounded loss where the alternative was the whole process.
+    ///
+    /// Amendment 33 is untouched: the claim is still taken before any `await` in `beginSession`.
+    ///
+    /// `teardown` is a parameter rather than the `cancelAndFinishNow()` call itself so that the
+    /// ordering has a test. Nothing can reach this path from a test as the code stands —
+    /// `beginSession` is private and every public entry point derives the format from the module
+    /// itself, so nothing can hand `prepareToAnalyze(in:)` something it would reject — and a real
+    /// analyzer cannot be made to hang on demand either. A stand-in teardown is the only observable
+    /// surface this ordering has.
+    func abandonHalfBuilt(
+        serial: UInt64,
+        reason: String,
+        teardown: @Sendable () async -> Void
+    ) async {
+        releaseSlot(serial: serial, reason: reason)
+        await teardown()
     }
 
     // MARK: - The analyzer slot
@@ -602,7 +749,11 @@ public actor SpeechEngine: TranscriptionEngine {
     /// the holder is still there after `slotWaitCeiling` — which, with `releaseSlot` wired to the
     /// session's terminal transition, means a genuinely stuck analyzer rather than the ordinary
     /// press-pause-press rhythm.
-    private func claimSlot(module: TranscriptionModule, locale which: UtteranceLocale) async throws -> UInt64 {
+    ///
+    /// `internal` rather than `private` for one reason: `abandonHalfBuilt`'s ordering can only be
+    /// observed by a test that holds a real claim, and this is the only way to take one without a
+    /// real analyzer and a real model on disk.
+    func claimSlot(module: TranscriptionModule, locale which: UtteranceLocale) async throws -> UInt64 {
         // A holder whose session has already terminated is a bug in whatever tore it down, not a
         // race, and making the user press twice for it is the exact symptom this whole change is
         // about. Reclaim, and log it as the distinct third case: *failed to clear*.
@@ -716,9 +867,11 @@ public actor SpeechEngine: TranscriptionEngine {
         }
         if secondaryAssetsReady { return }
 
-        // A download is already running from an earlier press. Do not await it — the user is holding a
-        // key right now and a 31 s stall inside an utterance is its own failure.
-        if let secondaryDownload, !secondaryDownload.isCancelled {
+        // A download of *this* language is already running from an earlier press. Do not await it —
+        // the user is holding a key right now and a 31 s stall inside an utterance is its own
+        // failure. Keyed by identifier, so an import downloading a third language no longer makes
+        // this sentence appear about a language nobody asked for.
+        if let running = downloads[locale.identifier], !running.isCancelled {
             throw SpeechEngineError.assetInstallFailed(
                 "The \(Self.languageName(locale)) speech model is still downloading. Try again in a moment."
             )
@@ -746,29 +899,65 @@ public actor SpeechEngine: TranscriptionEngine {
         }
 
         secondaryModelState = .downloading(0)
-        secondaryDownload = Task { [weak self] in
-            do {
-                try await request.downloadAndInstall()
-                await self?.secondaryDownloadFinished(error: nil)
-            } catch {
-                await self?.secondaryDownloadFinished(error: error)
-            }
-        }
+        startDownload(request, for: locale)
         throw SpeechEngineError.assetInstallFailed(
             "Downloading the \(Self.languageName(locale)) speech model. Try again in a moment."
         )
     }
 
-    private func secondaryDownloadFinished(error: Error?) {
-        secondaryDownload = nil
+    /// Park one `downloadAndInstall()` under its own language's key.
+    private func startDownload(_ request: AssetInstallationRequest, for locale: Locale) {
+        let identifier = locale.identifier
+        downloads[identifier] = Task { [weak self] in
+            do {
+                try await request.downloadAndInstall()
+                await self?.downloadFinished(identifier: identifier, error: nil)
+            } catch {
+                await self?.downloadFinished(identifier: identifier, error: error)
+            }
+        }
+    }
+
+    /// Record the outcome of one download **against the language it was for**.
+    ///
+    /// The identifier parameter is the whole point. This used to take only an error and write
+    /// `secondaryAssetsReady = true` unconditionally, so on a machine where the secondary dictation
+    /// language is not installed, an import's successful download of a *third* language reported the
+    /// secondary language as ready — and `requireSecondaryAssets()`, whose own comment calls itself
+    /// "the one place where falling back would be indefensible", then let an utterance run against a
+    /// model that is not on disk.
+    ///
+    /// `internal`, not `private`, and for the reason the audit gave: there is no seam for faking a
+    /// `downloadAndInstall()`, so the only way to test which language a completion is applied to is
+    /// to call this directly. `EngineRecoveryTests` does.
+    func downloadFinished(identifier: String, error: Error?) {
+        downloads[identifier] = nil
+        // Which language actually finished. This was hardcoded `true` while the surrounding branches
+        // were being written, which made every `else` unreachable and — far worse — made ANY
+        // completed import download mark the live secondary language as ready: a French import
+        // finishing would let the next Shift-Right-Option build an Indonesian analyzer against a
+        // model that is not on disk, past the one gate (`requireSecondaryAssets`) whose comment says
+        // falling back there would be indefensible.
+        let isSecondary = identifier == secondaryLocale?.identifier
         if let error {
-            secondaryAssetsReady = false
-            secondaryModelState = .unavailable(Self.describe(error))
-            Log.stt.error("secondary asset install failed: \(Self.describe(error), privacy: .public)")
+            let why = Self.describe(error)
+            if isSecondary {
+                secondaryAssetsReady = false
+                secondaryModelState = .unavailable(why)
+            } else {
+                importModelStates[identifier] = .unavailable(why)
+            }
+            Log.stt.error("""
+                asset install failed for \(identifier, privacy: .public): \(why, privacy: .public)
+                """)
         } else {
-            secondaryAssetsReady = true
-            secondaryModelState = .ready
-            Log.stt.info("secondary assets installed")
+            if isSecondary {
+                secondaryAssetsReady = true
+                secondaryModelState = .ready
+            } else {
+                importModelStates[identifier] = .ready
+            }
+            Log.stt.info("assets installed for \(identifier, privacy: .public)")
         }
     }
 
@@ -895,8 +1084,9 @@ public actor SpeechEngine: TranscriptionEngine {
     /// So imports use `SpeechTranscriber` — **but only where it can.** It covers 45 locales against
     /// `DictationTranscriber`'s 54, and Indonesian is in the gap:
     /// `SpeechTranscriber.supportedLocale(equivalentTo: id-ID)` returns nil, while the dictation
-    /// module transcribed an 18.8 s Indonesian clip word-perfect at 34.5x realtime. `resolveImportModule`
-    /// therefore falls back rather than refusing the file. One measured wrinkle worth knowing: on
+    /// module transcribed an 18.8 s Indonesian clip word-perfect at 34.5x realtime.
+    /// `resolveImportPass` therefore falls back to the dictation module for those 9 languages rather
+    /// than refusing the file. One measured wrinkle worth knowing: on
     /// `id_ID` the dictation module returned time ranges on all 38 runs but confidence on **none** of
     /// them, so the low-confidence dictionary suggestions are silently empty for Indonesian while the
     /// subtitle export still works.
@@ -951,56 +1141,144 @@ public actor SpeechEngine: TranscriptionEngine {
         build(module: .dictation, locale: locale).module
     }
 
-    // MARK: - Import module selection
-
-    /// Decide which module a file import should use, and prepare it.
+    /// Whether the assets for the module Edict would *actually build* for this locale are on disk.
     ///
-    /// Never throws and never refuses: the worst case is falling back to `.dictation`, which
-    /// `prepare(localeIdentifier:)` has already reserved and warmed. Three things send it back to
-    /// `.dictation`:
+    /// `internal`, and for a reason the last round paid for: a test has to be able to decide "skip"
+    /// **before** it asks `resolveImportPass` for a language, because `resolveImportPass` answers a
+    /// missing model by calling `downloadAndInstall()` from a detached task — minutes of the user's
+    /// bandwidth, begun before the `try #require` on the next line of the test can fire. Measured
+    /// while writing this: the *dictation* models for `en-GB`, `en-AU` and `en-CA` are all missing on
+    /// this machine, so for the three locales the gated reservation suite uses, the general-module
+    /// asset check is the only thing standing between that suite and a real download.
     ///
-    /// 1. The user turned the preference off.
-    /// 2. `SpeechTranscriber` does not support the locale (`id-ID`).
-    /// 3. `SpeechTranscriber` supports it but its assets are **not installed**. Downloading them
-    ///    inside an import would stall a queue the user is watching for an unbounded time, so the
-    ///    file is transcribed now with the model that is already on disk and the choice is logged.
-    public func resolveImportModule(
-        preferGeneral: Bool,
-        localeIdentifier: String
-    ) async -> TranscriptionModule {
-        guard preferGeneral else { return .dictation }
-        if let cached = importModuleByLocale[localeIdentifier] { return cached }
-
-        func remember(_ module: TranscriptionModule, _ why: String) -> TranscriptionModule {
-            importModuleByLocale[localeIdentifier] = module
-            Log.stt.info(
-                """
-                import module for \(localeIdentifier, privacy: .public):                 \(module.rawValue, privacy: .public) — \(why, privacy: .public)
-                """
-            )
-            return module
-        }
-
-        guard let canonical = await SpeechTranscriber.supportedLocale(
-            equivalentTo: Locale(identifier: localeIdentifier)
-        ) else {
-            return remember(.dictation, "the transcription model does not support this locale")
-        }
-
+    /// It goes through `build` rather than constructing a probe of its own because a hand-rolled
+    /// probe lies. RECON's second `AssetInventory` trap: installed state depends on
+    /// `attributeOptions`, and `fr-FR` on the general module reads **installed** with `[]` and
+    /// **missing** with the `[.transcriptionConfidence, .audioTimeRange]` this app always requests.
+    /// Only a module built with the real options can answer this question.
+    ///
+    /// **Asking is not free.** RECON §6 measured `assetInstallationRequest(supporting:)` reserving
+    /// the locale it is asked about as a side effect — that is what silently consumed a `ja-JP` slot
+    /// during probing — so a caller must prune afterwards. And "cannot tell" answers `false`: for a
+    /// skip decision an unanswerable check and a missing model belong on the same branch, and the
+    /// branch that does less is the safe one.
+    static func assetsInstalled(module: TranscriptionModule, locale: Locale) async -> Bool {
         do {
-            let probe = Self.build(module: .general, locale: canonical).module
-            // Reserved *before* the status check, exactly as RECON §6 requires: unreserved-but-installed
-            // locales report `.supported`, so gating on status would trigger a pointless download.
-            _ = try await reserve(canonical)
-            if try await AssetInventory.assetInstallationRequest(supporting: [probe]) != nil {
-                return remember(.dictation, "the transcription model's assets are not installed")
-            }
-            generalLocale = canonical
-            generalFormat = nil
-            return remember(.general, "measured 4.2 % word error against 10.1 % on this machine")
+            let probe = build(module: module, locale: locale).module
+            return try await AssetInventory.assetInstallationRequest(supporting: [probe]) == nil
         } catch {
-            return remember(.dictation, "the transcription model could not be prepared: \(Self.describe(error))")
+            Log.stt.warning("""
+                assets for \(locale.identifier, privacy: .public) on \
+                \(module.rawValue, privacy: .public) could not be checked: \
+                \(Self.describe(error), privacy: .public)
+                """)
+            return false
         }
+    }
+
+    // MARK: - Import reservations
+
+    /// macOS allows five concurrent locale reservations, they **persist across process launches**
+    /// keyed by bundle identifier, and the sixth throws `SFSpeechErrorDomain` Code=11 (RECON §6).
+    private static let reservationSlots = 5
+
+    /// How many import languages may hold a reservation at once, the one being resolved included.
+    ///
+    /// One slot beyond the dictation languages is deliberately left unused, and it is not slack:
+    ///
+    /// * RECON §6 measured `assetInstallationRequest(supporting:)` **reserving the locale it is asked
+    ///   about as a side effect** — that is what silently consumed a `ja-JP` slot during probing — so
+    ///   the availability check for a new language needs a free slot before Edict asks for one.
+    /// * A dictation language change re-reserves through `prepare` / `prepareSecondary`, and with all
+    ///   five slots inside the keep set the Code=11 eviction ladder has nothing it is allowed to
+    ///   evict and the language change fails outright.
+    ///
+    /// With both dictation languages prepared this comes out at 2, which is exactly what a dual-pass
+    /// import needs: pass A is resolved and kept, then pass B's resolution prunes to one, keeps A —
+    /// the most recent — and takes a slot for itself.
+    private var importReservationBudget: Int {
+        let live = (canonicalLocale == nil ? 0 : 1) + (secondaryLocale == nil ? 0 : 1)
+        return max(1, Self.reservationSlots - live - 1)
+    }
+
+    /// Drop the least-recently-used import passes, and release the reservations behind them.
+    ///
+    /// Called at the top of `resolveImportPass` for every language it has to resolve, rather than
+    /// only after a failure. Nothing used to prune these at all: every import language ever resolved
+    /// held a slot for the life of the process and beyond, so a fourth language met a Code=11 whose
+    /// eviction ladder had nothing evictable left.
+    ///
+    /// The memo and the reservation are dropped in the same step, in that order, because the
+    /// dangerous state is a memoised `.ready` pass on an unreserved locale — the framework logs
+    /// "Cannot use modules with unallocated locales … This will be an error in a future release!"
+    /// and today still transcribes (RECON §6), which is precisely why nothing would notice.
+    ///
+    /// Called only from `resolveImportPass`, which the import path calls between items and never
+    /// while a `DualPassImporter` is mid-file. That is what makes it safe for
+    /// `transcribe(input:pass:)` to look its locale up by identifier: a pass in use cannot have its
+    /// memo pulled out from under it, and both of a dual pass's languages fit inside the budget.
+    private func pruneImportPasses(reserving requested: String) async {
+        // Room for the one about to be taken: `requested` is never already in the order here, because
+        // a memoised language returns from `resolveImportPass` before this is called.
+        let dropped = Self.memosToEvict(
+            order: importPassOrder,
+            budget: max(0, importReservationBudget - 1)
+        )
+        for identifier in dropped {
+            importPasses[identifier] = nil
+            importPassLocales[identifier] = nil
+            importPassFormats[identifier] = nil
+        }
+        importPassOrder.removeFirst(dropped.count)
+
+        // Then release anything the framework still holds that Edict no longer depends on. This is a
+        // release-what-is-not-kept pass rather than a release-what-was-evicted one on purpose: the
+        // general-module availability check reserves a locale it may then decline to use, so slots
+        // exist that were never memoised by anything and only a keep-set sweep can see them.
+        let keep = keepSet()
+        guard !keep.isEmpty else { return }
+        var released: [String] = []
+        for reserved in await AssetInventory.reservedLocales where !keep.contains(reserved.identifier) {
+            // Only ever a `Locale` taken straight from `reservedLocales` — RECON §6: `release`
+            // matches on the raw identifier string, so a rebuilt `Locale(identifier: "id-ID")`
+            // returns false against a stored `"id_ID"` and leaks the slot for every future launch.
+            if await AssetInventory.release(reservedLocale: reserved) {
+                released.append(reserved.identifier)
+            } else {
+                Log.stt.error("release(\(reserved.identifier, privacy: .public)) refused")
+            }
+        }
+        if !released.isEmpty {
+            Log.stt.notice("""
+                import pass \(requested, privacy: .public): released \
+                \(released.joined(separator: ","), privacy: .public)
+                """)
+        }
+    }
+
+    /// Which memos must go for `order` to fit in `budget`, least recently used first.
+    ///
+    /// A value-returning function rather than an `if` wrapped around the eviction loop, because that
+    /// `if` is what shipped as `if false, importPassOrder.count > budget {` — a literal `false`
+    /// swiftc accepts in silence, dead-coding the whole eviction while the only tests that could see
+    /// it sat in the gated suite that cannot run here. There is no branch left at the call site to
+    /// disable, and what replaced it is pinned by `KeepSetTests`: that an order which fits loses
+    /// nothing, and that the ones dropped are the **oldest**, since evicting the newest would release
+    /// the language the caller is resolving right now.
+    ///
+    /// The `guard` is belt-and-braces rather than the boundary — `prefix(0)` is already empty when
+    /// the order exactly fills the budget — but it keeps `order.count - budget` from ever being
+    /// negative, which `prefix(_:)` traps on rather than clamping.
+    static func memosToEvict(order: [String], budget: Int) -> [String] {
+        guard order.count > budget else { return [] }
+        return Array(order.prefix(order.count - budget))
+    }
+
+    /// Move a requested identifier to the most-recently-used end of the eviction order.
+    private func touchImportPass(_ identifier: String) {
+        guard importPassOrder.last != identifier else { return }
+        importPassOrder.removeAll { $0 == identifier }
+        importPassOrder.append(identifier)
     }
 
     // MARK: - Dual-pass import passes
@@ -1008,24 +1286,32 @@ public actor SpeechEngine: TranscriptionEngine {
     /// Resolve, reserve and asset-check one language for a file import.
     ///
     /// Memoised by requested identifier, so the dual pass asks twice per file and pays for it once
-    /// per language per app run. The module choice is the same trade `resolveImportModule` makes and
-    /// for the same measured reason — `SpeechTranscriber` halves the word error and runs 4.4x faster
-    /// on a whole file — except that here it is asked *per language* rather than once for the app.
+    /// per language — up to `importReservationBudget` languages at a time, after which the
+    /// least-recently-used one is dropped and re-resolved if it comes back. The module choice is the
+    /// measured one: `SpeechTranscriber` halves the word error and runs 4.4x faster on a whole file,
+    /// asked *per language* rather than once for the app.
     ///
-    /// Unlike `resolveImportModule` this can come back `.unavailable`, and must be allowed to.
-    /// `resolveImportModule` can always fall back to the dictation module because it is choosing
-    /// between two models of the *same* language; here the choice is between languages, and there is
-    /// no substitute for a language whose model is not on the disk. A missing model kicks off its own
-    /// download and says so, exactly as the live secondary-language path does.
+    /// This can come back `.unavailable`, and must be allowed to. A fallback between the two
+    /// *modules* of one language is always safe; a fallback to a different **language** never is,
+    /// because transcribing Indonesian with the English model does not fail — it returns fluent
+    /// English nonsense. A missing model kicks off its own download and says so, exactly as the live
+    /// secondary-language path does.
     public func resolveImportPass(
         preferGeneral: Bool,
         localeIdentifier: String
     ) async -> ImportPassResolution {
-        if let cached = importPasses[localeIdentifier] { return .ready(cached) }
+        if let cached = importPasses[localeIdentifier] {
+            // Touched on the cheap path too, or the language a queue is actually running would age
+            // out of the eviction order while it was still in use.
+            touchImportPass(localeIdentifier)
+            return .ready(cached)
+        }
+        await pruneImportPasses(reserving: localeIdentifier)
 
         func remember(_ pass: ImportPass, _ locale: Locale, _ why: String) -> ImportPassResolution {
             importPasses[localeIdentifier] = pass
             importPassLocales[localeIdentifier] = locale
+            touchImportPass(localeIdentifier)
             Log.stt.info("""
                 import pass \(localeIdentifier, privacy: .public): \
                 \(pass.module.rawValue, privacy: .public) \(locale.identifier, privacy: .public) \
@@ -1044,6 +1330,10 @@ public actor SpeechEngine: TranscriptionEngine {
             do {
                 try await reserve(canonical)
                 let probe = Self.build(module: .general, locale: canonical).module
+                // Falling through from here leaves this reservation held with no memo behind it —
+                // usually harmless, because the dictation branch below reserves the same identifier
+                // for the same language, and otherwise released by the next resolution's prune,
+                // which sweeps everything outside the keep set rather than only what it evicted.
                 if try await AssetInventory.assetInstallationRequest(supporting: [probe]) == nil {
                     return remember(
                         ImportPass(
@@ -1105,17 +1395,25 @@ public actor SpeechEngine: TranscriptionEngine {
             )
         }
 
+        // A previous attempt's download has already finished, and failed. Report *that* rather than
+        // the download sentence again: repeating "Try this file again in a moment" for ever, with the
+        // real reason only in the log, is what this language's own state exists to prevent. Cleared
+        // as it is read, so the attempt after this one starts a fresh download — the usual cause is
+        // the network, and "try again" has to mean something.
+        if case .unavailable(let why) = importModelStates[canonical.identifier] {
+            importModelStates[canonical.identifier] = nil
+            return .unavailable(
+                "The \(Self.languageName(canonical)) speech model could not be installed: \(why)"
+            )
+        }
+
         // Not awaited: the caller has a queue on screen and a model download is minutes, not
-        // milliseconds. Start it, say so, and let the next import find it installed.
-        if secondaryDownload == nil {
-            secondaryDownload = Task { [weak self] in
-                do {
-                    try await request.downloadAndInstall()
-                    await self?.secondaryDownloadFinished(error: nil)
-                } catch {
-                    await self?.secondaryDownloadFinished(error: error)
-                }
-            }
+        // milliseconds. Start it, say so, and let the next import find it installed. Keyed by this
+        // language, so a second import language downloads alongside the first instead of being
+        // silently skipped because one shared slot was occupied — and so finishing it can never
+        // report the *secondary dictation* language as installed.
+        if downloads[canonical.identifier] == nil {
+            startDownload(request, for: canonical)
         }
         return .unavailable(
             "Downloading the \(Self.languageName(canonical)) speech model. Try this file again in a moment."
@@ -1167,6 +1465,82 @@ public actor SpeechEngine: TranscriptionEngine {
             throw CancellationError()
         }
         return try await session.finishAndCommit()
+    }
+
+    // MARK: - Waiting out a live dictation
+
+    /// How long to wait before asking for the analyzer slot again, and how many times.
+    ///
+    /// 10 s in total, which is the ladder `ImportQueue` arrived at for the same reason: a file
+    /// landing while the user is mid-dictation is refused with `.sessionAlreadyRunning` and resolves
+    /// itself in a second or two, so failing the file for it would be a bad answer to a temporary
+    /// state. Public so both import routes share one policy instead of two that drift.
+    public static let slotBusyRetry = Duration.milliseconds(250)
+    public static let slotBusyAttempts = 40
+
+    /// Run `body`, waiting out `.sessionAlreadyRunning` instead of failing on it.
+    ///
+    /// Lives here, on the engine, because the two import routes reach the engine differently and both
+    /// need it: `ImportQueue` comes in through a closure `Environment` and cannot touch
+    /// `SpeechEngine` at all, while `DictationController.runDualPass` holds it directly and used to
+    /// call `transcribe(input:pass:)` bare — so a user holding the dictation key during a dual-pass
+    /// import lost roughly one section per 3 s of hold, silently, because `DualPassImporter` catches
+    /// a failed pass and logs it.
+    ///
+    /// **The retry is only safe because the throw lands before the stream is touched.** `claimSlot`
+    /// runs first inside `beginSession`, ahead of the `for await item in input` loop, so a refused
+    /// attempt has consumed no elements — and an `AsyncStream` has exactly one consumer, so a retry
+    /// that had already drained part of it would silently transcribe the tail of the audio. Do not
+    /// widen this to wrap anything that reads the stream first.
+    ///
+    /// - Parameter keepWaiting: asked before each sleep. Return false to give up early — the caller's
+    ///   own cancellation, which the engine cannot see.
+    /// - Parameter onWait: called once, on the first refusal, for the caller's log line.
+    public static func waitingForSlot<T: Sendable>(
+        attempts: Int = SpeechEngine.slotBusyAttempts,
+        delay: Duration = SpeechEngine.slotBusyRetry,
+        // The caller's isolation is inherited rather than crossed. Without this, `body` is a
+        // non-`Sendable` closure being handed from an isolated context to a `nonisolated static`
+        // one, which Swift 6 rejects outright — and the alternatives are worse: marking `body`
+        // `@Sendable` would force every caller to launder the actor it is calling.
+        isolation: isolated (any Actor)? = #isolation,
+        keepWaiting: @Sendable () async -> Bool = { true },
+        onWait: @Sendable () -> Void = {},
+        body: () async throws -> T
+    ) async throws -> T {
+        var attempt = 0
+        while true {
+            do {
+                return try await body()
+            } catch SpeechEngineError.sessionAlreadyRunning {
+                attempt += 1
+                guard attempt < attempts, await keepWaiting() else {
+                    throw SpeechEngineError.sessionAlreadyRunning
+                }
+                if attempt == 1 { onWait() }
+                try await Task.sleep(for: delay)
+            }
+        }
+    }
+
+    /// `transcribe(input:pass:)`, waiting out a live dictation rather than losing the section.
+    ///
+    /// The retrying variant is the one every import pass should use; the bare one is kept for callers
+    /// that own their own ladder. See `waitingForSlot` for why re-entering with the same stream is
+    /// safe.
+    public func transcribeWaitingForSlot(
+        input: AsyncStream<AnalyzerInput>,
+        pass: ImportPass,
+        biasing: [String] = [],
+        onUpdate: @Sendable @escaping (TranscriptionUpdate) -> Void
+    ) async throws -> TranscriptionOutcome {
+        try await Self.waitingForSlot(
+            onWait: {
+                Log.stt.info("import pass waiting: the engine is busy with a live dictation")
+            }
+        ) {
+            try await transcribe(input: input, pass: pass, biasing: biasing, onUpdate: onUpdate)
+        }
     }
 
     private static func describe(_ error: Error) -> String {

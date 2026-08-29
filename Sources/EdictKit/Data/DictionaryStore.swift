@@ -213,9 +213,31 @@ public final class DictionaryStore {
     public static let shared = DictionaryStore(fileURL: AppPaths.dictionaryFile)
 
     public private(set) var entries: [DictionaryEntry] = []
-    /// Set when the file existed but could not be parsed. The pane surfaces this instead of silently
-    /// showing an empty dictionary, which would look like data loss.
+    /// Set when the file existed but could not be used as it was — and also set, deliberately, after
+    /// a **successful** recovery, because a recovery is news. The pane surfaces it instead of
+    /// silently showing an empty dictionary, which would look like data loss.
+    ///
+    /// Read it together with `recoveredEntryCount`: non-nil does not mean the load failed.
     public private(set) var lastLoadError: String?
+    /// How many entries the last load rescued from `dictionary.json.bak`, or `nil` when nothing was
+    /// rescued. Lets the UI tell a recovery from a failure without matching substrings of
+    /// `lastLoadError`.
+    public private(set) var recoveredEntryCount: Int?
+    /// Where the bytes that could not be read were moved to, or `nil` when nothing was moved —
+    /// which covers both an ordinary load and a quarantine that *failed*, the second of which
+    /// `lastLoadError` states in words.
+    public private(set) var quarantinedFileURL: URL?
+
+    /// The quarantine file's name on its own, for a message that must not print a home directory.
+    public var quarantinedFileName: String? { quarantinedFileURL?.lastPathComponent }
+
+    /// Why the terminal flush could not write, or `nil` if it has not failed.
+    ///
+    /// Exists so the failure is assertable and, later, showable. `flushPendingSave()` runs from
+    /// `applicationWillTerminate` with no UI left to report to, so the log is the only channel at the
+    /// time — but the log is also not something a test can read, and an untestable error path is how
+    /// this one stayed a bare `try?` for as long as it did.
+    public private(set) var lastFlushError: String?
 
     public let fileURL: URL
 
@@ -247,23 +269,71 @@ public final class DictionaryStore {
         return d
     }()
 
-    public func load() throws {
+    /// - Parameter recoverFromBackup: when the file is present and does not parse, move the
+    ///   unreadable bytes aside and adopt `dictionary.json.bak` if it decodes.
+    ///
+    ///   True for the launch load, where an unreadable file is on its way to being overwritten by the
+    ///   next debounced save and the backup is the only copy of the user's terms. **False** for the
+    ///   file watcher's reload, and that asymmetry is the point: `dictionary.json` is a documented
+    ///   plain-file interface a user is invited to hand-edit, so a save from their editor with a
+    ///   stray comma in it must not have the file yanked out from under them mid-edit. There the old
+    ///   behaviour is still right — keep what is in memory, report, change nothing on disk.
+    public func load(recoverFromBackup: Bool = true) throws {
         guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            // A decodable backup means this is NOT first run, and seeding over it is the worse of the
+            // two absent-file bugs: the user's own terms get replaced by starter entries, the log says
+            // "Seeded starter dictionary" so it reads as a fresh install, and the backup that still
+            // held their terms is destroyed by the next edit. `decodeBackup` used to be reachable only
+            // from `recoverAfterFailedDecode`, which requires the file to be PRESENT — so the most
+            // likely way a dictionary disappears was the one way the backup was never consulted.
+            //
+            // `recoverFromBackup` is honoured here for the same reason it exists on the decode path:
+            // `reloadIfChangedOnDisk` must never reinterpret a user's editor writing a file, and a
+            // watcher event that observes the file mid-replace can see it briefly absent.
+            if recoverFromBackup, let recovered = decodeBackup() {
+                entries = recovered
+                recoveredEntryCount = recovered.count
+                quarantinedFileURL = nil
+                lastLoadError = "\(fileURL.lastPathComponent) is not there."
+                    + " Recovered \(recovered.count) entr\(recovered.count == 1 ? "y" : "ies")"
+                    + " from the backup, so the starter dictionary was not seeded over them."
+                bumpRevision()
+                Log.data.notice("recovered \(recovered.count, privacy: .public) dictionary entries from the backup; the store file was absent")
+                // Reinstated for the same reason as history, plus one specific to this store: an
+                // absent `dictionary.json` on the NEXT launch would seed the starter entries over the
+                // recovered terms, so a recovery that is not written back is actively unsafe here.
+                try save()
+                return
+            }
+
             // First run: seed something visible so the feature is obviously alive rather than an
             // empty table the user has to believe in.
             entries = Self.starterEntries()
-            lastLoadError = nil
+            clearLoadDiagnostics()
             bumpRevision()
             try save()
             Log.data.info("Seeded starter dictionary with \(self.entries.count, privacy: .public) entries")
             return
         }
 
-        let data = try Data(contentsOf: fileURL)
-        guard !data.isEmpty else {
-            entries = []
-            lastLoadError = nil
-            bumpRevision()
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            // This read used to sit outside the `do` below, so an *unreadable* file — as opposed to
+            // an undecodable one — skipped the quarantine and the backup and was then replaced by
+            // the next debounced save.
+            Log.data.error("Dictionary read failed: \(error.localizedDescription, privacy: .public)")
+            try handleUnusableFile(.unreadable(error), recoverFromBackup: recoverFromBackup)
+            return
+        }
+
+        if data.isEmpty {
+            // A 0-byte file is not an empty dictionary; it is what a truncating writer leaves behind.
+            // Reading it as "the user has no terms" meant no quarantine, no backup, and a `nil`
+            // `lastLoadError`, and then the first debounced save had `keepPreviousVersion` copy the
+            // 0 bytes over the `.bak`.
+            try handleUnusableFile(.empty, recoverFromBackup: recoverFromBackup)
             return
         }
 
@@ -275,18 +345,130 @@ public final class DictionaryStore {
             lastLoadError = skipped == 0
                 ? nil
                 : "\(skipped) entr\(skipped == 1 ? "y was" : "ies were") skipped: no \"term\" or \"heard\" value."
+            recoveredEntryCount = nil
+            quarantinedFileURL = nil
             lastWrittenData = data
             bumpRevision()
             if skipped > 0 {
                 Log.data.warning("Skipped \(skipped, privacy: .public) malformed dictionary entries")
             }
         } catch {
-            // Keep whatever is in memory. Overwriting the user's hand-edited file with an empty array
-            // because of one stray comma would be unforgivable.
-            lastLoadError = "dictionary.json could not be read: \(error.localizedDescription)"
             Log.data.error("Dictionary decode failed: \(error.localizedDescription, privacy: .public)")
-            throw error
+            try handleUnusableFile(.undecodable(error), recoverFromBackup: recoverFromBackup)
         }
+    }
+
+    private func clearLoadDiagnostics() {
+        lastLoadError = nil
+        recoveredEntryCount = nil
+        quarantinedFileURL = nil
+    }
+
+    /// Route one of the three ways `dictionary.json` can fail to become the store, honouring the
+    /// `recoverFromBackup` asymmetry.
+    private func handleUnusableFile(_ kind: UnusableStoreFile, recoverFromBackup: Bool) throws {
+        guard recoverFromBackup else {
+            // Keep whatever is in memory. Overwriting the user's hand-edited file with an empty
+            // array because of one stray comma would be unforgivable — and a 0-byte file is the
+            // *most* likely thing to see here, because that is what the file looks like for the
+            // instant between an editor truncating it and writing the new contents. This path
+            // therefore changes nothing on disk and nothing in memory; it only reports.
+            lastLoadError = kind.sentence(about: fileURL.lastPathComponent)
+            // `.empty` carries no error to rethrow, so the caller gets a quiet return: the reload
+            // simply did not happen, which is the correct outcome mid-edit.
+            if let error = kind.underlyingError { throw error }
+            return
+        }
+        try recoverAfterFailedDecode(kind)
+    }
+
+    /// The one generation `AppPaths.writeAtomically` keeps. Read here and nowhere else in the app.
+    private var backupURL: URL { fileURL.appendingPathExtension("bak") }
+
+    /// `dictionary.json` is present and could not be used, on the launch path. Move the bytes aside,
+    /// then try the backup.
+    ///
+    /// The `.bak` is read before the quarantine — different files, so the order is free — because it
+    /// is the only way to decide whether a 0-byte `dictionary.json` is worth keeping at all. It is
+    /// not, unless a recovery is actually happening; a quarantine file holding nothing, with no
+    /// message to explain it, is just litter in a directory the user is invited to open.
+    ///
+    /// The quarantine still happens before anything is written, and for the two non-empty shapes it
+    /// happens even with no backup to adopt, for the same reason as in `HistoryStore`: the next
+    /// debounced save writes the whole store, so an unreadable file left in place is an overwritten
+    /// one. Here it is strictly kinder than what it replaces — the old code left the user's bytes on
+    /// disk right up until the next in-app edit silently replaced them.
+    private func recoverAfterFailedDecode(_ kind: UnusableStoreFile) throws {
+        let recovered = decodeBackup()
+        let quarantined = (recovered != nil || !kind.isEmptyFile)
+            ? AppPaths.quarantineUnreadableFile(at: fileURL)
+            : nil
+        quarantinedFileURL = quarantined
+        var message = kind.sentence(about: fileURL.lastPathComponent)
+
+        if let recovered {
+            entries = recovered
+            recoveredEntryCount = recovered.count
+            bumpRevision()
+            message += " Recovered \(recovered.count) entr\(recovered.count == 1 ? "y" : "ies") from the backup."
+            if let quarantined {
+                message += " The unreadable file is kept as \(quarantined.lastPathComponent)."
+                lastLoadError = message
+                Log.data.notice("Recovered \(recovered.count, privacy: .public) dictionary entries from the backup")
+                // Reinstate the file now: `load()` treats an absent `dictionary.json` as first run and
+                // would reseed the starter entries over the user's recovered terms on the next launch.
+                do { try save() } catch {
+                    Log.data.error("could not reinstate dictionary.json after recovery: \(error.localizedDescription, privacy: .public)")
+                }
+            } else {
+                // The quarantine failed, so the file still holds the only copy of the bytes nobody
+                // could read. Writing now would have `keepPreviousVersion` copy those bytes over the
+                // `.bak` this recovery just came from, and the next edit would copy the reinstated
+                // file over that — the original bytes gone in two writes. So the save is skipped and
+                // the message says so, instead of dropping the clause and reporting a clean recovery.
+                //
+                // The cost is real and is named here so nobody "fixes" it by writing anyway: with
+                // `dictionary.json` still unreadable, the next launch recovers from the `.bak` again
+                // rather than reseeding, which is the correct outcome for as long as the user has not
+                // dealt with the file.
+                message += " Edict could not move it aside, so those bytes are still in"
+                    + " \(fileURL.lastPathComponent) and the recovered entries were not written back."
+                    + " Copy that file somewhere safe before editing the dictionary again."
+                lastLoadError = message
+                Log.data.error("recovered the dictionary from the backup but could not quarantine \(self.fileURL.lastPathComponent, privacy: .public); skipped the reinstating save")
+            }
+            return
+        }
+
+        if kind.isEmptyFile {
+            // Nothing to adopt and nothing to report: the empty store `load()` has always presented
+            // for a 0-byte file, reached now with the backup genuinely consulted first. Not seeded
+            // with the starter entries — the file exists, so this is not first run, and inventing
+            // terms over a file the user may be halfway through emptying is not this method's call.
+            entries = []
+            clearLoadDiagnostics()
+            bumpRevision()
+            return
+        }
+
+        message += quarantined.map { " No usable backup; the unreadable file is kept as \($0.lastPathComponent)." }
+            // Not silence. Before this, a failed move just omitted the clause, so the message named
+            // no file at all and the only pointer to the user's bytes was the unified log.
+            ?? " No usable backup, and Edict could not move the unreadable file aside — those bytes are still in \(fileURL.lastPathComponent)."
+        lastLoadError = message
+        if let error = kind.underlyingError { throw error }
+    }
+
+    /// Decode `dictionary.json.bak`, or `nil` when there is nothing usable in it. An empty result
+    /// counts as nothing usable: "recovered 0 entries" is not a recovery.
+    private func decodeBackup() -> [DictionaryEntry]? {
+        guard let data = try? Data(contentsOf: backupURL), !data.isEmpty,
+              let raws = try? Self.decoder.decode([DictionaryEntry.Raw].self, from: data)
+        else { return nil }
+        // Same lenient compactMap as the primary path: a backup entry with no usable term is worth
+        // skipping, not worth abandoning the whole recovery over.
+        let decoded = raws.compactMap(DictionaryEntry.init(raw:))
+        return decoded.isEmpty ? nil : decoded
     }
 
     public func save() throws {
@@ -295,6 +477,23 @@ public final class DictionaryStore {
         let data = try Self.encoder.encode(entries)
         try AppPaths.writeAtomically(data, to: fileURL)
         lastWrittenData = data
+        // Cleared only on the far side of a successful write. `lastFlushError` is surfaced long after
+        // it is set — there is no UI at termination — so leaving a stale one behind meant the first
+        // time the user ever saw it, it could describe a failure a later save had already fixed.
+        lastFlushError = nil
+
+        // Re-arm the file watcher if the file went missing under it.
+        //
+        // `armWatcher()` bails when the file does not exist, and on a failed recovery the quarantine
+        // renames `dictionary.json` away *before* `DictationController.bootstrap` calls
+        // `startWatchingFile()` — so the watch was dead for the whole session, and a user who fixed
+        // their JSON in an editor got no reload and no hint why. This write has just recreated the
+        // file, so there is something to watch again.
+        //
+        // Honestly partial, and the comment must not pretend otherwise: this recovers the watch
+        // through an *in-app* edit only. A file recreated purely from outside Edict, with no in-app
+        // save in between, is still only picked up on the next launch.
+        if watchRequested, watchSourceStorage == nil { armWatcher() }
     }
 
     /// Coalesces a burst of edits (typing in the dictionary table, a batch delete) into one disk write.
@@ -313,7 +512,19 @@ public final class DictionaryStore {
     /// Force any pending debounced write to disk now. Call before termination.
     public func flushPendingSave() {
         guard saveTask != nil else { return }
-        try? save()
+        // NOT `try?`. This runs from `applicationWillTerminate` — which is the only reason
+        // `NSSupportsSuddenTermination` is false — so it is the last chance the work of the previous
+        // 500 ms has to reach disk, and there is no UI left to report to. Swallowing the error here
+        // made a lost dictionary invisible rather than merely lost; every other write path in
+        // this file logs its failures, so the bare `try?` was an inconsistency, not a policy.
+        do {
+            try save()
+        } catch {
+            lastFlushError = error.localizedDescription
+            Log.data.error(
+                "terminal dictionary flush failed: \(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     private func bumpRevision() {
@@ -477,6 +688,12 @@ public final class DictionaryStore {
 
     @ObservationIgnored private var watchDebounce: Task<Void, Never>?
     @ObservationIgnored private var watchSourceStorage: (any DispatchSourceFileSystemObject)?
+    /// True between `startWatchingFile()` and `stopWatchingFile()`, whether or not a source is
+    /// currently armed. Separate from `watchSourceStorage != nil` because those two differ in exactly
+    /// the case that matters: watching was asked for, and the file was not there to arm on. Without
+    /// it, `save()`'s re-arm would start watching in a process that never asked to — every test that
+    /// saves, for one.
+    @ObservationIgnored private var watchRequested = false
 
     /// Watch `dictionary.json` and reload on external edits.
     ///
@@ -487,10 +704,12 @@ public final class DictionaryStore {
     /// gated on the file's bytes differing from what we last wrote.
     public func startWatchingFile() {
         stopWatchingFile()
+        watchRequested = true
         armWatcher()
     }
 
     public func stopWatchingFile() {
+        watchRequested = false
         watchDebounce?.cancel()
         watchDebounce = nil
         watchSourceStorage?.cancel()
@@ -498,7 +717,8 @@ public final class DictionaryStore {
     }
 
     private func armWatcher() {
-        // Nothing to watch until the file exists; `load()` creates it on first run.
+        // Nothing to watch until the file exists; `load()` creates it on first run, and a failed
+        // recovery renames it away. `save()` retries this call for the second case.
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         let fd = open(fileURL.path, O_EVTONLY)
         guard fd >= 0 else {
@@ -549,7 +769,10 @@ public final class DictionaryStore {
             return
         }
         do {
-            try load()
+            // `recoverFromBackup: false`: the bytes on disk are the user's, seconds old, and possibly
+            // mid-edit. Moving their file aside because their editor saved a half-typed line would be
+            // the app breaking a documented plain-file interface. See `load(recoverFromBackup:)`.
+            try load(recoverFromBackup: false)
             Log.data.info("Reloaded dictionary.json after external edit (\(self.entries.count, privacy: .public) entries)")
         } catch {
             Log.data.error("External dictionary edit did not parse: \(error.localizedDescription, privacy: .public)")

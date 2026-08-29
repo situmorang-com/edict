@@ -200,24 +200,57 @@ struct DictionaryPane: View {
     /// it and reloads on external edits, so the path belongs on screen.
     private var fileFooter: some View {
         PanelSurface("File") {
-            HStack(spacing: D.space.md) {
-                RecessedWell(fill: .list) {
-                    Text(model.dictionary.fileURL.path)
-                        .typeStyle(D.type.mono)
-                        .foregroundStyle(D.color.textSecondary)
-                        .lineLimit(1)
-                        .truncationMode(.head)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: D.space.sm) {
+                HStack(spacing: D.space.md) {
+                    RecessedWell(fill: .list) {
+                        Text(model.dictionary.fileURL.path)
+                            .typeStyle(D.type.mono)
+                            .foregroundStyle(D.color.textSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.head)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    TapeButton("Reveal") {
+                        NSWorkspace.shared.activateFileViewerSelecting([model.dictionary.fileURL])
+                    }
                 }
-                if let error = model.dictionary.lastLoadError {
-                    Text(error)
-                        .typeStyle(D.type.caption)
-                        .foregroundStyle(D.color.alert)
-                        .lineLimit(2)
-                }
-                TapeButton("Reveal") {
-                    NSWorkspace.shared.activateFileViewerSelecting([model.dictionary.fileURL])
+                loadNotice
+            }
+        }
+    }
+
+    /// What actually happened to `dictionary.json` at launch, in the store's own words.
+    ///
+    /// On its own row, wrapping, with no line limit. It was a third column in the `HStack` above at
+    /// `.lineLimit(2)`, and caption size in a third of a footer's width truncates a recovery message
+    /// well before its end — which is precisely where the load-bearing part is: "Recovered 11 entries
+    /// from the backup. The unreadable file is kept as dictionary.unreadable-20260830T101500Z.json."
+    /// A message whose only useful half is cut off is the same silence as no message.
+    ///
+    /// `recoveredEntryCount` rather than a substring match, so the store can reword freely.
+    @ViewBuilder private var loadNotice: some View {
+        if let message = model.dictionary.lastLoadError {
+            let recovered = model.dictionary.recoveredEntryCount
+            HStack(alignment: .top, spacing: D.space.md) {
+                Text(message)
+                    .typeStyle(D.type.caption)
+                    // Red is for a load that produced nothing. A recovery is news, not a fault: the
+                    // terms in the table above it are real.
+                    .foregroundStyle(recovered == nil ? D.color.alert : D.color.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                // Naming a timestamped quarantine file without a way to reach it would leave the user
+                // retyping it into a Finder search. Absent when the move failed: there is nothing to
+                // reveal, and the message says where the bytes actually are.
+                if let quarantined = model.dictionary.quarantinedFileURL {
+                    TapeButton("Kept file") {
+                        NSWorkspace.shared.activateFileViewerSelecting([quarantined])
+                    }
+                    .help("Shows \(quarantined.lastPathComponent) in the Finder.")
+                    .accessibilityLabel("Show the quarantined dictionary file in the Finder")
                 }
             }
         }

@@ -180,6 +180,12 @@ struct HistoryStoreTests {
         #expect(throws: (any Error).self) { try store.load() }
         #expect(store.transcripts.count == 1)
         #expect(store.lastLoadError != nil)
+        // There is no `.bak` here — `save()` was this path's first write — so recovery has nothing to
+        // adopt and the load still fails. What it must no longer do is leave the unreadable bytes
+        // where the next debounced save will replace them. See `StoreRecoveryTests`.
+        let asideBytes = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("history.unreadable-") }
+        #expect(asideBytes.count == 1)
     }
 
     // MARK: Ordering, trimming, removal
@@ -329,11 +335,18 @@ struct HistoryStoreTests {
         // `history.json.bak`: `AppPaths.writeAtomically` keeps the outgoing version, because atomic
         // writes protect against a torn file and do nothing about a wrong one — which is the failure
         // that actually cost a user their transcript history.
+        //
+        // `history.json.bak.new` is deliberately NOT in this list. The backup is now staged there and
+        // swapped in with `replaceItemAt`, so that there is never a moment with no backup on disk
+        // while the main write proceeds — and a successful swap consumes the staging file. Its
+        // presence here would mean the swap did not complete, which is why this stays an exact
+        // comparison rather than a "contains the two we care about" check.
         try store.save()
 
         let contents = try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted()
         #expect(contents == ["history.json", "history.json.bak"])
         #expect(!contents.contains { $0.hasSuffix(".tmp") }, "no orphaned temp file")
+        #expect(!contents.contains("history.json.bak.new"), "the staged backup was swapped in, not abandoned")
 
         let reloaded = HistoryStore(fileURL: store.fileURL, limit: { 5000 })
         try reloaded.load()
