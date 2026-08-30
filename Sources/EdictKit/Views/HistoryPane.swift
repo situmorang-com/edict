@@ -40,6 +40,27 @@ struct HistoryPane: View {
         self._selection = State(initialValue: initialSelection)
     }
 
+    /// What adopting a pending selection has to do to make that row visible.
+    ///
+    /// Pure and `static` so it can be tested: a view body cannot be, and the interesting case here is
+    /// not the happy one. A jump issued from the import tray arrives with whatever query the user last
+    /// typed still in the field, and selecting a row the filter excludes would show an empty table
+    /// with a detail block for a row not in it — the pane contradicting itself. So the query is cleared
+    /// only when it is actually hiding the target, because clearing it otherwise would throw away a
+    /// search the user may still want.
+    ///
+    /// Returns `nil` when the transcript is gone — deleted between the press and the adoption, or
+    /// trimmed by `historyLimit` — in which case the jump is dropped rather than selecting nothing and
+    /// leaving the user to wonder what happened.
+    static func adoption(
+        of pending: UUID,
+        rows: [Transcript],
+        allTranscripts: [Transcript]
+    ) -> (selection: UUID, clearQuery: Bool)? {
+        guard allTranscripts.contains(where: { $0.id == pending }) else { return nil }
+        return (pending, !rows.contains(where: { $0.id == pending }))
+    }
+
     @State private var query = ""
     @State private var selection: UUID?
     @State private var armedClear = false
@@ -90,6 +111,19 @@ struct HistoryPane: View {
         }
         .padding(D.space.md)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // `.task(id:)` rather than `.onChange`: a jump issued while this pane was off screen has
+        // already set the value before this view appears, so an onChange would never fire for it.
+        .task(id: model.pendingHistorySelection) {
+            guard let pending = model.pendingHistorySelection else { return }
+            defer { model.pendingHistorySelection = nil }
+            guard let adopted = Self.adoption(
+                of: pending,
+                rows: rows,
+                allTranscripts: model.history.transcripts
+            ) else { return }
+            if adopted.clearQuery { query = "" }
+            selection = adopted.selection
+        }
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { paneHeight = $0 }
         .sheet(item: $draft) { draft in
             DictionaryEntrySheet(store: model.dictionary, draft: draft) {

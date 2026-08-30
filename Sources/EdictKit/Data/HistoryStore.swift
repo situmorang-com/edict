@@ -868,7 +868,17 @@ public final class HistoryStore {
     public func search(_ query: String) -> [Transcript] {
         let q = query.trimmed
         guard !q.isEmpty else { return transcripts }
-        return transcripts.filter { $0.text.containsLoosely(q) || $0.rawText.containsLoosely(q) }
+        return transcripts.filter {
+            $0.text.containsLoosely(q)
+                || $0.rawText.containsLoosely(q)
+                // The filename and the app are the two things a user actually remembers about a row
+                // they are trying to find again, and neither was searchable. Both are already stored
+                // on every transcript and both are already PRINTED in the detail header — so the
+                // obvious query for an imported transcript, the name of the file it came from,
+                // returned nothing while the answer sat on screen.
+                || ($0.source.importedFilename?.containsLoosely(q) ?? false)
+                || ($0.targetAppName?.containsLoosely(q) ?? false)
+        }
     }
 
     /// Words across every retained transcript; printed by `EquipmentRail.totals`.

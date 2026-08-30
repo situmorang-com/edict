@@ -268,6 +268,27 @@ struct HistoryStoreTests {
         #expect(store.search("claude").count == 1)          // case-insensitive
         #expect(store.search("cloud code").count == 1)      // matches the raw text only
         #expect(store.search("visa").count == 1)
+
+        // The two fields a user remembers about a row they are hunting for. The assertions above are
+        // all positives on text, which is why widening `search` was unblocked — and also why nothing
+        // here would have noticed that the filename printed in the detail header was unsearchable.
+        let imported = Transcript(
+            createdAt: Date(timeIntervalSince1970: 4000),
+            rawText: "unrelated words",
+            text: "unrelated words",
+            audioDuration: 60,
+            transcribeDuration: 6,
+            targetAppName: "Obsidian",
+            injection: .notAttempted,
+            source: .imported(filename: "Pertamina board review.m4a")
+        )
+        store.append(imported)
+
+        #expect(store.search("pertamina").count == 1, "an imported transcript could not be found by its filename")
+        #expect(store.search("board review").count == 1)
+        #expect(store.search("m4a").count == 1)
+        #expect(store.search("obsidian").count == 1, "a transcript could not be found by the app it was dictated into")
+        #expect(store.search("kalimantan").isEmpty, "the widened search matched something it should not")
         #expect(store.search("cafe").count == 1)            // diacritic-insensitive
         #expect(store.search("nonsense").isEmpty)
     }

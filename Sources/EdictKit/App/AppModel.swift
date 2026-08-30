@@ -414,6 +414,28 @@ public final class AppModel {
     /// file, which can arrive while any pane is showing.
     var pane: Pane = .history
 
+    /// A transcript the history pane should select when it next appears, or `nil` for none.
+    ///
+    /// The seam behind "Show in log" on a finished import row. `HistoryPane`'s `initialSelection` is a
+    /// `State(initialValue:)`, so it binds once at construction and MainWindow reuses the same pane
+    /// instance across pane switches — which means the destination existed but could only ever be
+    /// reached by the render fixture. This is the signal the pane adopts and then clears, the same way
+    /// Command-O and a dropped file already reach the import pane.
+    ///
+    /// Cleared BY the pane rather than by the setter, so a jump issued while the pane is off screen
+    /// still lands when it comes back.
+    var pendingHistorySelection: UUID?
+
+    /// Show one transcript in the history pane, switching panes if necessary.
+    ///
+    /// Both halves of the journey — transcribe this file, then read or keep the result — were missing
+    /// their last step: a finished import row's key bank is export-only, so getting from the row to
+    /// its transcript meant switching panes by hand and scrolling a time-ordered list looking for it.
+    func showInLog(_ id: UUID) {
+        pendingHistorySelection = id
+        pane = .history
+    }
+
     // MARK: Tuning
 
     /// The coarse `level` publish rate. Deliberately two orders of magnitude below the needle so

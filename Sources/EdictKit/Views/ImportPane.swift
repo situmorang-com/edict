@@ -330,6 +330,8 @@ struct ImportPane: View {
     /// per row is enough.
     let onCancel: (UUID) -> Void
     let onRetry: (UUID) -> Void
+    /// Show a finished row's transcript in the history pane.
+    let onShowInLog: (UUID) -> Void
     /// Removes every terminal row — finished, failed and cancelled alike.
     let onClearFinished: () -> Void
     /// Render-harness escape hatch, exactly as `HistoryPane.unbounded` and `SettingsWindow.unbounded`
@@ -351,9 +353,11 @@ struct ImportPane: View {
         onRerun: @escaping (UUID, String) -> Void = { _, _ in },
         onCancel: @escaping (UUID) -> Void = { _ in },
         onRetry: @escaping (UUID) -> Void = { _ in },
+        onShowInLog: @escaping (UUID) -> Void = { _ in },
         onClearFinished: @escaping () -> Void = {},
         unbounded: Bool = false
     ) {
+        self.onShowInLog = onShowInLog
         self.rows = rows
         self.locales = locales
         self.dictationLocaleIdentifier = dictationLocaleIdentifier
@@ -579,7 +583,8 @@ struct ImportPane: View {
                                     onRetry: { onRetry(row.id) },
                                     onSetLocale: { onSetRowLocale(row.id, $0) },
                                     onRerun: { onRerun(row.id, $0) },
-                                    onExport: { exportOutcomes[row.id] = $0 }
+                                    onExport: { exportOutcomes[row.id] = $0 },
+                                    onShowInLog: onShowInLog
                                 )
                             }
                         }
@@ -652,6 +657,9 @@ private struct ImportRow: View {
     let onSetLocale: (String) -> Void
     let onRerun: (String) -> Void
     let onExport: (TranscriptExportOutcome) -> Void
+    /// Jump to this row's transcript in the history pane. Nil-safe by construction: the pane only
+    /// passes a non-empty closure, and the menu item only appears on a finished row.
+    let onShowInLog: (UUID) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: D.space.xxs) {
@@ -747,6 +755,22 @@ private struct ImportRow: View {
         .padding(.horizontal, D.space.rowInset)
         .padding(.vertical, D.space.xs)
         .frame(minHeight: D.size.rowHeight)
+        // A context menu and not a key, and the reason is measured rather than aesthetic.
+        // `ExportKeyWidthTests.thereIsHeadroomForOneMoreFormat` asserts that a FOURTH cap does not fit
+        // in `M.colKeys`: the three export keys already come to more than the column, and `TapeCap`
+        // neither wraps nor scales, so an unaffordable key is not clipped — it draws leftwards over
+        // the filename, duration, language and progress of the row. Widening the column would take
+        // that width from the filename on every row, for an action wanted once per import. So the
+        // affordance goes where there is unlimited room and no layout to get wrong.
+        //
+        // `contentShape` first, because a `VStack` of labels has hit-testable area only where the
+        // labels are: without it the gaps between columns swallow the right-click.
+        .contentShape(Rectangle())
+        .contextMenu {
+            if case .finished(let transcript) = row.state {
+                Button("Show in Log") { onShowInLog(transcript.id) }
+            }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(row.filename)
         .accessibilityValue(spokenState)

@@ -222,9 +222,25 @@ struct EdictCommands: Commands {
         }
 
         CommandGroup(replacing: .help) {
+            // "Edict Help" used to reveal dictionary.json in the Finder. The comment justifying that
+            // said "no hosted docs yet", which stopped being true when the repository went public —
+            // so a user who went looking for help got handed a JSON file. Revealing the dictionary is
+            // still worth offering; it just is not help, and the two are separate items now.
+            //
+            // A URL rather than a bundled page: RECON amendment 24 forbids declaring `resources:` on
+            // the app target, so anything bundled has to be copied by build-app.sh, and a help file
+            // that ships broken is worse than one that lives where it is already maintained.
             Button("Edict Help") {
-                // No hosted docs yet; the dictionary file is the one thing a user is told to edit
-                // by hand, so point at it rather than at a dead URL.
+                if let url = URL(string: "https://github.com/situmorang-com/edict#readme") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+
+            Divider()
+
+            // The one file a user is invited to edit by hand, which is why the store watches it for
+            // external changes rather than owning it outright.
+            Button("Reveal Dictionary File") {
                 NSWorkspace.shared.activateFileViewerSelecting([model.dictionary.fileURL])
             }
         }

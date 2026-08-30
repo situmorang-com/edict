@@ -117,6 +117,7 @@ public struct MainWindow: View {
                 onRerun: { model.importQueue.rerun($0, localeIdentifier: $1) },
                 onCancel: { model.importQueue.cancel($0) },
                 onRetry: { model.importQueue.retry($0) },
+                onShowInLog: { model.showInLog($0) },
                 onClearFinished: { model.importQueue.clearFinished() }
             )
             // Cheap, idempotent, and it takes no locale reservation — `AssetInventory` allows five
