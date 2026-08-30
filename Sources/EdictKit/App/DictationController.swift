@@ -1466,7 +1466,7 @@ public final class DictationController {
     func completeImport(_ result: ImportQueue.Result) -> UUID? {
         let raw = result.outcome.text
         guard !raw.trimmed.isEmpty else {
-            Log.data.notice("import produced no text: \(result.info.filename, privacy: .public)")
+            Log.data.notice("import produced no text: \(result.info.filename, privacy: .private(mask: .hash))")
             return nil
         }
 
@@ -1525,7 +1525,7 @@ public final class DictationController {
         }
 
         Log.data.info("""
-            import saved: \(result.info.filename, privacy: .public)             \(transcript.wordCount, privacy: .public) words,             \(transcript.segments.count, privacy: .public) segments,             \(corrected.hits.count, privacy: .public) corrections,             module \(module.rawValue, privacy: .public),             locale \(transcript.contributingLocales.joined(separator: "+"), privacy: .public),             quality \(result.quality.verdict.rawValue, privacy: .public),             \(String(format: "%.1f", result.realtimeFactor), privacy: .public)x realtime\
+            import saved: \(result.info.filename, privacy: .private(mask: .hash))             \(transcript.wordCount, privacy: .public) words,             \(transcript.segments.count, privacy: .public) segments,             \(corrected.hits.count, privacy: .public) corrections,             module \(module.rawValue, privacy: .public),             locale \(transcript.contributingLocales.joined(separator: "+"), privacy: .public),             quality \(result.quality.verdict.rawValue, privacy: .public),             \(String(format: "%.1f", result.realtimeFactor), privacy: .public)x realtime\
             \(result.incompleteReason == nil ? "" : " INCOMPLETE", privacy: .public)
             """)
         return transcript.id

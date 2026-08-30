@@ -1309,6 +1309,15 @@ private struct CorrectionLine: View {
     }
 }
 
+// Everything below here is preview and render-harness scaffolding, and it is behind `#if DEBUG` for
+// one reason: the fixture enums are `public` so an out-of-tree render harness can link them, which
+// also means they cannot be dead-stripped. They were 588 symbols of the shipped binary. The `#Preview`
+// blocks are gated with them because they reference the fixtures — gating a fixture enum on its own
+// stops the file compiling in release, which is why all six files had to change together.
+//
+// Tests and the render harness both build the library in debug, so every reference in Tests/ keeps
+// working. Nothing here has any behavioural effect on the app.
+#if DEBUG
 // MARK: - Render fixtures
 
 /// Sheets for the offscreen renderer, covering the three things this pass changed: the login-item
@@ -1487,3 +1496,4 @@ public enum RecoveryFixtures {
         .background(D.surface.deckPaint)
         .preferredColorScheme(.dark)
 }
+#endif

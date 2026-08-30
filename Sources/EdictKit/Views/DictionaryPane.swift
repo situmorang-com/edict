@@ -588,6 +588,12 @@ private struct FieldWell: View {
     }
 }
 
+// Gated with the fixture enums these previews use. `PreviewFixtures` is `#if DEBUG` because it is
+// `public` for an out-of-tree render harness and therefore cannot be dead-stripped; a `#Preview` that
+// references it has to be gated too, or the file stops compiling in release. This file was one of the
+// two the audit's list of affected files missed — the release build found them, which is why the
+// release build is now part of finishing this change.
+#if DEBUG
 // MARK: - Previews
 
 #Preview("Dictionary — light") {
@@ -609,3 +615,4 @@ private struct FieldWell: View {
         draft: EntryDraft(isCorrection: true, heard: "cloud", write: "Claude")
     ) {}
 }
+#endif

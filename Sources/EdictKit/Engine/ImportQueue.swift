@@ -524,7 +524,7 @@ public final class ImportQueue {
             return false
         }
         Log.data.info("""
-            import queue: \(self.items[index].filename, privacy: .public) \
+            import queue: \(self.items[index].filename, privacy: .private(mask: .hash)) \
             \(self.items[index].localeIdentifier, privacy: .public) -> \(locale, privacy: .public)
             """)
         items[index].localeIdentifier = locale
@@ -569,7 +569,7 @@ public final class ImportQueue {
         // comparing stays adjacent even in a tray of twenty rows.
         items.insert(item, at: index + 1)
         Log.data.info("""
-            import queue: re-running \(source.filename, privacy: .public) as \
+            import queue: re-running \(source.filename, privacy: .private(mask: .hash)) as \
             \(locale, privacy: .public) (was \(source.localeIdentifier, privacy: .public))
             """)
         startWorkerIfNeeded()
@@ -809,7 +809,7 @@ public final class ImportQueue {
 
             if cancelledIDs.contains(id) {
                 finish(id, state: .cancelled, stats: stats)
-                Log.data.info("import cancelled: \(filename, privacy: .public)")
+                Log.data.info("import cancelled: \(filename, privacy: .private(mask: .hash))")
                 return
             }
             if case .cancelled = readFailure {
@@ -825,7 +825,7 @@ public final class ImportQueue {
             let verdict = Self.readVerdict(for: stats)
             if case .undecodable(let reason) = verdict {
                 finish(id, state: .failed(reason: reason), stats: stats)
-                Log.data.error("import undecodable: \(filename, privacy: .public): \(reason, privacy: .public)")
+                Log.data.error("import undecodable: \(filename, privacy: .private(mask: .hash)): \(reason, privacy: .public)")
                 return
             }
 
@@ -880,7 +880,7 @@ public final class ImportQueue {
             }
             Log.data.info(
                 """
-                import done: \(filename, privacy: .public) [\(locale, privacy: .public)] \
+                import done: \(filename, privacy: .private(mask: .hash)) [\(locale, privacy: .public)] \
                 \(String(format: "%.1f", info.duration), privacy: .public)s audio in \
                 \(String(format: "%.1f", result.wallSeconds), privacy: .public)s \
                 (\(String(format: "%.1f", result.realtimeFactor), privacy: .public)x) \
@@ -897,7 +897,7 @@ public final class ImportQueue {
             await importer.cancel()
             let reason = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             finish(id, state: .failed(reason: reason), stats: await importer.statistics)
-            Log.data.error("import failed: \(filename, privacy: .public): \(reason, privacy: .public)")
+            Log.data.error("import failed: \(filename, privacy: .private(mask: .hash)): \(reason, privacy: .public)")
         }
     }
 
@@ -957,7 +957,7 @@ public final class ImportQueue {
             // let one model have a go. The user asked for a transcript, not for a language contest.
             Log.data.error("""
                 dual pass failed, falling back to a single pass: \
-                \(filename, privacy: .public): \(reason, privacy: .public)
+                \(filename, privacy: .private(mask: .hash)): \(reason, privacy: .public)
                 """)
             runningDualTask = nil
             return false
@@ -967,7 +967,7 @@ public final class ImportQueue {
         guard let outcome else { return false }
         if cancelledIDs.contains(id) {
             finish(id, state: .cancelled, stats: outcome.outcome.stats)
-            Log.data.info("import cancelled: \(filename, privacy: .public)")
+            Log.data.info("import cancelled: \(filename, privacy: .private(mask: .hash))")
             return true
         }
 
@@ -983,7 +983,7 @@ public final class ImportQueue {
         let verdict = Self.readVerdict(for: dual.stats)
         if case .undecodable(let reason) = verdict {
             finish(id, state: .failed(reason: reason), stats: dual.stats)
-            Log.data.error("dual-pass undecodable: \(filename, privacy: .public): \(reason, privacy: .public)")
+            Log.data.error("dual-pass undecodable: \(filename, privacy: .private(mask: .hash)): \(reason, privacy: .public)")
             return true
         }
 
@@ -997,7 +997,7 @@ public final class ImportQueue {
                 + " could run, so there is no transcript for this file. Try it again."
             finish(id, state: .failed(reason: reason), stats: dual.stats)
             Log.data.error("""
-                dual pass produced nothing: \(filename, privacy: .public): \
+                dual pass produced nothing: \(filename, privacy: .private(mask: .hash)): \
                 \(dual.failedPasses, privacy: .public) passes failed
                 """)
             return true
@@ -1076,7 +1076,7 @@ public final class ImportQueue {
         }
         Log.data.info(
             """
-            dual-pass import done: \(filename, privacy: .public) \
+            dual-pass import done: \(filename, privacy: .private(mask: .hash)) \
             \(String(format: "%.1f", info.duration), privacy: .public)s audio in \
             \(String(format: "%.1f", result.wallSeconds), privacy: .public)s \
             (\(String(format: "%.1f", result.realtimeFactor), privacy: .public)x) \

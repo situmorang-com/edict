@@ -49,12 +49,27 @@ import UniformTypeIdentifiers
 /// Reported before any audio is decoded so the UI can show duration and format on the queue row,
 /// and so a file that cannot work (no audio track, DRM) is rejected up front instead of halfway
 /// through a ten-minute transcription.
+/// The extension of a filename, alone, for the log.
+///
+/// Filenames go out `privacy: .private(mask: .hash)`: that keeps every line of one import
+/// correlatable without printing "HR grievance call 2026-08-24.m4a" into a log that any sysdiagnose
+/// collects verbatim. But the question a failed import actually raises is "what format was it", and
+/// that answer is not identifying — so it rides `.public` beside the hash.
+///
+/// A free function because `AudioFileInfo` and the `AudioFileImporter` actor each carry their own
+/// `filename`, and two copies of three lines is how the two drift apart.
+func audioFileKind(of filename: String) -> String {
+    let ext = (filename as NSString).pathExtension.lowercased()
+    return ext.isEmpty ? "no extension" : ext
+}
+
 public struct AudioFileInfo: Sendable, Hashable {
     /// The file the user picked or dropped.
     public var url: URL
     /// Last path component only. Everything user-visible uses this — a home directory is nobody's
     /// business, and `TranscriptSource.imported(filename:)` documents the same rule.
     public var filename: String
+
     /// The asset's real duration in seconds, loaded with
     /// `AVURLAssetPreferPreciseDurationAndTimingKey` so a VBR MP3 does not report an estimate.
     public var duration: TimeInterval
@@ -500,7 +515,7 @@ public actor AudioFileImporter {
             self.trackOutput = output
             Log.audio.info(
                 """
-                import \(self.filename, privacy: .public) opened via \(attempt.label, privacy: .public): \
+                import \(self.filename, privacy: .private(mask: .hash)) opened via \(attempt.label, privacy: .public): \
                 \(info.formatSummary, privacy: .public) \
                 \(String(format: "%.1f", info.duration), privacy: .public)s \
                 video=\(info.hasVideo ? "yes" : "no", privacy: .public)
@@ -578,7 +593,7 @@ public actor AudioFileImporter {
         channel?.finish(discardingQueued: true)
         producer?.cancel()
         if failure == nil { failure = .cancelled(filename: filename) }
-        Log.audio.info("import \(self.filename, privacy: .public): cancelled")
+        Log.audio.info("import \(self.filename, privacy: .private(mask: .hash)): cancelled")
     }
 
     /// Counters for the finished (or abandoned) read. Read after the stream ends.
@@ -637,7 +652,7 @@ public actor AudioFileImporter {
         case .failed:
             let reason = reader.error?.localizedDescription ?? "unknown reader failure"
             if failure == nil { failure = .readFailed(filename: filename, reason: reason) }
-            Log.audio.error("import \(self.filename, privacy: .public): reader failed: \(reason, privacy: .public)")
+            Log.audio.error("import \(self.filename, privacy: .private(mask: .hash)) [\(audioFileKind(of: self.filename), privacy: .public)]: reader failed: \(reason, privacy: .public)")
         case .cancelled:
             if failure == nil { failure = .cancelled(filename: filename) }
         default:
@@ -657,7 +672,7 @@ public actor AudioFileImporter {
 
         Log.audio.info(
             """
-            import \(self.filename, privacy: .public) read \
+            import \(self.filename, privacy: .private(mask: .hash)) read \
             \(String(format: "%.2f", self.stats.deliveredSeconds), privacy: .public)s in \
             \(String(format: "%.2f", self.stats.readWallSeconds), privacy: .public)s \
             (\(String(format: "%.1f", self.stats.realtimeFactor), privacy: .public)x) \
@@ -713,7 +728,7 @@ public actor AudioFileImporter {
             // is worse than the honest wall-clock fallback.
             probeOverflowed = true
             probeSamples = []
-            Log.audio.debug("import \(self.filename, privacy: .public): speech probe over budget, dropped")
+            Log.audio.debug("import \(self.filename, privacy: .private(mask: .hash)): speech probe over budget, dropped")
             return
         }
         probeSamples.append(contentsOf: UnsafeBufferPointer(start: data[0], count: frames))
@@ -786,7 +801,7 @@ public actor AudioFileImporter {
         case .failed:
             let reason = reader.error?.localizedDescription ?? "unknown reader failure"
             if failure == nil { failure = .readFailed(filename: filename, reason: reason) }
-            Log.audio.error("import \(self.filename, privacy: .public): decode failed: \(reason, privacy: .public)")
+            Log.audio.error("import \(self.filename, privacy: .private(mask: .hash)) [\(audioFileKind(of: self.filename), privacy: .public)]: decode failed: \(reason, privacy: .public)")
         case .cancelled:
             if failure == nil { failure = .cancelled(filename: filename) }
         default:
@@ -809,7 +824,7 @@ public actor AudioFileImporter {
 
         Log.audio.info(
             """
-            import \(self.filename, privacy: .public) decoded \
+            import \(self.filename, privacy: .private(mask: .hash)) decoded \
             \(String(format: "%.2f", Double(samples.count) / self.target.sampleRate), privacy: .public)s in \
             \(String(format: "%.2f", self.stats.readWallSeconds), privacy: .public)s \
             (\(String(format: "%.1f", self.stats.realtimeFactor), privacy: .public)x) \
@@ -859,7 +874,7 @@ public actor AudioFileImporter {
             into: buffer.mutableAudioBufferList
         )
         guard status == noErr else {
-            Log.audio.error("import \(self.filename, privacy: .public): PCM copy failed (\(status, privacy: .public))")
+            Log.audio.error("import \(self.filename, privacy: .private(mask: .hash)): PCM copy failed (\(status, privacy: .public))")
             return nil
         }
         return buffer
@@ -875,7 +890,7 @@ public actor AudioFileImporter {
             // would produce noise rather than an error.
             guard let fresh = AVAudioConverter(from: buffer.format, to: target) else {
                 Log.audio.error(
-                    "import \(self.filename, privacy: .public): no converter from \(buffer.format, privacy: .public)"
+                    "import \(self.filename, privacy: .private(mask: .hash)): no converter from \(buffer.format, privacy: .public)"
                 )
                 return nil
             }
@@ -904,7 +919,7 @@ public actor AudioFileImporter {
             return output.frameLength > 0 ? output : nil
         case .endOfStream, .error:
             if let error {
-                Log.audio.error("import \(self.filename, privacy: .public): converter failed: \(error.localizedDescription, privacy: .public)")
+                Log.audio.error("import \(self.filename, privacy: .private(mask: .hash)) [\(audioFileKind(of: self.filename), privacy: .public)]: converter failed: \(error.localizedDescription, privacy: .public)")
             }
             return nil
         @unknown default:
