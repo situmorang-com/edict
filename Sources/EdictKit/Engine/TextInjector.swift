@@ -190,7 +190,22 @@ public actor TextInjector {
     /// Demote an app permanently. This is the self-healing half: any app that yields
     /// `confirmedNotInserted` or `cannotVerify` can never be trusted with an AX insert again, because a
     /// `.success` return from it is unfalsifiable.
-    private func demoteToPasteOnly(_ bundleID: String?, why: String) {
+    ///
+    /// Internal rather than private so `InjectPolicyTests` can drive it directly. It has exactly two
+    /// call sites — the two failing verdicts in `inject`'s rung 1 — and both sit past `AXIsProcessTrusted`
+    /// and a real focused-element read, so no test may reach it through `inject`: doing that would need
+    /// the user's own frontmost app and a posted Cmd-V. **So the two call sites themselves are still
+    /// unguarded** — nothing in `Tests/` calls `inject(_:into:)`, so deleting both lines breaks no test
+    /// in this package, only the self-healing. Guarding the wiring needs the `InjectAX`/`InjectPasteboard`
+    /// seam, which is scoped separately; what the tests cover is that the function they call does what
+    /// its name says.
+    ///
+    /// The second guard is what makes this idempotent: a repeat demotion of an app already learned as
+    /// paste-only writes nothing and logs nothing, so an unseeded Electron app that fails its AX verify
+    /// on every dictation does not rewrite `edict.injectPolicies` each time. A *seeded* paste-only app
+    /// never reaches here at all — its strategy skips rung 1 — and if it were demoted by hand the guard
+    /// would not catch it, because `learned(for:)` is nil for a seed.
+    func demoteToPasteOnly(_ bundleID: String?, why: String) {
         guard let bundleID else { return }
         guard policies.learned(for: bundleID) != .pasteOnly else { return }
         policies.set(.pasteOnly, for: bundleID)
@@ -313,7 +328,18 @@ public actor TextInjector {
 
     /// Terminals execute a pasted newline. Collapse them rather than running the user's prose as shell
     /// commands — RECON flags this as the one content transformation the injector must make.
-    private static func normalise(_ text: String, for bundleID: String?) -> String {
+    ///
+    /// Internal rather than private because this is the only transformation Edict makes to the user's
+    /// words, and the bullets feature made multi-line dictation routine. A bundle id drifting out of
+    /// `InjectSeed.terminalBundles` means dictated prose arrives in Ghostty as a run of shell commands;
+    /// the `\r\n` pass losing its place at the head of the chain is milder — one break becomes two
+    /// spaces — but it is silent, so it needs a test too. `InjectNormalisationTests` is that guard, and
+    /// it pins the seed set as well as the collapse, because a test that only iterates the set cannot
+    /// notice an id leaving it.
+    ///
+    /// `\t` is deliberately left alone: no shell executes the line on a tab, so it is not the failure
+    /// this exists to prevent, and rewriting it would mangle dictated code for no gain.
+    static func normalise(_ text: String, for bundleID: String?) -> String {
         guard let bundleID, InjectSeed.terminalBundles.contains(bundleID) else { return text }
         return text
             .replacingOccurrences(of: "\r\n", with: " ")
@@ -409,7 +435,12 @@ public actor TextInjector {
 /// Apps that RECON identified as accepting an `AXSelectedText` write with `kAXErrorSuccess` and doing
 /// nothing. This is only a *seed*: `TextInjector` learns and persists demotions at runtime, so the list
 /// does not have to be exhaustive or maintained forever.
-private enum InjectSeed {
+///
+/// Internal rather than private so the tests can pin `terminalBundles` against a literal list of its
+/// own. Iterating the production set alone would not catch the failure that matters — an id dropping
+/// *out* of the set would simply stop being iterated, and the test would stay green while dictated
+/// prose started executing in that terminal.
+enum InjectSeed {
 
     static let pasteOnlyBundles: Set<String> = [
         // Electron / Chromium shells

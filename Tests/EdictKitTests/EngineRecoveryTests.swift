@@ -254,6 +254,15 @@ struct EngineRecoveryTests {
 /// `en_US` and `id_ID` reserved, stated because it is true and the claim was not:
 /// `clearSecondaryKeepsAnImportPassLocale` has to prepare the import language as its *secondary*, so
 /// it cannot also hold `id_ID`, and its prune does release `id_ID` — restored when it finishes.
+///
+/// **Every claim below now has an ungated twin.** The three reservation tests are reproduced in
+/// `ReservationLadderTests`, driven through the same production entry points against
+/// `FakeReservations` — which reproduces the two behaviours this suite exists to observe: Code=11 on
+/// the sixth distinct locale, and a `release` that refuses anything whose identifier does not match
+/// byte for byte. The download-completion routing is reproduced in `DownloadCompletionRoutingTests`
+/// further down this file. Those two suites are what actually protect this code, because they run on
+/// every machine and every run. What is left here, and only here, is whether the *framework* still
+/// behaves the way RECON measured it: run this deliberately after an OS update, not as coverage.
 @Suite("Engine recovery — reservations",
        .enabled(if: ProcessInfo.processInfo.environment["EDICT_SPEECH_TESTS"] == "1"),
        .serialized)

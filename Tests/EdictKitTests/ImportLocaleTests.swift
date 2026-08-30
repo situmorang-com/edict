@@ -656,6 +656,33 @@ struct ImportLocaleEngineTests {
         #expect(queue.pendingCount == 0, "the queue did not finish inside \(timeout)")
     }
 
+    /// Whether an import of `identifier` can resolve without starting a model download.
+    ///
+    /// Both modules, in the order `resolveImportPass` tries them: the general one where it covers the
+    /// language, then the dictation one. If neither has its assets on disk, resolving the language
+    /// calls `downloadAndInstall()` from a detached task, which is why this has to be asked *before*
+    /// anything is enqueued rather than inferred from the row's failure afterwards.
+    ///
+    /// Asked through `SpeechEngine.assetsInstalled`, which builds the probe the way a real session
+    /// would. A hand-rolled probe lies: RECON's second `AssetInventory` trap is that installed state
+    /// depends on `attributeOptions`, and `fr-FR` on the general module reads installed with `[]` and
+    /// missing with the `[.transcriptionConfidence, .audioTimeRange]` Edict always requests.
+    ///
+    /// Asking is not free — each check reserves the locale it asks about (RECON §6) — which is
+    /// acceptable here only because this whole suite is gated and takes real reservations anyway.
+    private static func importResolvesWithoutDownloading(_ identifier: String) async -> Bool {
+        let asked = Locale(identifier: identifier)
+        if let general = await SpeechTranscriber.supportedLocale(equivalentTo: asked),
+           await SpeechEngine.assetsInstalled(module: .general, locale: general) {
+            return true
+        }
+        if let dictation = await DictationTranscriber.supportedLocale(equivalentTo: asked),
+           await SpeechEngine.assetsInstalled(module: .dictation, locale: dictation) {
+            return true
+        }
+        return false
+    }
+
     private static func markerHits(_ text: String) -> Int {
         let words = Set(
             text.lowercased()
@@ -752,20 +779,29 @@ struct ImportLocaleEngineTests {
     /// for (RECON §7 explains why it must). So "is this language ready" is only answerable through the
     /// module the app actually builds.
     ///
-    /// A row whose model is genuinely absent is asserted on too, and asserted as a *success* of the
-    /// feature: it fails carrying its own language's sentence, and no transcript is ever written under
-    /// a substituted locale. That is the invariant. `.done` for all three is the expectation on a
-    /// machine with the models, and the loop says which case each row took.
+    /// The en-GB row is **enqueued only if its model is on disk**, and that is a safety measure
+    /// rather than tidiness. `resolveImportPass` answers a language whose model is missing by calling
+    /// `downloadAndInstall()` from a detached task — minutes of somebody's bandwidth, started before
+    /// the row can report anything — and on the machine this was written on the models for
+    /// `en-GB`/`en-AU`/`en-CA` are all absent. The old version enqueued it unconditionally and
+    /// accommodated the resulting `.failed` row, which read as handling the case while in fact paying
+    /// for the download every run. A Mac without British assets has nothing wrong with it, so the row
+    /// is skipped with a printed line saying so.
+    ///
+    /// The `.failed` branch in the loop stays, because it is still the invariant worth pinning: a
+    /// language that cannot be served fails carrying its own language's sentence, and no transcript is
+    /// ever written under a substituted locale. On a machine with all three models the expectation is
+    /// `.done` for all three, and the loop says which case each row took.
     @Test("A mixed batch transcribes each file under its own locale")
     func mixedBatch() async throws {
         let directory = try scratchDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let englishAudio = try Self.synthesise(Self.english, voice: "Samantha", into: directory)
         let indonesianAudio = try Self.synthesise(Self.indonesian, voice: "Damayanti", into: directory)
-        let britishAiff = try Self.synthesise(Self.british, voice: "Daniel", into: directory)
-        // One compressed container in the batch, because the import path's whole reason for using
-        // `AVAssetReader` is that it opens more than raw PCM.
-        let britishAudio = Self.transcode(britishAiff) ?? britishAiff
+
+        // Asked before anything is enqueued, so the answer can keep the row out of the queue rather
+        // than letting the queue discover it and start a download.
+        let britishReady = await Self.importResolvesWithoutDownloading("en-GB")
 
         let (controller, history) = controller(dictationLocale: "en-US")
         let queue = ImportQueue(environment: controller.importEnvironment())
@@ -780,8 +816,20 @@ struct ImportLocaleEngineTests {
 
         queue.enqueue([englishAudio], localeIdentifier: "en-US")
         queue.enqueue([indonesianAudio], localeIdentifier: "id-ID")
-        queue.enqueue([britishAudio], localeIdentifier: "en-GB")
-        #expect(queue.items.map(\.localeIdentifier) == ["en-US", "id-ID", "en-GB"])
+        var expectedLocales = ["en-US", "id-ID"]
+        if britishReady {
+            let britishAiff = try Self.synthesise(Self.british, voice: "Daniel", into: directory)
+            // One compressed container in the batch, because the import path's whole reason for using
+            // `AVAssetReader` is that it opens more than raw PCM.
+            queue.enqueue([Self.transcode(britishAiff) ?? britishAiff], localeIdentifier: "en-GB")
+            expectedLocales.append("en-GB")
+        } else {
+            print("""
+                [import-locale] skipped the en-GB row: neither module has British assets on this Mac, \
+                so enqueueing it would start a real model download rather than fail.
+                """)
+        }
+        #expect(queue.items.map(\.localeIdentifier) == expectedLocales)
         try await drain(queue)
 
         for item in queue.items {
@@ -918,6 +966,20 @@ struct ImportLocaleEngineTests {
 
     /// Reservations are the one piece of global state this feature touches, and RECON §6 records how
     /// they leak: `release` matches on the raw identifier string, and there are only five slots.
+    ///
+    /// `#expect(after.count <= 5)` used to close this test and **could not fail**. The framework
+    /// throws at six and `reserve` catches the throw and evicts, so the count is five or fewer by
+    /// construction — including in the state the assertion was written to rule out, where Edict has
+    /// permanently leaked all five slots to languages nobody is using. What replaces it is a
+    /// subtraction against the inventory as it stood before the import: what the import must have
+    /// done is *add* its own language, and what it must not have done is leave anything else behind.
+    /// Subtraction rather than equality because resolving a pass asset-checks other locales and each
+    /// check reserves one (RECON §6), so `after` is not `before` plus one entry.
+    ///
+    /// The disjunct on the first assertion is not slack. Reservations persist across process launches
+    /// keyed to the bundle identifier, and `id-ID` is Edict's own default second language, so a
+    /// developer's inventory very often holds `id_ID` before this test starts — and a bare
+    /// subtraction would then be empty for a reason that has nothing to do with the code.
     @Test("Importing in a second language reserves it and leaves the reservations sane")
     func reservationsStaySane() async throws {
         let directory = try scratchDirectory()
@@ -934,9 +996,23 @@ struct ImportLocaleEngineTests {
         try await drain(queue)
 
         let after = await engine.reservedLocaleIdentifiers()
-        print("[import-locale] reservations before \(before) after \(after)")
+        let added = Set(after).subtracting(before)
+        print("""
+            [import-locale] reservations before \(before) after \(after) \
+            added \(added.sorted())
+            """)
         #expect(queue.items[0].state == .done)
         #expect(after.contains { Settings.localeKey($0) == Settings.localeKey("id-ID") })
-        #expect(after.count <= 5, "the 5 reservation slots must not be exceeded")
+        #expect(
+            added.contains("id_ID") || before.contains("id_ID"),
+            "the import ran without a reservation for its own language: added \(added.sorted())"
+        )
+        // The two languages this run can justify: the dictation primary the controller prepared, and
+        // the import's own. Anything else is a slot Edict took and forgot, which persists into every
+        // future launch — the failure the count could not see.
+        #expect(
+            added.subtracting(["en_US", "id_ID"]).isEmpty,
+            "the import left reservations behind for languages it never used: \(added.sorted())"
+        )
     }
 }

@@ -164,7 +164,9 @@ public final class ImportQueue {
         /// `SpeechEngine.build(module:locale:)` asks for that attribute explicitly.
         public var segments: [TranscriptSegment]
         public var stats: ImportStats
-        /// Non-nil when the read stopped early. The text before that point is genuine.
+        /// Non-nil when audio is known to be missing from the transcript — the read stopped early,
+        /// buffers were refused by the converter, or the tail was dropped. The text that is here is
+        /// genuine; see `ImportQueue.readVerdict` for how the sentence is built.
         public var incompleteReason: String?
         /// Wall clock for the whole file: open, decode, transcribe, finalize.
         public var wallSeconds: Double
@@ -815,9 +817,22 @@ public final class ImportQueue {
                 return
             }
 
-            // A read that stopped early still produced real text. Saving it with a warning beats
-            // throwing away nine minutes of a ten-minute transcript.
-            let warning = readFailure?.errorDescription
+            // Checked before anything reads `outcome.text`, and checked here rather than left to the
+            // empty-text branch below, because the failure this catches does not throw and does not
+            // set `readFailure`: `AVAudioConverter` refuses every buffer, no chunk is ever handed
+            // over, so the analyzer is fed nothing and returns nothing. That used to reach the
+            // surface as "No speech was found in this file."
+            let verdict = Self.readVerdict(for: stats)
+            if case .undecodable(let reason) = verdict {
+                finish(id, state: .failed(reason: reason), stats: stats)
+                Log.data.error("import undecodable: \(filename, privacy: .public): \(reason, privacy: .public)")
+                return
+            }
+
+            // A read that stopped early, or one that lost buffers on the way, still produced real
+            // text. Saving it with a warning beats throwing away nine minutes of a ten-minute
+            // transcript — and beats keeping it silently, which is the same as claiming it is whole.
+            let warning = Self.warning(readFailure: readFailure, verdict: verdict)
             let elapsed = ContinuousClock.now - began
             let segments = Self.segments(from: outcome.words)
             // Taken before the importer is released, and released straight after: the probe is the
@@ -959,7 +974,45 @@ public final class ImportQueue {
         update(id) { $0.info = outcome.info }
         let info = outcome.info
         let dual = outcome.outcome
-        let warning = dual.failure?.errorDescription
+
+        // The dual pass owns its own decode — `AudioFileImporter.decodeAll`, wired in at
+        // DictationController.runDualPass — so it accumulates the same counters and can fail the same
+        // silent way: every buffer refused, no samples, no sections, no passes, empty text, nothing
+        // thrown. Same verdict and the same sentence, so the two routes cannot come to disagree
+        // about what a file the converter refused looks like.
+        let verdict = Self.readVerdict(for: dual.stats)
+        if case .undecodable(let reason) = verdict {
+            finish(id, state: .failed(reason: reason), stats: dual.stats)
+            Log.data.error("dual-pass undecodable: \(filename, privacy: .public): \(reason, privacy: .public)")
+            return true
+        }
+
+        // Gated on `failedPasses`, not on `passesRun == 0` alone, and the difference is the whole
+        // point: a file of pure silence also runs no passes, because `DualPassImporter` finds no
+        // sections to run them on — and for that file "no speech was found" is the true answer, not
+        // a misdiagnosis. Passes that were attempted and *threw* are the failure worth reporting.
+        if dual.failedPasses > 0, dual.passesRun == 0 {
+            let reason = "None of the \(dual.failedPasses) transcription "
+                + (dual.failedPasses == 1 ? "pass" : "passes")
+                + " could run, so there is no transcript for this file. Try it again."
+            finish(id, state: .failed(reason: reason), stats: dual.stats)
+            Log.data.error("""
+                dual pass produced nothing: \(filename, privacy: .public): \
+                \(dual.failedPasses, privacy: .public) passes failed
+                """)
+            return true
+        }
+
+        // Every sentence that is true about this outcome, in the order the user needs them: what
+        // stopped the decode, how much audio is missing from it, and how many passes never ran.
+        // A failed pass is a *section* absent from the transcript, which no other signal reveals —
+        // the text still reads fluently, it is simply short.
+        var warning = Self.warning(readFailure: dual.failure, verdict: verdict)
+        if dual.failedPasses > 0 {
+            let sentence = "\(dual.failedPasses) of \(dual.passesAttempted) transcription passes "
+                + "could not run; parts of this file are missing from the transcript."
+            warning = [warning, sentence].compactMap { $0 }.joined(separator: " ")
+        }
 
         if dual.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let failure = dual.failure {
             finish(
@@ -1029,6 +1082,7 @@ public final class ImportQueue {
             (\(String(format: "%.1f", result.realtimeFactor), privacy: .public)x) \
             sections=\(dual.sections.count, privacy: .public) \
             passes=\(dual.passesRun, privacy: .public) \
+            failedPasses=\(dual.failedPasses, privacy: .public) \
             locales=\(dual.localeIdentifiers.joined(separator: "+"), privacy: .public) \
             quality=\(result.quality.verdict.rawValue, privacy: .public)\
             \(warning == nil ? "" : " INCOMPLETE", privacy: .public)
@@ -1045,6 +1099,93 @@ public final class ImportQueue {
             guard case .running(let current) = item.state else { return }
             if clamped > current { item.state = .running(progress: clamped) }
         }
+    }
+
+    // MARK: - What the read counters mean for the row
+
+    /// What `ImportStats` says about a read that did **not** throw.
+    ///
+    /// This exists because the interesting import failures are the quiet ones. `AudioFileImporter`
+    /// counts every buffer `AVAudioConverter` refused (`conversionFailures`) and every frame the
+    /// consumer never took (`dropped`). Dropped frames at least also set a `readFailure`, so the row
+    /// said *something*; `conversionFailures` was written, logged and read by nothing in production,
+    /// and so a file whose every buffer was refused produced no chunks, no text, no thrown error and
+    /// a `.done` row — which the surface rendered as "No speech was found in this file.", a confident
+    /// diagnosis of silence over a recording full of speech.
+    ///
+    /// `ImportStats.isSuspect` asks the same question as a Bool and had no caller either, while the
+    /// live-capture path uses its namesake in `AudioCapture`. This answers it with the sentence the
+    /// row has to print, and separates "some audio is missing" from "no audio arrived at all",
+    /// because those two need different terminal states.
+    enum ReadVerdict: Equatable, Sendable {
+        /// Audio arrived and nothing was refused or dropped. Say nothing.
+        case clean
+        /// A real transcript with a hole in it. Keep the text, print the sentence.
+        case incomplete(String)
+        /// Nothing was ever handed to the analyzer, so there is no transcript to keep.
+        case undecodable(String)
+    }
+
+    /// Read the counters, and be specific about what is missing.
+    ///
+    /// Deliberately a pure function of the counters and nothing else: it is the one part of the
+    /// terminal decision that can be tested without a file, a reader or a model, and both the
+    /// single-pass and the dual-pass route go through it so the two cannot drift apart.
+    static func readVerdict(for stats: ImportStats) -> ReadVerdict {
+        guard stats.isSuspect else { return .clean }
+
+        // Nothing decoded *and* buffers refused: the converter turned the whole file away. Distinct
+        // from an empty transcript with clean counters, which really is a file with no speech in it.
+        if stats.chunks == 0, stats.conversionFailures > 0 {
+            return .undecodable(
+                "Edict could not decode this file's audio: all "
+                    + "\(stats.conversionFailures) audio "
+                    + (stats.conversionFailures == 1 ? "buffer was" : "buffers were")
+                    + " refused. It may use a channel layout or codec this Mac cannot convert."
+            )
+        }
+
+        var parts: [String] = []
+        if stats.conversionFailures > 0 {
+            // Named as a share of what was read, so the number means something: "2 of 431" is a
+            // glitch, "400 of 431" is a transcript not worth trusting, and only the user can tell
+            // which of those matters for this recording.
+            parts.append(
+                "\(stats.conversionFailures) of \(stats.chunks + stats.conversionFailures) "
+                    + "audio buffers could not be decoded; parts of this file are missing from the "
+                    + "transcript."
+            )
+        }
+        if stats.dropped > 0 {
+            // The tail, specifically, and that is structural rather than a guess: the reader's
+            // channel is FIFO with back-pressure, so what is lost when the consumer goes away is
+            // always the end (see `ImportStats.dropped`) — the opposite of the live path's failure
+            // mode, where `.bufferingNewest` discards the oldest element (RECON amendment 20).
+            let amount = stats.sampleRate > 0
+                ? String(format: "%.1f seconds", Double(stats.dropped) / stats.sampleRate)
+                : "\(stats.dropped) frames"
+            parts.append(
+                "The last \(amount) of audio never reached the transcriber, so the end of this "
+                    + "file is missing from the transcript."
+            )
+        }
+        // Unreachable while `isSuspect` is exactly these two counters, but a future third counter
+        // must not silently produce an empty warning: an empty sentence in the row would read as a
+        // clean import.
+        guard !parts.isEmpty else { return .clean }
+        return .incomplete(parts.joined(separator: " "))
+    }
+
+    /// The row's warning: every sentence that is true about this read, or `nil` for a clean one.
+    ///
+    /// Both sentences can apply at once and they say different things — the read failure names the
+    /// stage that stopped, the verdict names how much is gone — so neither is allowed to displace
+    /// the other.
+    static func warning(readFailure: AudioImportError?, verdict: ReadVerdict) -> String? {
+        var parts: [String] = []
+        if let sentence = readFailure?.errorDescription { parts.append(sentence) }
+        if case .incomplete(let sentence) = verdict { parts.append(sentence) }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
     // MARK: - Recognition quality

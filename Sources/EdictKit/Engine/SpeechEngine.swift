@@ -172,7 +172,24 @@ public actor SpeechEngine: TranscriptionEngine {
     /// the slot is free" — is not observable from anywhere else, and it is the invariant that broke.
     public var isSlotClaimed: Bool { slotHolder != nil }
 
-    public init() {}
+    /// The five reservation slots and the asset-installation check, behind one protocol.
+    ///
+    /// Every `AssetInventory` call in this actor goes through here. See `LocaleReservations` for why
+    /// the asset check has to be part of it and not just `reserve`/`release`.
+    private let reservations: any LocaleReservations
+
+    public init() {
+        self.reservations = SystemReservations()
+    }
+
+    /// The seam. `internal`, because this is the only reason it exists: `FakeReservations` in the
+    /// test target reproduces the two measured behaviours the ladder turns on — a sixth distinct
+    /// locale throwing `SFSpeechErrorDomain` Code=11, and `release` refusing anything whose
+    /// identifier does not match byte for byte — so the eviction ladder, the keep set and the prune
+    /// can all be driven on a machine with no speech assets, no network and no slots to lose.
+    init(reservations: any LocaleReservations) {
+        self.reservations = reservations
+    }
 
     // MARK: - Locale and assets
 
@@ -186,6 +203,9 @@ public actor SpeechEngine: TranscriptionEngine {
             let canonical = try await reserveLocale(localeIdentifier)
             canonicalLocale = canonical
 
+            // The one framework call left in here that does not go through `LocaleReservations`, and
+            // the reason the ladder tests still touch a real `DictationTranscriber`. It downloads
+            // nothing and takes no reservation.
             let probe = Self.makeModule(locale: canonical)
             guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [probe]) else {
                 throw SpeechEngineError.noAudioFormat
@@ -195,7 +215,11 @@ public actor SpeechEngine: TranscriptionEngine {
             // Gate on the installation request being nil, NOT on `AssetInventory.status(forModules:)`:
             // RECON §6 measured status returning `.supported` (not `.installed`) for locales whose assets are
             // on disk, which would trigger a pointless download every launch.
-            let request = try await AssetInventory.assetInstallationRequest(supporting: [probe])
+            //
+            // `probe` is deliberately not reused: the seam builds its own, with the same `build`, so
+            // that no caller can ask the installed question with the wrong `attributeOptions`. The
+            // price is one extra module construction at launch, measured warm at ~2.5 ms (RECON §3).
+            let request = try await reservations.installationRequest(module: .dictation, locale: canonical)
             modelState = request == nil ? .ready : .needsDownload
 
             Log.stt.info(
@@ -228,8 +252,7 @@ public actor SpeechEngine: TranscriptionEngine {
             secondaryLocale = canonical
             secondaryFormat = nil
 
-            let probe = Self.makeModule(locale: canonical)
-            let request = try await AssetInventory.assetInstallationRequest(supporting: [probe])
+            let request = try await reservations.installationRequest(module: .dictation, locale: canonical)
             secondaryAssetsReady = request == nil
             secondaryModelState = secondaryAssetsReady ? .ready : .needsDownload
 
@@ -275,9 +298,9 @@ public actor SpeechEngine: TranscriptionEngine {
                 """)
             return
         }
-        for reserved in await AssetInventory.reservedLocales
+        for reserved in await reservations.reservedLocales
         where reserved.identifier == locale.identifier {
-            let released = await AssetInventory.release(reservedLocale: reserved)
+            let released = await reservations.release(reservedLocale: reserved)
             Log.stt.info("released \(reserved.identifier, privacy: .public): \(released, privacy: .public)")
         }
     }
@@ -337,7 +360,7 @@ public actor SpeechEngine: TranscriptionEngine {
 
     /// The reservation state as the framework sees it, for the launch log and for diagnostics.
     public func reservedLocaleIdentifiers() async -> [String] {
-        await AssetInventory.reservedLocales.map(\.identifier).sorted()
+        await reservations.reservedLocales.map(\.identifier).sorted()
     }
 
     /// Release every reservation Edict does not currently want.
@@ -363,8 +386,8 @@ public actor SpeechEngine: TranscriptionEngine {
         guard !keep.isEmpty else { return [] }
 
         var released: [String] = []
-        for reserved in await AssetInventory.reservedLocales where !keep.contains(reserved.identifier) {
-            if await AssetInventory.release(reservedLocale: reserved) {
+        for reserved in await reservations.reservedLocales where !keep.contains(reserved.identifier) {
+            if await reservations.release(reservedLocale: reserved) {
                 released.append(reserved.identifier)
             } else {
                 Log.stt.error("release(\(reserved.identifier, privacy: .public)) refused")
@@ -403,7 +426,7 @@ public actor SpeechEngine: TranscriptionEngine {
     /// import path can reserve a `SpeechTranscriber` locale, which resolves through a *different*
     /// module and therefore cannot go through the dictation resolver above.
     private func reserve(_ canonical: Locale) async throws {
-        let existing = await AssetInventory.reservedLocales
+        let existing = await reservations.reservedLocales
         // Logged at every prepare because the probe leaked slots during exploration and a leak is invisible
         // until reservation starts failing outright.
         Log.stt.debug("reserved locales: \(existing.map(\.identifier).joined(separator: ","), privacy: .public)")
@@ -412,7 +435,7 @@ public actor SpeechEngine: TranscriptionEngine {
 
         do {
             // `false` means "already reserved" and is not an error.
-            _ = try await AssetInventory.reserve(locale: canonical)
+            _ = try await reservations.reserve(locale: canonical)
         } catch {
             // SFSpeechErrorDomain Code=11 "Too many allocated locales, 5 maximum". Evict everything
             // outside `keepSet()` and retry. Everything Edict is actually using is spared: the two
@@ -425,11 +448,14 @@ public actor SpeechEngine: TranscriptionEngine {
             Log.stt.warning("reserve(\(canonical.identifier, privacy: .public)) failed, evicting: \(Self.describe(error), privacy: .public)")
             var keep = keepSet()
             keep.insert(canonical.identifier)
-            for stale in await AssetInventory.reservedLocales where !keep.contains(stale.identifier) {
-                _ = await AssetInventory.release(reservedLocale: stale)
+            // Only ever a `Locale` taken straight from `reservedLocales`: `release` matches on the
+            // raw identifier string (RECON §6), so a rebuilt one would return false, evict nothing,
+            // and leave the retry below hitting the same Code=11.
+            for stale in await reservations.reservedLocales where !keep.contains(stale.identifier) {
+                _ = await reservations.release(reservedLocale: stale)
             }
             do {
-                _ = try await AssetInventory.reserve(locale: canonical)
+                _ = try await reservations.reserve(locale: canonical)
             } catch {
                 throw SpeechEngineError.reservationFailed(Self.describe(error))
             }
@@ -439,20 +465,24 @@ public actor SpeechEngine: TranscriptionEngine {
     /// Download the locale's assets if they are missing. No-op when `prepare` already reported `.ready`.
     public func installModelIfNeeded(progress: @Sendable (Double) -> Void) async throws {
         guard let locale = canonicalLocale else { throw SpeechEngineError.notPrepared }
-        let probe = Self.makeModule(locale: locale)
 
         do {
-            guard let request = try await AssetInventory.assetInstallationRequest(supporting: [probe]) else {
+            guard let request = try await reservations.installationRequest(
+                module: .dictation,
+                locale: locale
+            ) else {
                 modelState = .ready
                 progress(1.0)
                 return
             }
             modelState = .downloading(0)
             progress(0)
-            // Coarse 0 → 1 reporting: `AssetInstallationRequest.progress` is a `Progress`, which is not
-            // `Sendable`, so it cannot be polled from a child task under strict concurrency. RECON never
-            // exercised this path at all (assets were already installed and the request came back nil in
-            // 0.07 s), so a smarter progress bridge should wait until it can be measured.
+            // Coarse 0 → 1 reporting: the framework's `AssetInstallationRequest.progress` is a
+            // `Progress`, which is not `Sendable`, so it cannot be polled from a child task under
+            // strict concurrency — which is why `AssetInstallation` does not expose it and this
+            // holds only the download call. RECON never exercised this path at all (assets were
+            // already installed and the request came back nil in 0.07 s), so a smarter progress
+            // bridge should wait until it can be measured.
             try await request.downloadAndInstall()
             modelState = .ready
             progress(1.0)
@@ -877,16 +907,15 @@ public actor SpeechEngine: TranscriptionEngine {
             )
         }
 
-        let probe = Self.makeModule(locale: locale)
         // Gate on the request being nil, not on `AssetInventory.status` (RECON §6: status reports
         // `.supported` rather than `.installed` for assets that are on disk but unreserved).
         //
-        // `try?` is deliberately NOT used here: it flattens `AssetInstallationRequest??` into one
+        // `try?` is deliberately NOT used here: it flattens `(any AssetInstallation)??` into one
         // optional, which would make "assets already installed" indistinguishable from "the check
         // itself failed" — and those two must not take the same branch.
-        let pending: AssetInstallationRequest?
+        let pending: (any AssetInstallation)?
         do {
-            pending = try await AssetInventory.assetInstallationRequest(supporting: [probe])
+            pending = try await reservations.installationRequest(module: .dictation, locale: locale)
         } catch {
             throw SpeechEngineError.assetInstallFailed(
                 "The \(Self.languageName(locale)) speech model could not be checked: \(Self.describe(error))"
@@ -906,7 +935,7 @@ public actor SpeechEngine: TranscriptionEngine {
     }
 
     /// Park one `downloadAndInstall()` under its own language's key.
-    private func startDownload(_ request: AssetInstallationRequest, for locale: Locale) {
+    private func startDownload(_ request: any AssetInstallation, for locale: Locale) {
         let identifier = locale.identifier
         downloads[identifier] = Task { [weak self] in
             do {
@@ -1136,9 +1165,21 @@ public actor SpeechEngine: TranscriptionEngine {
         }
     }
 
-    /// Kept as the dictation-only shorthand the asset paths use.
+    /// Kept as the dictation-only shorthand `prepare`'s format query uses.
     private static func makeModule(locale: Locale) -> any SpeechModule {
         build(module: .dictation, locale: locale).module
+    }
+
+    /// The module `SystemReservations` asks `AssetInventory` about.
+    ///
+    /// `fileprivate` only so the seam next door can reach it, and routed through `build` rather than
+    /// constructing a transcriber of its own, because RECON's second `AssetInventory` trap is that
+    /// installed state depends on `attributeOptions`: `fr-FR` on the general module reads installed
+    /// with `[]` and missing with the `[.transcriptionConfidence, .audioTimeRange]` this app always
+    /// requests. Only a module built the way the session will build it can answer "are these assets
+    /// on disk" for the session that is about to run.
+    fileprivate static func probeModule(module: TranscriptionModule, locale: Locale) -> any SpeechModule {
+        build(module: module, locale: locale).module
     }
 
     /// Whether the assets for the module Edict would *actually build* for this locale are on disk.
@@ -1151,21 +1192,29 @@ public actor SpeechEngine: TranscriptionEngine {
     /// this machine, so for the three locales the gated reservation suite uses, the general-module
     /// asset check is the only thing standing between that suite and a real download.
     ///
-    /// It goes through `build` rather than constructing a probe of its own because a hand-rolled
-    /// probe lies. RECON's second `AssetInventory` trap: installed state depends on
-    /// `attributeOptions`, and `fr-FR` on the general module reads **installed** with `[]` and
-    /// **missing** with the `[.transcriptionConfidence, .audioTimeRange]` this app always requests.
-    /// Only a module built with the real options can answer this question.
+    /// It asks through `LocaleReservations`, whose production implementation builds the probe with
+    /// `build` rather than rolling one of its own, because a hand-rolled probe lies. RECON's second
+    /// `AssetInventory` trap: installed state depends on `attributeOptions`, and `fr-FR` on the
+    /// general module reads **installed** with `[]` and **missing** with the
+    /// `[.transcriptionConfidence, .audioTimeRange]` this app always requests. Only a module built
+    /// with the real options can answer this question.
     ///
     /// **Asking is not free.** RECON §6 measured `assetInstallationRequest(supporting:)` reserving
     /// the locale it is asked about as a side effect — that is what silently consumed a `ja-JP` slot
     /// during probing — so a caller must prune afterwards. And "cannot tell" answers `false`: for a
     /// skip decision an unanswerable check and a missing model belong on the same branch, and the
     /// branch that does less is the safe one.
-    static func assetsInstalled(module: TranscriptionModule, locale: Locale) async -> Bool {
+    ///
+    /// `static`, so it carries the seam as a parameter: it is the pre-flight a test runs *before* an
+    /// engine exists, to decide whether asking `resolveImportPass` for a language would start a real
+    /// download.
+    static func assetsInstalled(
+        module: TranscriptionModule,
+        locale: Locale,
+        reservations: any LocaleReservations = SystemReservations()
+    ) async -> Bool {
         do {
-            let probe = build(module: module, locale: locale).module
-            return try await AssetInventory.assetInstallationRequest(supporting: [probe]) == nil
+            return try await reservations.installationRequest(module: module, locale: locale) == nil
         } catch {
             Log.stt.warning("""
                 assets for \(locale.identifier, privacy: .public) on \
@@ -1238,11 +1287,11 @@ public actor SpeechEngine: TranscriptionEngine {
         let keep = keepSet()
         guard !keep.isEmpty else { return }
         var released: [String] = []
-        for reserved in await AssetInventory.reservedLocales where !keep.contains(reserved.identifier) {
+        for reserved in await reservations.reservedLocales where !keep.contains(reserved.identifier) {
             // Only ever a `Locale` taken straight from `reservedLocales` — RECON §6: `release`
             // matches on the raw identifier string, so a rebuilt `Locale(identifier: "id-ID")`
             // returns false against a stored `"id_ID"` and leaks the slot for every future launch.
-            if await AssetInventory.release(reservedLocale: reserved) {
+            if await reservations.release(reservedLocale: reserved) {
                 released.append(reserved.identifier)
             } else {
                 Log.stt.error("release(\(reserved.identifier, privacy: .public)) refused")
@@ -1329,12 +1378,11 @@ public actor SpeechEngine: TranscriptionEngine {
            ) {
             do {
                 try await reserve(canonical)
-                let probe = Self.build(module: .general, locale: canonical).module
                 // Falling through from here leaves this reservation held with no memo behind it —
                 // usually harmless, because the dictation branch below reserves the same identifier
                 // for the same language, and otherwise released by the next resolution's prune,
                 // which sweeps everything outside the keep set rather than only what it evicted.
-                if try await AssetInventory.assetInstallationRequest(supporting: [probe]) == nil {
+                if try await reservations.installationRequest(module: .general, locale: canonical) == nil {
                     return remember(
                         ImportPass(
                             module: .general,
@@ -1371,13 +1419,12 @@ public actor SpeechEngine: TranscriptionEngine {
             )
         }
 
-        let probe = Self.makeModule(locale: canonical)
-        let pending: AssetInstallationRequest?
+        let pending: (any AssetInstallation)?
         do {
             // Gated on the request being nil, never on `AssetInventory.status` — RECON amendment 6
             // measured that reporting `.supported` for an installed-but-unreserved locale, which
             // would trigger a pointless download.
-            pending = try await AssetInventory.assetInstallationRequest(supporting: [probe])
+            pending = try await reservations.installationRequest(module: .dictation, locale: canonical)
         } catch {
             return .unavailable(
                 "The \(Self.languageName(canonical)) speech model could not be checked: \(Self.describe(error))"
@@ -1545,6 +1592,102 @@ public actor SpeechEngine: TranscriptionEngine {
 
     private static func describe(_ error: Error) -> String {
         (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+    }
+}
+
+// MARK: - The reservation seam
+
+/// The five locale reservation slots, and the asset check that quietly takes one of them.
+///
+/// A protocol rather than `AssetInventory` statics reached directly, because of what the absence of
+/// one cost. The Code=11 → evict-outside-keep → retry ladder in `SpeechEngine.reserve` is the most
+/// consequential global state this app touches: the slots persist across process launches keyed to
+/// the bundle identifier, so getting it wrong strands the *user's* app and not merely a test run.
+/// It had no seam, so the only tests that could reach it drove the real framework and were gated
+/// behind `EDICT_SPEECH_TESTS=1` — which cannot run on the machine this was written on. That suite
+/// resolves `en-GB`/`en-AU`/`en-CA`, whose general-module assets are absent here, so
+/// `resolveImportPass` falls through to the dictation branch and calls `downloadAndInstall()` in a
+/// detached task, before the `try #require` meant to report the problem can fire. Three bugs shipped
+/// underneath that gate in one round — a hardcoded `let isSecondary = true`, an `if false,` that
+/// dead-coded the memo eviction, and a `keepSet()` whose one-line body contradicted its own ten-line
+/// doc comment — each with a fully green suite.
+///
+/// **`installationRequest` is in here, and that is the whole point.** RECON §6 measured
+/// `assetInstallationRequest(supporting:)` *reserving the locale it is asked about* as a side
+/// effect — it is what silently consumed a `ja-JP` slot during probing — which makes the
+/// availability check the primary route to exhaustion. A reserve/release-only seam would leave the
+/// headline mechanism untestable and the finding unfixed.
+///
+/// It takes `(module:locale:)` rather than the framework's `[any SpeechModule]` for two reasons.
+/// `SpeechModule` exposes no locale, so a double handed one could not tell which language it was
+/// being asked about. And RECON's second `AssetInventory` trap makes a hand-rolled probe a liar:
+/// installed state depends on `attributeOptions`, and `fr-FR` on the general module reads
+/// **installed** with `[]` and **missing** with the `[.transcriptionConfidence, .audioTimeRange]`
+/// this app always requests. Building the probe inside `SystemReservations`, through the same
+/// `SpeechEngine.build` a real session uses, is what makes it impossible for a caller to ask the
+/// question with the wrong options.
+protocol LocaleReservations: Sendable {
+    /// Exactly what the framework holds, in the framework's own spelling.
+    ///
+    /// The spelling is load-bearing. `release(reservedLocale:)` matches on the raw
+    /// `Locale.identifier` *string* (RECON §6), so every release must hand back an object taken from
+    /// here — a rebuilt `Locale(identifier: "id-ID")` does not match a stored `"id_ID"`, returns
+    /// false, does nothing, and leaks the slot for every future launch.
+    var reservedLocales: [Locale] { get async }
+
+    /// - Returns: `false` when the locale was already reserved, which is not an error.
+    @discardableResult
+    func reserve(locale: Locale) async throws -> Bool
+
+    /// - Returns: whether anything was released — `false` for an identifier that does not match a
+    ///   held one byte for byte.
+    @discardableResult
+    func release(reservedLocale: Locale) async -> Bool
+
+    /// Whether this module-and-locale's assets are on disk, expressed as the request that would
+    /// install them.
+    ///
+    /// - Returns: `nil` when the assets are already installed. That is the gate the whole app uses,
+    ///   never `AssetInventory.status`, which reports `.supported` rather than `.installed` for a
+    ///   locale whose assets are on disk but unreserved (RECON §6).
+    func installationRequest(
+        module: TranscriptionModule,
+        locale: Locale
+    ) async throws -> (any AssetInstallation)?
+}
+
+/// One pending asset download.
+///
+/// Abstracted for a mechanical reason: `AssetInstallationRequest` is a `final class` with no public
+/// initialiser, so nothing can construct one — and without a stand-in, every test that reaches the
+/// "this model is not on disk" branch starts a real download of somebody's bandwidth.
+protocol AssetInstallation: Sendable {
+    func downloadAndInstall() async throws
+}
+
+extension AssetInstallationRequest: AssetInstallation {}
+
+/// The real thing: `AssetInventory`, asked about probes built the way the sessions build them.
+struct SystemReservations: LocaleReservations {
+    var reservedLocales: [Locale] {
+        get async { await AssetInventory.reservedLocales }
+    }
+
+    func reserve(locale: Locale) async throws -> Bool {
+        try await AssetInventory.reserve(locale: locale)
+    }
+
+    func release(reservedLocale: Locale) async -> Bool {
+        await AssetInventory.release(reservedLocale: reservedLocale)
+    }
+
+    func installationRequest(
+        module: TranscriptionModule,
+        locale: Locale
+    ) async throws -> (any AssetInstallation)? {
+        try await AssetInventory.assetInstallationRequest(
+            supporting: [SpeechEngine.probeModule(module: module, locale: locale)]
+        )
     }
 }
 

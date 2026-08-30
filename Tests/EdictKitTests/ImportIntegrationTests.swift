@@ -368,6 +368,249 @@ struct ImportIntegrationTests {
         #expect(queue.items.first?.transcriptID == nil)
     }
 
+    // MARK: - What the read counters mean for the row
+
+    /// `ImportStats` with only the counters a test cares about set.
+    private func counters(
+        chunks: Int = 0,
+        conversionFailures: Int = 0,
+        dropped: Int = 0,
+        sampleRate: Double = 16_000
+    ) -> ImportStats {
+        var stats = ImportStats()
+        stats.chunks = chunks
+        stats.conversionFailures = conversionFailures
+        stats.dropped = dropped
+        stats.sampleRate = sampleRate
+        return stats
+    }
+
+    @Test("A clean read says nothing at all")
+    func cleanCountersSayNothing() {
+        #expect(ImportQueue.readVerdict(for: counters(chunks: 431)) == .clean)
+        #expect(ImportQueue.readVerdict(for: ImportStats()) == .clean)
+    }
+
+    /// The heart of finding #1. Every buffer refused by `AVAudioConverter` throws nothing, sets no
+    /// `readFailure` and hands the analyzer nothing, so the file used to finish `.done` with empty
+    /// text — which the surface rendered as "No speech was found in this file."
+    @Test("No chunks and refused buffers is a decode failure, not a silent file")
+    func everyBufferRefused() throws {
+        let verdict = ImportQueue.readVerdict(for: counters(chunks: 0, conversionFailures: 431))
+        guard case .undecodable(let reason) = verdict else {
+            Issue.record("expected .undecodable, got \(verdict)")
+            return
+        }
+        #expect(reason.contains("could not decode"))
+        // Specific about what is missing, per the rule the whole finding is about.
+        #expect(reason.contains("431"))
+    }
+
+    @Test("Some refused buffers is a real transcript with a hole, named as a share of the file")
+    func someBuffersRefused() throws {
+        let verdict = ImportQueue.readVerdict(for: counters(chunks: 429, conversionFailures: 2))
+        guard case .incomplete(let sentence) = verdict else {
+            Issue.record("expected .incomplete, got \(verdict)")
+            return
+        }
+        // "2 of 431" is checkable against the recording; "some audio was lost" is not.
+        #expect(sentence.contains("2 of 431"))
+        #expect(sentence.contains("missing from the transcript"))
+    }
+
+    @Test("Dropped frames name the tail, in seconds of audio")
+    func droppedTailIsNamed() throws {
+        // 32 000 frames at the analyzer's 16 kHz is exactly two seconds.
+        let verdict = ImportQueue.readVerdict(for: counters(chunks: 100, dropped: 32_000))
+        guard case .incomplete(let sentence) = verdict else {
+            Issue.record("expected .incomplete, got \(verdict)")
+            return
+        }
+        #expect(sentence.contains("2.0 seconds"))
+        #expect(sentence.contains("end of this file"))
+    }
+
+    @Test("A read failure and lost audio are both stated; neither displaces the other")
+    func warningKeepsBothSentences() throws {
+        let warning = try #require(ImportQueue.warning(
+            readFailure: .readFailed(filename: "board.m4a", reason: "the reader gave up"),
+            verdict: ImportQueue.readVerdict(for: counters(chunks: 429, conversionFailures: 2))
+        ))
+        #expect(warning.contains("board.m4a"))
+        #expect(warning.contains("2 of 431"))
+        #expect(ImportQueue.warning(readFailure: nil, verdict: .clean) == nil)
+    }
+
+    // MARK: - Dual-pass terminal states
+
+    /// One finished dual-pass job, as the injected closure hands it back. Nothing here needs a model:
+    /// what is under test is the queue turning counters into a terminal state and a sentence.
+    private nonisolated static func dualJob(
+        text: String,
+        passesRun: Int,
+        failedPasses: Int,
+        stats: ImportStats,
+        failure: AudioImportError? = nil,
+        filename: String = "meeting.m4a"
+    ) -> ImportQueue.DualPassJob {
+        ImportQueue.DualPassJob(
+            info: AudioFileInfo(
+                url: URL(fileURLWithPath: "/tmp/\(filename)"),
+                filename: filename,
+                duration: 120,
+                sampleRate: 48_000,
+                channelCount: 2,
+                codec: "AAC",
+                hasVideo: false
+            ),
+            outcome: DualPassOutcome(
+                sections: [],
+                text: text,
+                segments: [],
+                localeIdentifiers: ["en-US"],
+                speechDuration: 60,
+                meanConfidence: 0.9,
+                lowConfidenceWords: [],
+                passesRun: passesRun,
+                failedPasses: failedPasses,
+                stats: stats,
+                failure: failure
+            ),
+            wallSeconds: 3
+        )
+    }
+
+    /// A queue whose dual pass always serves this one job, and whose single pass must never run.
+    private func dualQueue(_ job: ImportQueue.DualPassJob) -> ImportQueue {
+        ImportQueue(
+            environment: ImportQueue.Environment(
+                analyzerFormat: { AudioFormats.analyzerFallback() },
+                transcribe: { stream, _ in
+                    for await _ in stream {}
+                    Issue.record("the single pass must not run for a file the dual pass served")
+                    return TranscriptionOutcome(
+                        text: "", confidence: nil, latency: 0, audioDuration: 0
+                    )
+                },
+                dualPass: { _, _ in job }
+            )
+        )
+    }
+
+    /// The URL never has to exist: `enqueue` does not touch the file, and the dual-pass closure is
+    /// offered the file before the streaming reader is built, so this row never opens anything.
+    private var absentFile: URL { URL(fileURLWithPath: "/tmp/edict-never-read-\(UUID().uuidString).m4a") }
+
+    @Test("A dual pass whose every buffer was refused fails the row instead of reporting silence")
+    func dualPassUndecodableFails() async throws {
+        let queue = dualQueue(Self.dualJob(
+            text: "",
+            passesRun: 0,
+            failedPasses: 0,
+            stats: counters(chunks: 0, conversionFailures: 431)
+        ))
+        queue.onFinish = { _ in
+            Issue.record("a file that decoded to nothing must not reach history")
+            return nil
+        }
+
+        queue.enqueue(absentFile)
+        try await drain(queue)
+
+        let row = try #require(queue.items.first)
+        guard case .failed(let reason) = row.state else {
+            Issue.record("expected a failed row, got \(row.state)")
+            return
+        }
+        #expect(reason.contains("could not decode"))
+        #expect(row.transcriptID == nil)
+    }
+
+    @Test("A dual pass where every pass threw fails the row and counts the passes")
+    func dualPassWithNoSuccessfulPassFails() async throws {
+        let queue = dualQueue(Self.dualJob(
+            text: "",
+            passesRun: 0,
+            failedPasses: 6,
+            stats: counters(chunks: 431)
+        ))
+        queue.onFinish = { _ in
+            Issue.record("a file with no transcript must not reach history")
+            return nil
+        }
+
+        queue.enqueue(absentFile)
+        try await drain(queue)
+
+        let row = try #require(queue.items.first)
+        guard case .failed(let reason) = row.state else {
+            Issue.record("expected a failed row, got \(row.state)")
+            return
+        }
+        #expect(reason.contains("6"))
+        #expect(reason.contains("could run"))
+    }
+
+    @Test("A dual pass that lost some passes keeps its transcript and says which part is missing")
+    func dualPassPartialLossWarns() async throws {
+        let queue = dualQueue(Self.dualJob(
+            text: "Okay team let us review the quarterly numbers",
+            passesRun: 90,
+            failedPasses: 6,
+            stats: counters(chunks: 431)
+        ))
+        let received = Box<ImportQueue.Result?>(nil)
+        queue.onFinish = { received.value = $0; return UUID() }
+
+        queue.enqueue(absentFile)
+        try await drain(queue)
+
+        let row = try #require(queue.items.first)
+        // Kept, not failed: 90 passes' worth of transcript is worth far more than an error.
+        #expect(row.state == .done)
+        let warning = try #require(row.warning, "a row that lost 6 passes must say so")
+        #expect(warning.contains("6 of 96"))
+        #expect(warning.contains("missing from the transcript"))
+        // And it reaches the stored transcript, not only the queue row: the history entry is what
+        // outlives the import, so the incompleteness has to travel with it.
+        #expect(try #require(received.value).incompleteReason == warning)
+    }
+
+    @Test("A dual pass that lost buffers on the way keeps its transcript and warns")
+    func dualPassSuspectStatsWarn() async throws {
+        let queue = dualQueue(Self.dualJob(
+            text: "Okay team let us review the quarterly numbers",
+            passesRun: 96,
+            failedPasses: 0,
+            stats: counters(chunks: 429, conversionFailures: 2)
+        ))
+        queue.onFinish = { _ in UUID() }
+
+        queue.enqueue(absentFile)
+        try await drain(queue)
+
+        let row = try #require(queue.items.first)
+        #expect(row.state == .done)
+        #expect(try #require(row.warning).contains("2 of 431"))
+    }
+
+    @Test("A clean dual pass carries no warning at all")
+    func dualPassCleanHasNoWarning() async throws {
+        let queue = dualQueue(Self.dualJob(
+            text: "Okay team let us review the quarterly numbers",
+            passesRun: 96,
+            failedPasses: 0,
+            stats: counters(chunks: 431)
+        ))
+        queue.onFinish = { _ in UUID() }
+
+        queue.enqueue(absentFile)
+        try await drain(queue)
+
+        #expect(queue.items.first?.state == .done)
+        #expect(queue.items.first?.warning == nil)
+    }
+
     // MARK: - Video
 
     @Test("A video container is opened for its audio track and tagged as video")

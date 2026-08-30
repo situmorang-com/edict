@@ -1059,7 +1059,11 @@ public struct TranscriptExportKeys: View {
         HStack(spacing: D.space.xs) {
             ForEach(TranscriptExportFormat.allCases, id: \.self) { format in
                 let isAvailable = available.contains(format)
-                TapeButton(format.fileExtension, minWidth: M.keyWidth) {
+                // `ReportingButton`, not `TapeButton`: the write can fail on a read-only volume, a
+                // full disk or an iCloud path that has not materialised, and a bare key made every
+                // one of those look identical to success. The template is the longest legend the cap
+                // can ever show, so a report never resizes the key or nudges its two neighbours.
+                ReportingButton(format.fileExtension, template: "couldn't write", minWidth: M.keyWidth) {
                     TranscriptFileExport.save(transcript, as: format)
                 }
                 .disabled(!isAvailable)
@@ -1118,8 +1122,20 @@ enum MediaOpenPanel {
 /// file system, not Edict's panel.
 enum TranscriptFileExport {
 
+    /// Run the panel and write the file.
+    ///
+    /// - Returns: what to print on the key that was pressed, or `nil` when the user cancelled the
+    ///   panel — the one outcome a key must stay quiet about, because the user caused it.
+    ///
+    /// It returns a report rather than nothing because a failed write is *invisible* otherwise. The
+    /// panel dismisses itself, the key springs back, and there is no file: a read-only volume, a full
+    /// disk and an iCloud folder that has not materialised all look exactly like success. Nothing is
+    /// lost — the transcript is still in HISTORY — but the app claimed an outcome it never verified,
+    /// which is the rule `ActionReport` exists to enforce.
+    ///
+    /// `NSSavePanel` runs its own replace confirmation, so overwriting is the panel's business.
     @MainActor
-    static func save(_ transcript: Transcript, as format: TranscriptExportFormat) {
+    static func save(_ transcript: Transcript, as format: TranscriptExportFormat) -> ActionReport? {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [format.contentType]
         panel.nameFieldStringValue = TranscriptExport.suggestedFilename(for: transcript, format: format)
@@ -1127,13 +1143,51 @@ enum TranscriptFileExport {
         panel.isExtensionHidden = false
         panel.message = "Save the transcript of \(transcript.source.displayName)."
 
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return write(transcript, as: format, to: url)
+    }
+
+    /// The write on its own, split out from the panel so it can be tested.
+    ///
+    /// `NSSavePanel.runModal` is system UI and cannot be driven from a test, but "what does this key
+    /// say when the destination refuses the file" is exactly the question worth pinning down, and it
+    /// is answerable without a panel.
+    static func write(
+        _ transcript: Transcript,
+        as format: TranscriptExportFormat,
+        to url: URL
+    ) -> ActionReport {
         do {
             try TranscriptExport.data(for: transcript, format: format)
                 .write(to: url, options: .atomic)
             Log.data.info("Exported a transcript as \(format.rawValue, privacy: .public).")
+            return .done("written")
         } catch {
+            // The whole sentence goes to the log, where there is room for it; the cap gets the few
+            // words it can hold. Both, not either — see `shortReason`.
             Log.data.error("Could not write the export: \(error.localizedDescription, privacy: .public)")
+            return .failed(shortReason(for: error))
+        }
+    }
+
+    /// A write failure in as many words as fit on a key cap.
+    ///
+    /// `localizedDescription` is a whole sentence ("You don't have permission to save the file …"),
+    /// and `ReportingButton` prints its report *on the cap*, whose width is reserved for `template`.
+    /// So the cap gets the distinction that changes what the user does next — a full disk, a
+    /// read-only volume, a folder that is not there and a permission problem need four different
+    /// remedies — and the log keeps the sentence. Anything unrecognised falls back to the honest
+    /// "couldn't write", which claims only what we know: it did not work.
+    static func shortReason(for error: Error) -> String {
+        let nsError = error as NSError
+        guard nsError.domain == NSCocoaErrorDomain else { return "couldn't write" }
+        switch CocoaError.Code(rawValue: nsError.code) {
+        case .fileWriteOutOfSpace: return "disk full"
+        case .fileWriteVolumeReadOnly: return "read-only"
+        case .fileWriteNoPermission: return "no permission"
+        // A missing parent directory, and an unmaterialised iCloud path, both land here.
+        case .fileNoSuchFile, .fileWriteInvalidFileName: return "bad path"
+        default: return "couldn't write"
         }
     }
 }
@@ -1289,7 +1343,10 @@ public enum ImportPreviewFixtures {
                 filename: "client-call.m4a",
                 duration: 2_400,
                 state: .transcribing(0.5),
-                note: "Two languages per section — 24 of 96 passes done",
+                // Verbatim from `AppModel.note(for:)`, which counts passes *attempted* — so no
+                // "done": a fixture that reads better than the shipping string is a fixture that
+                // stops catching the shipping string's problems.
+                note: "Two languages per section — 24 of 96 passes",
                 localeIdentifier: "en-US",
                 localeWasChosen: false,
                 secondPassLocaleIdentifier: "id-ID"

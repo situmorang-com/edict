@@ -308,6 +308,15 @@ final class TranscriptSink: @unchecked Sendable {
 
     var committed: String { lock.withLock { committedLocked } }
 
+    /// How many finals are held. A test seam, with no reader in Sources.
+    ///
+    /// `TranscriptSinkTests` needs it because the replace-vs-append rule at the top of `ingest` is a
+    /// rule about *this array*, and `committed` witnesses it only indirectly — through whatever text a
+    /// wrongly-appended duplicate happens to add. Asserting the count states the rule itself, and is
+    /// the only way to say "three volatiles added no finals" rather than "three volatiles left the
+    /// joined text unchanged".
+    var finalCount: Int { lock.withLock { finals.count } }
+
     var allWords: [WordConfidence] { lock.withLock { words } }
 
     /// Deduped, order-preserving list of the words the engine was unsure about.

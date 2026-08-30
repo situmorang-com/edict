@@ -202,6 +202,47 @@ struct InjectionRecoveryTests {
 
 // MARK: - Learned policy
 
+/// An in-memory `UserDefaults` that counts write-throughs of the injection policy map.
+///
+/// Why not `EphemeralDefaults`: it is `final`, and it counts nothing. This repeats its trick for the
+/// same measured reason — a suite domain, once written to, is re-persisted by cfprefsd on its own
+/// schedule and cannot be cleaned up in-process (see `EphemeralDefaults` for the table), so a domain
+/// that is never created is the only teardown that works. Every read and write below is answered out
+/// of `store` without reaching `super`.
+///
+/// The count exists because a demotion that ignores its idempotence guard and one that respects it
+/// leave *the same value* behind. Asserting on the strategy alone would pass against both, which is
+/// the class of test this phase is meant to stop writing.
+///
+/// `@unchecked Sendable`: `UserDefaults` is already `Sendable`, so this cannot be actor-confined; the
+/// dictionary and the counter are genuinely guarded by `lock` instead.
+private final class CountingDefaults: UserDefaults, @unchecked Sendable {
+
+    private let lock = NSLock()
+    private var store: [String: Any] = [:]
+    private var writes = 0
+
+    /// `init(suiteName:)` is `UserDefaults`' only designated initializer, and `nil` means "the default
+    /// search list" — the cheapest thing to hand the superclass, and never written to.
+    init() { super.init(suiteName: nil)! }
+
+    /// Writes of `InjectPolicyStore.key` only, so an unrelated key cannot inflate the count.
+    var policyWriteCount: Int { lock.withLock { writes } }
+
+    override func object(forKey key: String) -> Any? { lock.withLock { store[key] } }
+
+    override func set(_ value: Any?, forKey key: String) {
+        lock.withLock {
+            if key == InjectPolicyStore.key { writes += 1 }
+            if let value { store[key] = value } else { _ = store.removeValue(forKey: key) }
+        }
+    }
+
+    override func removeObject(forKey key: String) {
+        lock.withLock { _ = store.removeValue(forKey: key) }
+    }
+}
+
 /// The learned per-bundle policy has to be one thing in the process, not one per `TextInjector`.
 ///
 /// There are now two injectors: `DictationController`'s, on the dictation path, and `AppModel`'s,
@@ -294,6 +335,64 @@ struct InjectPolicyTests {
         #expect(await second.strategy(for: "com.example.qt") == .unicodeOnly)
     }
 
+    // MARK: Self-healing demotion
+
+    // The half of the amendment nothing reached: every test above this point drives `setStrategy` or
+    // `forgetStrategy` by hand, so deleting both `demoteToPasteOnly` call sites in `inject` left the
+    // suite green. The three below call the demotion itself, which is why it is internal.
+    //
+    // Be clear about what that does and does not buy: `inject` reads the frontmost app's focused
+    // element and posts a Cmd-V, so no test here may run the ladder, and the two call sites inside it
+    // stay unguarded until the `InjectAX`/`InjectPasteboard` seam exists. What is guarded now is the
+    // function those call sites call — before this, it was reachable by nothing at all.
+
+    @Test("An unverifiable AX write demotes the app for good")
+    func demotionLearns() async {
+        let injector = TextInjector(policies: makeStore())
+        #expect(await injector.strategy(for: "com.example.electron") == .axFirst)
+
+        await injector.demoteToPasteOnly(
+            "com.example.electron",
+            why: "AX insert is unverifiable on this element"
+        )
+
+        #expect(await injector.strategy(for: "com.example.electron") == .pasteOnly)
+        // Learned rather than seeded, so the recovery block can say Edict decided this.
+        #expect(await injector.hasLearnedStrategy(for: "com.example.electron") == true)
+    }
+
+    @Test("A repeat demotion of an already-demoted app writes nothing")
+    func demotionIsIdempotent() async {
+        let defaults = CountingDefaults()
+        let injector = TextInjector(policies: InjectPolicyStore(defaults: defaults))
+
+        await injector.demoteToPasteOnly("com.example.electron", why: "first failure")
+        #expect(defaults.policyWriteCount == 1)
+
+        await injector.demoteToPasteOnly("com.example.electron", why: "second failure")
+
+        // The `learned(...) != .pasteOnly` guard. Without it, an app that fails its AX verify on every
+        // dictation rewrites the whole policy map and logs a fresh demotion each time, for a decision
+        // already taken. The stored value is identical either way, which is why this asserts on the
+        // write count rather than on the strategy.
+        #expect(defaults.policyWriteCount == 1)
+        #expect(await injector.strategy(for: "com.example.electron") == .pasteOnly)
+    }
+
+    @Test("A nil bundle id cannot be demoted, because it cannot be keyed")
+    func demotionNeedsABundleID() async {
+        let defaults = CountingDefaults()
+        let injector = TextInjector(policies: InjectPolicyStore(defaults: defaults))
+
+        await injector.demoteToPasteOnly(nil, why: "AX write returned success but nothing changed")
+
+        #expect(defaults.policyWriteCount == 0)
+        #expect(await injector.learnedStrategies().isEmpty)
+        // Nothing is lost by not recording it: an unbundled process is already paste-only under the
+        // nil rule in `strategy(for:)`, and a nil key would collide with every other such process.
+        #expect(await injector.strategy(for: nil) == .pasteOnly)
+    }
+
     @Test("Every strategy has a sentence the recovery block can print")
     func displayNames() {
         for strategy in InjectStrategy.allCases {
@@ -326,5 +425,92 @@ struct ActionReportTests {
         // presses can produce an equal report; this pins the equality that makes that necessary.
         #expect(ActionReport.done("Copied") == ActionReport.done("Copied"))
         #expect(Set([ActionReport.done("Copied"), ActionReport.done("Copied")]).count == 1)
+    }
+}
+
+// MARK: - Terminal newline collapse
+
+/// The seven ids `TextInjector.normalise` collapses newlines for, written out here rather than read
+/// from `InjectSeed`.
+///
+/// Iterating the production set would not fail in the direction that matters: an id dropping *out* of
+/// `terminalBundles` would simply stop being iterated, and the suite would stay green while dictated
+/// prose began executing as shell commands in that terminal. `tableCoversTheSeedSet` closes the other
+/// direction, so a newly supported terminal has to be added here and proved to collapse.
+private let terminalBundleTable = [
+    "com.apple.Terminal",
+    "com.googlecode.iterm2",
+    "dev.warp.Warp-Stable",
+    "net.kovidgoyal.kitty",
+    "io.alacritty",
+    "com.github.wez.wezterm",
+    "com.mitchellh.ghostty",
+]
+
+/// The one transformation Edict makes to the user's words, and the only one whose regression is
+/// destructive rather than merely wrong: a terminal *executes* a pasted newline. Bullets made
+/// multi-line dictation routine a few commits before this suite existed, and until it did, nothing in
+/// `Tests/` mentioned `normalise` or `terminalBundles` at all.
+///
+/// Nothing here posts an event or writes a pasteboard: `normalise` is a pure function of the text and
+/// the bundle id, which is exactly why it is the half of the ladder worth testing on every machine.
+@Suite("Terminal newline collapse")
+struct InjectNormalisationTests {
+
+    @Test("The table covers exactly the shipped terminal list")
+    func tableCoversTheSeedSet() {
+        // An id added to the seed without a row here, or removed from the seed while a row remains,
+        // both land as a failure — which is the point, since every terminal in the set has to be
+        // proved to collapse and no id may silently leave the set.
+        #expect(InjectSeed.terminalBundles == Set(terminalBundleTable))
+    }
+
+    @Test("Every terminal collapses a dictated line break to one space", arguments: terminalBundleTable)
+    func collapsesEveryLineEnding(bundleID: String) {
+        #expect(TextInjector.normalise("line one\nline two", for: bundleID) == "line one line two")
+        // `\r\n` has to be replaced first. Run the bare `\n` pass ahead of it and this comes back as
+        // "a  b" — two spaces from one dictated break — and hoisting the `\r` pass gives the same. Only
+        // the head of the chain is load-bearing: `\n` and `\r` are interchangeable with each other.
+        #expect(TextInjector.normalise("a\r\nb", for: bundleID) == "a b")
+        #expect(TextInjector.normalise("a\rb", for: bundleID) == "a b")
+    }
+
+    @Test("A dictated bullet list reaches a terminal as one line", arguments: terminalBundleTable)
+    func collapsesBullets(bundleID: String) {
+        // The shape the bullets feature produces. Uncollapsed, the first line runs and the rest queue
+        // behind it as further commands.
+        #expect(
+            TextInjector.normalise("- check the logs\n- restart the box\n- tell Ana", for: bundleID)
+                == "- check the logs - restart the box - tell Ana"
+        )
+    }
+
+    @Test("Tabs survive the collapse", arguments: terminalBundleTable)
+    func leavesTabsAlone(bundleID: String) {
+        // No shell executes a line on a tab, so it is not the failure being prevented, and rewriting
+        // it would mangle dictated code.
+        #expect(TextInjector.normalise("a\tb", for: bundleID) == "a\tb")
+        #expect(TextInjector.normalise("indent\tthis\nand that", for: bundleID) == "indent\tthis and that")
+    }
+
+    @Test("A non-terminal app gets the user's text byte for byte")
+    func textEditIsUntouched() {
+        // TextEdit takes a pasted newline as a newline, which is what the user dictated. Collapsing
+        // here would be a silent content edit with nothing to justify it.
+        let dictated = "First line\nsecond line\r\nthird\rfourth\twith a tab"
+        let out = TextInjector.normalise(dictated, for: "com.apple.TextEdit")
+        #expect(out == dictated)
+        #expect(Array(out.utf8) == Array(dictated.utf8))
+    }
+
+    @Test("A nil bundle id gets the user's text byte for byte")
+    func nilBundleIsUntouched() {
+        // An unbundled or helper process cannot be keyed in the policy map, so it cannot be known to
+        // be a terminal. `strategy(for: nil)` already refuses to trust it with an AX insert; that is
+        // a reason to be careful about *how* the text is delivered, not a licence to rewrite it.
+        let dictated = "one\ntwo\r\nthree\rfour\tfive"
+        let out = TextInjector.normalise(dictated, for: nil)
+        #expect(out == dictated)
+        #expect(Array(out.utf8) == Array(dictated.utf8))
     }
 }

@@ -371,6 +371,105 @@ struct DualPassStitchTests {
     }
 }
 
+// MARK: - Failed passes
+
+/// A failed pass is missing transcript, and the file that loses one still looks fluent — it is simply
+/// short. So the only defence is a count, and these pin the count and the two things driven off it.
+@Suite("Dual pass — a pass that throws is counted, not swallowed")
+struct DualPassFailureTests {
+
+    /// Two sections separated by a full second of silence, so the segmenter reliably finds two.
+    private func twoSections() -> DecodedAudio {
+        decoded(tone(3, then: 1.0) + tone(3, then: 0.4))
+    }
+
+    /// A second language whose model is unavailable on every section — the shape of the real failure
+    /// this exists for, where `SpeechEngine` throws rather than returning a poor transcript.
+    private var alwaysFails: DualPassImporter.Pass {
+        DualPassImporter.Pass(localeIdentifier: "id-ID", module: .dictation) { stream in
+            // Drained anyway: the production `transcribe` consumes the stream before it can fail.
+            for await _ in stream {}
+            throw SpeechEngineError.notPrepared
+        }
+    }
+
+    private var firstPass: DualPassImporter.Pass {
+        scriptedPass("en-US", texts: [
+            "Okay team let us review the quarterly numbers before we start",
+            "And that is the last of the actions for this week thank you all",
+        ])
+    }
+
+    @Test("Progress and the section counter follow passes ATTEMPTED, so a failing language cannot stall them")
+    func progressCountsAttempts() async throws {
+        let seen = ProgressLog()
+        let outcome = try await DualPassImporter().run(
+            decoded: twoSections(),
+            format: analyzerFormat,
+            passes: [firstPass, alwaysFails],
+            reporting: DualPassImporter.Reporting(
+                onProgress: { seen.progress($0) },
+                onSections: { done, total in seen.section(done, total) }
+            )
+        )
+        #expect(outcome.sections.count == 2)
+        // Four passes were started and two of them threw. Both of these assertions were captured
+        // failing against the pre-fix code, which counted only the successes: the counter's last
+        // event was [2, 4] on a finished job, and the fraction after the first section was 0.265
+        // where half the passes were already spent. That is the stalled bar in finding #1 — the same
+        // bug as the silent failure, since a bar climbing at half rate is a bar that lies about how
+        // much of the file was read.
+        #expect(seen.sectionEvents.last == [4, 4])
+        // The first section is half the file's passes, so the bar must be past halfway the moment it
+        // is decided. `progressValues.first` is the decode's fixed share, so the section is next.
+        let afterFirstSection = try #require(seen.progressValues.dropFirst().first)
+        #expect(afterFirstSection > 0.5)
+        #expect(seen.progressValues == seen.progressValues.sorted())
+    }
+
+    @Test("failedPasses counts every pass that threw, and the file keeps what worked")
+    func failedPassesAreCounted() async throws {
+        let outcome = try await DualPassImporter().run(
+            decoded: twoSections(),
+            format: analyzerFormat,
+            passes: [firstPass, alwaysFails]
+        )
+        #expect(outcome.passesRun == 2)
+        #expect(outcome.failedPasses == 2)
+        #expect(outcome.passesAttempted == 4)
+        // Both sections still contributed: one failed pass costs a candidate, not the section.
+        #expect(outcome.sections.count == 2)
+        #expect(outcome.text.contains("quarterly numbers"))
+        #expect(outcome.text.contains("last of the actions"))
+    }
+
+    @Test("Silence fails no passes, so a quiet file can never be reported as a failed transcription")
+    func silenceFailsNothing() async throws {
+        let outcome = try await DualPassImporter().run(
+            decoded: decoded([Int16](repeating: 0, count: 16_000 * 5)),
+            format: analyzerFormat,
+            passes: [firstPass, alwaysFails]
+        )
+        // Both zero, and the difference between them is what `ImportQueue.runDualPass` gates on:
+        // no sections means no passes to fail, and "no speech was found" is the true answer here.
+        #expect(outcome.passesRun == 0)
+        #expect(outcome.failedPasses == 0)
+    }
+
+    @Test("A file where every pass throws produces no transcript and says how many failed")
+    func everyPassFails() async throws {
+        let outcome = try await DualPassImporter().run(
+            decoded: twoSections(),
+            format: analyzerFormat,
+            passes: [alwaysFails, alwaysFails]
+        )
+        #expect(outcome.passesRun == 0)
+        #expect(outcome.failedPasses == 4)
+        #expect(outcome.sections.isEmpty)
+        #expect(outcome.text.isEmpty)
+    }
+}
+
 private final class ProgressLog: @unchecked Sendable {
     private let lock = NSLock()
     private var progressStore: [Double] = []

@@ -211,8 +211,17 @@ func audioRMSPeak(_ buffer: AVAudioPCMBuffer) -> (rms: Float, peak: Float) {
     return (sqrt(sumSquares / Float(layout.total)), peak)
 }
 
-/// Amplitude → dBFS, floored well below the meter's −54 dBFS rest point so true digital silence
-/// does not produce `-inf` and poison the ballistics filter.
+/// Amplitude → dBFS, floored at −140 rather than allowed to reach `-inf` on true digital silence.
+///
+/// The floor is **not** protecting the ballistics filter, which is what this comment used to claim.
+/// Measured while writing AudioBufferMathTests: `D.meter.fraction(dbfs: -.infinity)` clamps to 0 and
+/// `LevelBallistics.advance` then steps normally, so an `-inf` reading is survivable there (a `NaN`
+/// would not be — `fraction` propagates it — but `log10f(0)` is `-inf`, not `NaN`).
+///
+/// What the floor protects is everything that reads `AudioFrame.dbfs`, which `LevelMeter` leaves
+/// deliberately **raw** and unsmoothed so a meter can run its own ballistics off it: an `-inf` there
+/// is an `-inf` in a numeric readout and in whatever a view multiplies it by. −140 also sits below
+/// `D.meter.floorDBFS` (−54), so silence still reads as the bottom of the printed scale.
 @inline(__always)
 func audioDBFS(_ amplitude: Float) -> Float {
     amplitude > 1e-7 ? 20 * log10f(amplitude) : -140

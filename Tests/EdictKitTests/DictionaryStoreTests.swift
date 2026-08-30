@@ -599,9 +599,15 @@ struct TestHygieneTests {
         #expect(defaults.string(forKey: key) == nil)
     }
 
-    // Deliberately no companion test for the support directory. `AppPaths.supportDirectory`
-    // *creates* the directory as a side effect of being read, so a test that asserted anything
-    // about it would itself be the leak it was meant to catch. The store fixtures above all pass an
-    // explicit `fileURL:` under `NSTemporaryDirectory()`, which is what keeps the real
-    // `~/Library/Application Support/Edict` out of the test run.
+    // The companion test for the support directory lives in `AppPathsGuardTests`, and it took an API
+    // change to make it safe. It used to be true that a test asserting anything about the support
+    // directory would itself be the leak it was meant to catch, because `AppPaths.supportDirectory`
+    // *creates* the directory as a side effect of being read, and the guard test read it three times.
+    // `AppPaths.defaultSupportDirectoryURL` now composes the same path and creates nothing, so the
+    // path can be asserted without touching the real `~/Library/Application Support/Edict`. Reading
+    // `historyFile` or `dictionaryFile` still creates it, which is why the assertion about their
+    // names runs only under `EDICT_SUPPORT_DIR`.
+    //
+    // The store fixtures above all pass an explicit `fileURL:` under `NSTemporaryDirectory()`, which
+    // is what keeps the real directory out of the test run in the first place.
 }

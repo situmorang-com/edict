@@ -40,9 +40,40 @@ public enum AppPaths {
         return url
     }()
 
-    /// `~/Library/Application Support/Edict`, or `overrideDirectory` when set. Created on first
-    /// access; creation failures are logged rather than thrown so a read-only home directory degrades
-    /// to "nothing persists" instead of a crash.
+    /// `~/Library/Application Support/Edict` — the path, and nothing else. It composes a URL and
+    /// returns it: no directory is created, and the override is deliberately not consulted, so this is
+    /// the *documented literal* path even in a redirected process.
+    ///
+    /// It exists because `supportDirectory` cannot be read without a side effect, which made the suite
+    /// that guards the real support directory a test that *created* it:
+    /// `AppPathsGuardTests.defaultPathIsUnchanged` used to read `supportDirectory`, and was enabled
+    /// precisely when no override was set, so a plain `swift test` on a fresh machine made
+    /// `~/Library/Application Support/Edict` in the developer's real home. Nothing was written into it
+    /// — but an absent directory is the only signal that says a test run never strayed towards the live
+    /// store, and creating it removed that signal.
+    ///
+    /// Anything that wants to *know* the path, rather than write to it, wants this property.
+    public static var defaultSupportDirectoryURL: URL {
+        defaultSupportDirectory(under: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
+    }
+
+    /// The composition on its own, with the search-path answer passed in.
+    ///
+    /// Split out for the `nil` branch: `urls(for:in:)` returning empty is unreachable on a healthy
+    /// machine, so a test cannot provoke the fallback any other way, and the fallback is the half that
+    /// would do real damage if it regressed.
+    static func defaultSupportDirectory(under applicationSupport: URL?) -> URL {
+        let base = applicationSupport
+            // Fall back to an explicit path rather than the CWD: a nil here would otherwise scatter
+            // dictionary.json wherever the process happened to be launched from.
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent(folderName, isDirectory: true)
+    }
+
+    /// `defaultSupportDirectoryURL`, or `overrideDirectory` when set. Created on first access; creation
+    /// failures are logged rather than thrown so a read-only home directory degrades to "nothing
+    /// persists" instead of a crash. Read this only to write something: for the path alone, read
+    /// `defaultSupportDirectoryURL`, which creates nothing.
     public static var supportDirectory: URL {
         if let override = overrideDirectory {
             do { try ensureDirectory(override) } catch {
@@ -50,11 +81,7 @@ public enum AppPaths {
             }
             return override
         }
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            // Fall back to an explicit path rather than the CWD: a nil here would otherwise scatter
-            // dictionary.json wherever the process happened to be launched from.
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        let dir = base.appendingPathComponent(folderName, isDirectory: true)
+        let dir = defaultSupportDirectoryURL
         do {
             try ensureDirectory(dir)
         } catch {
@@ -63,6 +90,10 @@ public enum AppPaths {
         return dir
     }
 
+    // Both of these still hang off the *creating* property, so reading either one creates the
+    // directory. That is what the two production callers want — each is a store about to read or write
+    // its file — but it means anything that only wants the *name* must set `EDICT_SUPPORT_DIR` first or
+    // compose from `defaultSupportDirectoryURL`, or it becomes the leak that property exists to fix.
     public static var dictionaryFile: URL { supportDirectory.appendingPathComponent("dictionary.json") }
 
     public static var historyFile: URL { supportDirectory.appendingPathComponent("history.json") }

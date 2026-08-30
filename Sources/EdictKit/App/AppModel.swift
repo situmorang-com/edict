@@ -632,11 +632,17 @@ public final class AppModel {
     /// knows how many sections there are before it starts. The single-pass route deliberately says
     /// nothing here, because everything it could say would be the elapsed-time estimate the bar is
     /// already showing (`ImportQueue.progressNote`).
+    ///
+    /// "\(done) of \(total) passes" and not "passes done", because `done` counts passes **attempted**
+    /// — see `DualPassImporter.Reporting.onSections`, where counting only the successful ones left
+    /// this readout and the bar advancing at the *surviving* passes' rate on exactly the file that had
+    /// lost a section. What failed is a sentence in the row's warning when the job ends, not a word
+    /// squeezed into a running counter.
     private func note(for item: ImportQueue.Item) -> String? {
         guard item.id == importQueue.runningItemID,
               case .transcribingSections(let done, let total) = importQueue.runningPhase,
               total > 0 else { return nil }
-        return "Two languages per section — \(done) of \(total) passes done"
+        return "Two languages per section — \(done) of \(total) passes"
     }
 
     private func rowState(for item: ImportQueue.Item) -> ImportQueueRow.State {
@@ -655,10 +661,17 @@ public final class AppModel {
             if let id = item.transcriptID, let transcript = history.transcripts.first(where: { $0.id == id }) {
                 return .finished(transcript)
             }
-            // `.done` with nothing in history means the file decoded but held no speech. Reporting
-            // that as a failure is honest: there is no transcript, so there is nothing to export and
-            // nothing to open, and a row saying "Done" with dead keys would be a lie.
-            return .failed("No speech was found in this file.")
+            // `.done` with nothing in history means no text was produced. Reporting that as a
+            // failure is honest: there is no transcript, so there is nothing to export and nothing
+            // to open, and a row saying "Done" with dead keys would be a lie.
+            //
+            // The *reason* is the row's own warning wherever there is one, and that ordering is the
+            // point. "No speech was found in this file." is a diagnosis, and it is only true when
+            // the pipeline came through clean — when buffers were refused by the converter or a
+            // transcription pass could not run, `ImportQueue` has already put a sentence on the row
+            // naming what is missing, and asserting silence over the top of it is the app confidently
+            // misreading a recording it never managed to read (finding #1).
+            return .failed(item.warning ?? "No speech was found in this file.")
         case .failed(let reason):
             return .failed(reason)
         case .cancelled:

@@ -179,6 +179,14 @@ public struct DualPassOutcome: Sendable {
     public var lowConfidenceWords: [String]
     /// How many transcription passes actually ran. `2 × sections` unless a pass failed.
     public var passesRun: Int
+    /// How many transcription passes were attempted and threw.
+    ///
+    /// Counted rather than merely logged because a failed pass is *missing transcript*, and the only
+    /// thing worse than losing a section is losing it silently: at zero, no section was lost to a
+    /// failing pass, and above zero the caller must say that part of the file is not in the text.
+    /// Before this existed the catch in `run` only logged — the row still finished `.done`, and when
+    /// nothing survived at all the surface reported that no speech had been found in the file.
+    public var failedPasses: Int
     /// Read counters from the decode.
     public var stats: ImportStats
     /// Why the decode stopped early, or `nil`.
@@ -190,6 +198,11 @@ public struct DualPassOutcome: Sendable {
     /// True when more than one language won at least one section.
     public var isMixed: Bool { localeIdentifiers.count > 1 }
 
+    /// Passes that were started, whether or not they returned a transcript — which for a run that
+    /// was not cancelled is `sections × passes`, the denominator any "N of M" sentence needs.
+    /// Derived rather than stored so it cannot drift from the two counters it is the sum of.
+    public var passesAttempted: Int { passesRun + failedPasses }
+
     public init(
         sections: [DualPassSection],
         text: String,
@@ -199,6 +212,7 @@ public struct DualPassOutcome: Sendable {
         meanConfidence: Double?,
         lowConfidenceWords: [String],
         passesRun: Int,
+        failedPasses: Int = 0,
         stats: ImportStats,
         failure: AudioImportError?
     ) {
@@ -210,6 +224,7 @@ public struct DualPassOutcome: Sendable {
         self.meanConfidence = meanConfidence
         self.lowConfidenceWords = lowConfidenceWords
         self.passesRun = passesRun
+        self.failedPasses = failedPasses
         self.stats = stats
         self.failure = failure
     }
@@ -251,8 +266,16 @@ public struct DualPassImporter: Sendable {
         public var onProgress: @Sendable (Double) -> Void
         /// The stitched transcript so far, after each section is decided.
         public var onText: @Sendable (String) -> Void
-        /// Passes finished and passes to run — two per section. Reported alongside the fraction
+        /// Passes **attempted** and passes to run — two per section. Reported alongside the fraction
         /// because "24 of 96" is a claim a user can check against the file, where "25 %" is not.
+        ///
+        /// Attempted, not succeeded, and that distinction closes a real bug: a pass that threw is
+        /// finished work — nothing retries it — so counting only the successes made this counter and
+        /// the bar advance at the *surviving* passes' rate. Measured on a two-section fixture whose
+        /// second language failed everywhere: the last event was `(2, 4)` and the last measured
+        /// fraction 0.51, on a job that was over. What is *missing* from a run is
+        /// `DualPassOutcome.failedPasses`, said once at the end where there is room for a sentence,
+        /// rather than squeezed into a progress readout.
         public var onSections: @Sendable (Int, Int) -> Void
 
         public init(
@@ -269,14 +292,20 @@ public struct DualPassImporter: Sendable {
     /// What the reported progress is, and why it is better than the single-pass estimate.
     ///
     /// It is a **measurement**, not the elapsed-time guess `ImportQueue.progressNote` describes. A
-    /// dual pass knows how many sections there are before it starts and completes them one at a time,
-    /// so "passes finished / passes to run" is a real fraction. That matters more here than it did
-    /// before: the work has roughly doubled, and an estimate calibrated on single-pass throughput
+    /// dual pass knows how many sections there are before it starts and works through them one at a
+    /// time, so "passes attempted / passes to run" is a real fraction. That matters more here than it
+    /// did before: the work has roughly doubled, and an estimate calibrated on single-pass throughput
     /// would have run to 99 % at the halfway mark and sat there — the exact dishonesty the
     /// single-pass note apologises for. The decode is credited a fixed small share because it is
     /// genuinely small: measured at 570–4300x realtime, a 377-second file decodes in 90 ms.
+    ///
+    /// **Attempted, not succeeded.** A pass that threw is finished work — nothing retries it — so
+    /// crediting only the successes made the bar climb at the surviving passes' rate and then jump to
+    /// the cap on the unconditional final report, which is the halfway-and-stuck dishonesty above
+    /// wearing a different hat. The failures are counted in `DualPassOutcome.failedPasses` and
+    /// stated in the row's warning instead.
     public static let progressNote = """
-        Measured: sections finished against sections to transcribe, two passes each. \
+        Measured: transcription passes attempted against passes to run, two per section. \
         Not an estimate.
         """
 
@@ -351,6 +380,10 @@ public struct DualPassImporter: Sendable {
         let totalPasses = sections.count * passes.count
         reporting.onSections(0, totalPasses)
         var passesRun = 0
+        var failedPasses = 0
+        /// Passes started, successful or not — the only counter progress may be driven from. See
+        /// `Reporting.onSections`.
+        var attempted: Int { passesRun + failedPasses }
         var decided: [DualPassSection] = []
         var stitched: [String] = []
         var words: [WordConfidence] = []
@@ -386,9 +419,13 @@ public struct DualPassImporter: Sendable {
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
-                    // One failed pass is not a failed file. The section still has the other
-                    // candidate, and a section with no candidates at all simply contributes nothing
-                    // — which is the same thing silence contributes, and is reported as such.
+                    // One failed pass is not a failed file: the section still has the other
+                    // candidate. But it is not free either, and treating it as free is the defect —
+                    // a section that loses *both* candidates contributes nothing, which is exactly
+                    // what silence contributes, so to every caller downstream a file that could not
+                    // be transcribed looked identical to a file with nothing on it. Hence the count;
+                    // `ImportQueue.runDualPass` turns it into a sentence naming what is not there.
+                    failedPasses += 1
                     Log.stt.warning("""
                         dual pass: \(pass.localeIdentifier, privacy: .public) failed on \
                         \(String(format: "%.1f", section.start), privacy: .public)s — \
@@ -397,8 +434,8 @@ public struct DualPassImporter: Sendable {
                 }
             }
 
-            reporting.onProgress(Self.fraction(passesRun, of: totalPasses))
-            reporting.onSections(passesRun, totalPasses)
+            reporting.onProgress(Self.fraction(attempted, of: totalPasses))
+            reporting.onSections(attempted, totalPasses)
             guard !candidates.isEmpty else { continue }
 
             let verdict = scorer.verdict(
@@ -459,6 +496,7 @@ public struct DualPassImporter: Sendable {
         Log.stt.info("""
             dual pass: \(decided.count, privacy: .public) sections, \
             \(passesRun, privacy: .public) passes, \
+            failed=\(failedPasses, privacy: .public), \
             locales=\(ordered.joined(separator: "+"), privacy: .public), \
             confident=\(decided.count { $0.isConfident }, privacy: .public)
             """)
@@ -474,6 +512,7 @@ public struct DualPassImporter: Sendable {
                 : confidences.reduce(0, +) / Double(confidences.count),
             lowConfidenceWords: Self.lowConfidenceWords(in: words),
             passesRun: passesRun,
+            failedPasses: failedPasses,
             stats: decoded.stats,
             failure: decoded.failure
         )
