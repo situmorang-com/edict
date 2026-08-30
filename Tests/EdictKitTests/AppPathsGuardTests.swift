@@ -78,16 +78,36 @@ struct AppPathsGuardTests {
     // gate can go rather than merely being inverted: the pure property ignores the override, so this is
     // the documented literal path in a redirected run too, and the assertion is no longer
     // self-contradictory there.
+    //
+    // A guard, not evidence for finding #26: it passed against the creating property too. What it
+    // catches is the path *moving* — `folderName` renamed, which would strand the user's hand-edited
+    // `dictionary.json` in a file the app no longer reads, or the process acquiring a sandbox
+    // container, which RECON measured redirects `NSHomeDirectory()` into
+    // `~/Library/Containers/<bundle id>/Data` and would take the whole store with it. The header doc on
+    // `AppPaths` states the no-container half as a promise; this is where it is checked.
     @Test("The store's default path is the documented literal one")
     func defaultPathIsUnchanged() {
+        let path = AppPaths.defaultSupportDirectoryURL.path
         #expect(AppPaths.defaultSupportDirectoryURL.lastPathComponent == "Edict")
-        #expect(AppPaths.defaultSupportDirectoryURL.path.contains("Application Support"))
+        #expect(path.contains("/Library/Application Support/"))
+        #expect(!path.contains("/Containers/"),
+                "the documented path is the literal one, not a sandbox container redirect")
     }
 
-    /// The property above must stay a *path* accessor. A scratch base that has never existed is the
-    /// only way to say that in an assertion: the real `~/Library/Application Support/Edict` exists on
-    /// any machine that has run Edict once, so `ensureDirectory` early-returns there and re-adding the
-    /// creation would be invisible on exactly the machines a developer runs the suite on.
+    /// Two claims live here, and which is which matters.
+    ///
+    /// **Pinned as a filesystem outcome:** `defaultSupportDirectory(under:)` creates nothing. It is
+    /// pointed at a base under `NSTemporaryDirectory()` that has never existed, so an `ensureDirectory`
+    /// added inside that seam shows up as a directory that is suddenly there.
+    ///
+    /// **Pinned as a code path only:** that the public `defaultSupportDirectoryURL` is that same
+    /// composition applied to the real search-path answer. This is *not* proof that reading the public
+    /// property creates nothing, and no test on this machine can be: the real
+    /// `~/Library/Application Support/Edict` exists and holds the user's transcripts, so
+    /// `ensureDirectory` would early-return there, and moving that folder aside to find out is not an
+    /// option. What keeps a statement out of the public property is structural rather than tested — it
+    /// is a stored `static let` initialised by a single expression, so it has no statement position to
+    /// grow one in. Nobody should read the assertions below as covering that.
     @Test("Composing the default path creates neither the folder nor its parent")
     func defaultPathCreatesNothing() {
         let base = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -101,12 +121,28 @@ struct AppPathsGuardTests {
         #expect(!FileManager.default.fileExists(atPath: composed.path),
                 "reading the path must not create the folder — an absent folder is the only signal that a run never went near the live store")
         #expect(!FileManager.default.fileExists(atPath: base.path), "nor its parent")
+
+        // The code-path half: the public property callers actually read must be this same seam over the
+        // real search path, so that the assertion above is about the composition callers get.
+        let searchPath = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        #expect(AppPaths.defaultSupportDirectoryURL.path
+                == AppPaths.defaultSupportDirectory(under: searchPath).path)
     }
 
     /// The `nil` branch of the search path, which no other test can reach: `urls(for:in:)` returning
     /// empty does not happen on a healthy machine. Worth an assertion anyway, because the wrong
     /// fallback here is the destructive one — a relative path would put `dictionary.json` wherever the
     /// process was launched from, which for `swift test` is the package directory.
+    ///
+    /// The first assertion mirrors the implementation's own expression, so it is a guard and nothing
+    /// more: co-editing the two keeps it green. The second is not a mirror — it holds the hardcoded
+    /// fallback against what the OS actually answers, so it fails if the two drift apart, which is the
+    /// one failure the mirrored assertion cannot see. It assumes an unsandboxed process: RECON measured
+    /// that a sandboxed build's `NSHomeDirectory()` is redirected into
+    /// `~/Library/Containers/<bundle id>/Data`, and the two sides would then be two different homes.
+    ///
+    /// A third assertion used to sit here, `composed.path.hasPrefix("/")`, and is gone because it could
+    /// not fail: `NSHomeDirectory()` is absolute, so the composed path always begins with `/`.
     @Test("With no Application Support search path, the fallback stays an absolute path inside the home")
     func fallbackStaysInsideTheHome() {
         let composed = AppPaths.defaultSupportDirectory(under: nil)
@@ -114,18 +150,33 @@ struct AppPathsGuardTests {
             .appendingPathComponent("Library/Application Support/Edict")
 
         #expect(composed.path == expected.path)
-        #expect(composed.path.hasPrefix("/"))
+        #expect(composed.path == AppPaths.defaultSupportDirectoryURL.path,
+                "the fallback must land where the search path already points, or a machine that ever takes it moves the store")
     }
 
-    // Inverted gate, deliberately: reading `AppPaths.historyFile` creates the support directory, so
-    // this assertion may only run in a process that has already been redirected — where the creation
-    // lands in the scratch directory the override names. Amendment 39 requires every automated run to
-    // set `EDICT_SUPPORT_DIR`, so this is covered in exactly the runs the repo mandates, and skipped in
-    // the plain `swift test` where it would be the leak.
-    @Test("The two store files keep their documented names",
-          .enabled(if: AppPaths.overrideDirectory != nil))
+    /// Ungated now, and that is the change. This assertion used to read `AppPaths.historyFile`, which
+    /// creates the support directory, so it could only be enabled in a process that had already been
+    /// redirected: `.enabled(if: AppPaths.overrideDirectory != nil)`. Amendment 39 mandates
+    /// `EDICT_SUPPORT_DIR` for anything that exercises the real app — but a plain `swift test` is not
+    /// that, and nothing in scripts/, Package.swift or .github exports the variable, so the gate left
+    /// the names checked only in the runs where a caller had exported it by hand. `historyFile(in:)`
+    /// and `dictionaryFile(in:)` take the directory, so the same claim costs nothing and holds in
+    /// every run.
+    ///
+    /// A guard, and the rename it guards against is not cosmetic: `dictionary.json` is documented as a
+    /// file the user opens in a text editor and hand-edits, so renaming it strands their edits in a
+    /// file the app has stopped reading.
+    @Test("The two store files keep their documented names")
     func storeFilesKeepTheirNames() {
-        #expect(AppPaths.historyFile.lastPathComponent == "history.json")
-        #expect(AppPaths.dictionaryFile.lastPathComponent == "dictionary.json")
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("edict-names-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        #expect(AppPaths.historyFile(in: dir).lastPathComponent == "history.json")
+        #expect(AppPaths.dictionaryFile(in: dir).lastPathComponent == "dictionary.json")
+        #expect(AppPaths.historyFile(in: dir).deletingLastPathComponent().path == dir.path,
+                "the file sits directly in the directory it was given, not in a subfolder of it")
+        #expect(!FileManager.default.fileExists(atPath: dir.path),
+                "composing a file name must not create the directory around it either")
     }
 }

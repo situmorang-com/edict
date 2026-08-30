@@ -972,14 +972,25 @@ struct ImportLocaleEngineTests {
     /// construction — including in the state the assertion was written to rule out, where Edict has
     /// permanently leaked all five slots to languages nobody is using. What replaces it is a
     /// subtraction against the inventory as it stood before the import: what the import must have
-    /// done is *add* its own language, and what it must not have done is leave anything else behind.
-    /// Subtraction rather than equality because resolving a pass asset-checks other locales and each
-    /// check reserves one (RECON §6), so `after` is not `before` plus one entry.
+    /// done is *add* its own language. Subtraction rather than equality because resolving a pass
+    /// asset-checks other locales and each check reserves one (RECON §6), so `after` is not `before`
+    /// plus one entry.
     ///
-    /// The disjunct on the first assertion is not slack. Reservations persist across process launches
+    /// The disjunct on that assertion is not slack. Reservations persist across process launches
     /// keyed to the bundle identifier, and `id-ID` is Edict's own default second language, so a
     /// developer's inventory very often holds `id_ID` before this test starts — and a bare
     /// subtraction would then be empty for a reason that has nothing to do with the code.
+    ///
+    /// What this test deliberately does **not** assert is the other half — that nothing *else* was
+    /// left behind. `added.subtracting(["en_US", "id_ID"]).isEmpty` stood here and is not sound from
+    /// a gated suite: the five slots are shared per bundle identifier, and the other two gated suites
+    /// — `SecondaryLocaleEngineTests` and `EngineReservationRecoveryTests` — reserve languages of
+    /// their own, so anything they take between `before` and `after` lands in `added` and fails a
+    /// test that had nothing to do with it. The `.serialized` on this suite does not prevent that:
+    /// measured in this target with two throwaway `.serialized` suites, the two ran *concurrently
+    /// with each other* while each kept its own tests in order. The leak claim is made against the
+    /// fake and on every machine, by `ReservationLadderTests.pruneLeavesExactlyThePreparedLanguages`.
+    /// The `print` below is what is left here: the inventory is reported, not judged.
     @Test("Importing in a second language reserves it and leaves the reservations sane")
     func reservationsStaySane() async throws {
         let directory = try scratchDirectory()
@@ -1007,12 +1018,10 @@ struct ImportLocaleEngineTests {
             added.contains("id_ID") || before.contains("id_ID"),
             "the import ran without a reservation for its own language: added \(added.sorted())"
         )
-        // The two languages this run can justify: the dictation primary the controller prepared, and
-        // the import's own. Anything else is a slot Edict took and forgot, which persists into every
-        // future launch — the failure the count could not see.
-        #expect(
-            added.subtracting(["en_US", "id_ID"]).isEmpty,
-            "the import left reservations behind for languages it never used: \(added.sorted())"
-        )
+        // The two languages this run can justify are the dictation primary the controller prepared
+        // and the import's own; a third would be a slot Edict took and forgot, persisting into every
+        // future launch. That is not asserted here — see the note above the test — because a
+        // concurrently running gated suite's reservation is indistinguishable from a leak from
+        // inside this process. It is printed above so a human reading a gated run can see it.
     }
 }

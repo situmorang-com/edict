@@ -250,23 +250,35 @@ struct SecondaryLocaleEngineTests {
         try await engine.prepare(localeIdentifier: "en-US")
         try await engine.prepareSecondary(localeIdentifier: "id-ID")
 
-        // Both slots held at once — and only those two. RECON §6: 5 maximum, they persist across
-        // process launches keyed to the bundle identifier, and a leak is invisible until reservation
-        // starts failing outright.
+        // Both slots held at once. RECON §6: 5 maximum, they persist across process launches keyed
+        // to the bundle identifier, and a leak is invisible until reservation starts failing
+        // outright — so the one thing worth asserting against the real inventory is that preparing
+        // each language actually took a slot for it.
         //
         // `#expect(reserved.count <= 5)` used to stand here and could not fail: the framework throws
         // at six and `reserve` catches the throw and evicts, so the count is five or fewer by
         // construction — including in the state the assertion was written to rule out, where Edict
-        // has permanently leaked all five slots. Pruning first, which is exactly what the app does at
-        // launch, and then naming the exact set is the version that can fail: after preparing two
-        // languages, a slot held for any third one is a slot Edict took and forgot.
-        await engine.pruneReservations()
+        // has permanently leaked all five slots.
+        //
+        // What replaces it is membership, deliberately not the exact set. The exact-set claim — that
+        // after a prune nothing but the prepared languages is held — lives in
+        // `ReservationLadderTests.pruneLeavesExactlyThePreparedLanguages`, which makes it against the
+        // fake on every machine. It cannot honestly be made here. The five slots are shared per
+        // bundle identifier, and the other two gated suites — `ImportLocaleEngineTests` and
+        // `EngineReservationRecoveryTests` — reserve languages of their own, so under
+        // EDICT_SPEECH_TESTS=1 a third identifier in this inventory may be theirs rather than a leak.
+        // `.serialized` does not save this: measured in this target with two throwaway `.serialized`
+        // suites, the two ran *concurrently with each other* (peak of two tests in flight, one from
+        // each) while each kept its own tests in order — so the trait orders within a suite, not
+        // across suites, and this suite is not `.serialized` in any case.
+        // Pruning first to force the set exact would be worse than flaky: `pruneReservations`
+        // releases every slot outside *this* engine's keep set, process-wide, so it would pull a
+        // reservation out from under whichever gated suite is running alongside this one.
         let reserved = Set(await engine.reservedLocaleIdentifiers())
-        #expect(reserved.contains("en_US"))
-        #expect(reserved.contains("id_ID"))
+        #expect(reserved.contains("en_US"), "no slot for the prepared primary: \(reserved.sorted())")
         #expect(
-            reserved == ["en_US", "id_ID"],
-            "slots are held for languages this engine never prepared: \(reserved.sorted())"
+            reserved.contains("id_ID"),
+            "prepareSecondary returned without a reservation for its language: \(reserved.sorted())"
         )
 
         // Assets may need fetching on a cold machine. The engine deliberately refuses to run the

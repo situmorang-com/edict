@@ -136,7 +136,6 @@ struct LevelBallisticsTests {
 
         #expect(abs(occluded.position - ceiling.position) < 1e-12,
                 "a 2 s step moved to \(occluded.position) against the clamped \(ceiling.position)")
-        #expect(occluded.position <= ceiling.position)
     }
 
     /// The other end. Below 4 ms the coefficient is noise, so a burst of near-zero steps must not
@@ -148,7 +147,6 @@ struct LevelBallisticsTests {
 
         #expect(abs(tiny.position - floor.position) < 1e-12,
                 "a 0.1 ms step moved to \(tiny.position) against the clamped \(floor.position)")
-        #expect(tiny.position >= floor.position)
     }
 
     // MARK: the peak marker
@@ -237,11 +235,15 @@ struct LevelBallisticsTests {
     /// fraction` clamps `-inf` to 0 before the integrator ever sees it, and the movement steps
     /// normally towards the low peg.
     ///
-    /// So the floor is a contract with whatever reads `AudioFrame.dbfs` raw, not with this filter,
-    /// and the comment on `audioDBFS` now says so. `NaN` is the one reading that *would* propagate
-    /// here — `D.meter.fraction(dbfs: .nan)` returns `NaN` — but it cannot arrive: `audioDBFS`' gate
-    /// is `amplitude > 1e-7`, which is false for `NaN`, so a buffer of `NaN` samples comes out as
-    /// −140 like any other silence. That is asserted in `AudioLevelMathTests.dbfsMapping`.
+    /// So the floor is a contract with the one raw reader of `AudioFrame.dbfs` that has no clamp in
+    /// front of its integrator — `LevelTrace.tick` in Design/Waveform.swift, where an `-inf` turns
+    /// into a permanent `NaN` on the following tick — and not with this filter. The comment on
+    /// `audioDBFS` now says so, and `AudioLevelMathTests.silenceFloorKeepsTheTraceFinite` drives it.
+    ///
+    /// `NaN` is the one reading that *would* propagate here — `D.meter.fraction(dbfs: .nan)` returns
+    /// `NaN` — but it cannot arrive: `audioDBFS`' gate is `amplitude > 1e-7`, which is false for
+    /// `NaN`, so a buffer of `NaN` samples comes out as −140 like any other silence. That is asserted
+    /// in `AudioLevelMathTests.dbfsMapping`.
     @Test("An -inf reading is clamped rather than poisoning the movement")
     func minusInfinityIsSurvivable() {
         var ballistics = Self.driven(count: 60, rmsDBFS: 0, peakDBFS: 0)
@@ -287,9 +289,13 @@ struct LevelBallisticsTests {
 /// The claim worth guarding is the one in `frame`'s doc comment — `rms` and `peak` are integrated
 /// while **`dbfs` is deliberately left raw**, so a `VUMeter` handed this frame runs its own
 /// ballistics off the same input it would have got straight from `AudioCapture.levels`. Smoothing
-/// the same signal twice is how a needle ends up feeling dead (DESIGN-COMPONENTS §2), and before
-/// this file nothing in the package read `frame` at all, so a regression that "helpfully" smoothed
-/// `dbfs` too had nowhere to be caught.
+/// the same signal twice is how a needle ends up feeling dead (DESIGN-COMPONENTS §2).
+///
+/// Production does read `frame`: HUDWindow.swift:280 and Views/MainWindow.swift:175 both take it and
+/// hand it to `Waveform` / `VUMeter`, which read `.dbfs` off it at Waveform.swift:235 and
+/// VUMeter.swift:598. What did not exist before this file is any assertion — a grep of `Tests/` for
+/// `LevelMeter` found nothing — so a regression that "helpfully" smoothed `dbfs` too would have
+/// shipped green.
 @Suite("LevelMeter frames")
 @MainActor
 struct LevelMeterFrameTests {

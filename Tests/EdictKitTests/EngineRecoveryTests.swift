@@ -359,6 +359,19 @@ struct EngineReservationRecoveryTests {
     /// path too. It is not a nicety: reservations persist across process launches keyed to the bundle
     /// identifier (RECON §6) and there are five of them, so a run that walks away holding four
     /// leaves the *user's* app unable to reserve, not just the next test.
+    ///
+    /// Read the scope of that prune carefully, because it is wider than this suite.
+    /// `pruneReservations()` releases every slot outside *this* engine's keep set, and the five slots
+    /// are shared per bundle identifier — so this reaches into whatever the other two gated suites
+    /// (`SecondaryLocaleEngineTests`, `ImportLocaleEngineTests`) are holding, and `.serialized` here
+    /// does not stop it: measured in this target with two throwaway `.serialized` suites, the two ran
+    /// concurrently with each other while each kept its own tests in order. What keeps the collateral
+    /// survivable is the keep set, not the trait: preparing `en-US` and `id-ID` above means the prune
+    /// keeps `en_US` and `id_ID`, which are the only reservations the other two gated suites assert
+    /// on. A *third* language — an import pass's locale mid-resolution — is outside a fresh engine's
+    /// keep set and can still be pulled out from under a concurrent gated run.
+    /// Nothing serializes the three gated suites against each other; running one at a time with
+    /// `--filter` is the only way to be sure.
     private func restoreInventory() async throws {
         let engine = SpeechEngine()
         try await engine.prepare(localeIdentifier: "en-US")

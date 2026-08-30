@@ -326,10 +326,20 @@ struct ReservationLadderTests {
     /// RECON §6's measured side effect, and the reason the seam wraps the asset check at all: asking
     /// "is this model installed" reserves the locale it asks about.
     ///
-    /// Both halves are asserted because both are load-bearing. That the check costs a slot is what
-    /// `importReservationBudget` leaves a spare one for; that an unanswerable check reads `false` is
-    /// what makes `assetsInstalled` safe to use as a skip decision, since "cannot tell" and "not
-    /// installed" belong on the same branch and the branch that does less is the safe one.
+    /// Read the two halves differently, because only one of them is about the app.
+    ///
+    /// The first — that a successful check leaves `french` held — is a **regression guard on the
+    /// double**, not evidence: `FakeReservations.installationRequest` reserves because RECON §6
+    /// measured the real one reserving, so this pins the fake's modelled side effect. It is here
+    /// because every slot-budget assertion in this file counts on the fake charging for a check the
+    /// way the framework does. The only production edit it would catch is one that stopped asking
+    /// through `LocaleReservations` altogether, or released the slot again on the way out.
+    ///
+    /// The second is the production claim. That an unanswerable check reads `false` is what makes
+    /// `assetsInstalled` safe to use as a skip decision, since "cannot tell" and "not installed"
+    /// belong on the same branch and the branch that does less is the safe one — and the inventory
+    /// assertion after it says the check must reach that answer by *failing*, not by evicting
+    /// somebody's model to make room for its own question.
     @Test("Asking whether a model is installed costs a reservation, and cannot answer when full")
     func theInstallationCheckTakesASlot() async throws {
         let french = try await Self.canonical("fr-FR")
@@ -342,7 +352,7 @@ struct ReservationLadderTests {
         ))
         #expect(
             spare.heldIdentifiers == ["en_US", french],
-            "the check answered without taking the slot RECON measured it taking"
+            "the fake stopped charging for a check, which every budget assertion below relies on"
         )
 
         let full = FakeReservations(
@@ -357,7 +367,12 @@ struct ReservationLadderTests {
             a check that could not run answered "installed", which as a skip decision is the wrong \
             way round: it is what sends a caller into the branch that starts a real download
             """)
-        #expect(full.heldIdentifiers.count == 5)
+        #expect(
+            full.heldIdentifiers == ["en_US", "id_ID", "de_DE", "ja_JP", "es_ES"], """
+            the check bought its answer by evicting a held locale: `assetsInstalled` runs for locales \
+            nothing is depending on yet, so a slot it frees may be one a live session is transcribing \
+            with — a full inventory has to make the check fail, not make room
+            """)
     }
 
     // MARK: The prune

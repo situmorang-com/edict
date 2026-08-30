@@ -205,7 +205,8 @@ public actor SpeechEngine: TranscriptionEngine {
 
             // The one framework call left in here that does not go through `LocaleReservations`, and
             // the reason the ladder tests still touch a real `DictationTranscriber`. It downloads
-            // nothing and takes no reservation.
+            // nothing; whether it takes a reservation has never been measured — RECON §6 observed
+            // only `assetInstallationRequest` doing that.
             let probe = Self.makeModule(locale: canonical)
             guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [probe]) else {
                 throw SpeechEngineError.noAudioFormat
@@ -1165,7 +1166,8 @@ public actor SpeechEngine: TranscriptionEngine {
         }
     }
 
-    /// Kept as the dictation-only shorthand `prepare`'s format query uses.
+    /// Kept as the dictation-only shorthand the two format queries use: `prepare`'s probe and
+    /// `bestAudioFormat(secondary:)`. Those are its only callers in the package.
     private static func makeModule(locale: Locale) -> any SpeechModule {
         build(module: .dictation, locale: locale).module
     }

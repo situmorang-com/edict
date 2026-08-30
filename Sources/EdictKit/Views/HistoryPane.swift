@@ -343,6 +343,12 @@ private struct TranscriptDetail: View {
     /// content inside it lays out at its natural size and this measures that.
     @State private var contentHeight: CGFloat = 0
 
+    /// What the last export press did. Held here rather than on the keys because the keys cannot
+    /// print it — see `TranscriptExportKeys` for the measurement — and this view carries
+    /// `.id(transcript.id)`, so selecting another transcript correctly clears an outcome that
+    /// belonged to the previous one.
+    @State private var exportOutcome: TranscriptExportOutcome?
+
     var body: some View {
         PanelSurface("Transcript") {
             // A *definite* height: given only a maximum a `ScrollView` is greedy and eats the log
@@ -350,6 +356,15 @@ private struct TranscriptDetail: View {
             MaybeScroll(scrolls: !unbounded) {
                 VStack(alignment: .leading, spacing: D.space.md) {
                     header
+                    // Directly under the keys that produced it, and full width, because the reason a
+                    // write failed is a sentence with a remedy in it. `TranscriptExportKeys` records
+                    // why this cannot go on the key cap.
+                    if let exportOutcome {
+                        Text(exportOutcome.sentence)
+                            .typeStyle(D.type.caption)
+                            .foregroundStyle(exportOutcome.isFault ? D.color.alert : D.color.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if transcript.mayBeIncomplete { incompleteNotice }
                     // Above the transcript, not below it: the point is to be read *before* the text
                     // is trusted. Renders to nothing when the recognition rate was plausible.
@@ -460,7 +475,10 @@ private struct TranscriptDetail: View {
             // three more keys per row would swamp it, while the detail is already the place the user
             // has committed to one transcript. SRT and VTT grey themselves out for a dictated
             // transcript — there are no per-word timings to cut cues against — and say so on hover.
-            TranscriptExportKeys(transcript)
+            // The outcome goes to a line under this header, not onto a cap: measured, a bank of three
+            // keys templated for a write failure needs 410.9pt where this header has 137.8pt of
+            // slack left. See `TranscriptExportKeys`.
+            TranscriptExportKeys(transcript) { exportOutcome = $0 }
             SeamDivider(.vertical)
                 .frame(height: D.size.buttonHeight)
             ReportingButton("Copy", template: "Copied") {

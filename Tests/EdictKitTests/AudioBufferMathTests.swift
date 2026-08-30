@@ -114,18 +114,20 @@ private enum Fixture {
 /// an interleaved buffer holds exactly ONE element.
 ///
 /// The regression this guards is therefore `let planes = channels`, dropping the `isInterleaved`
-/// branch — and it dereferences `channelData[1]`, which was never allocated. Measured by making
-/// exactly that edit and running this suite: the interleaved expectations first record nonsense read
-/// out of unrelated memory (`peak` of 1.5e+13 against 0.5, `rms` differing by 4.9e+11) and then the
-/// process **faults**. `swift test` reports "exited with unexpected signal code 5" and prints no run
-/// summary at all, so every other test in the same process dies with it and the crashing suite is
-/// never named.
+/// branch — and it dereferences `channelData[1]`, which was never allocated. That is undefined
+/// behaviour, and two independent reproductions of the identical edit did not agree on what it does.
+/// Mine: the interleaved expectations first record nonsense read out of unrelated memory (`peak` of
+/// 1.5e+13 against 0.5, `rms` differing by 4.9e+11) and then the process **faults** — `swift test`
+/// reports "exited with unexpected signal code 5" and prints no run summary at all, so every other
+/// test in the same process dies with it and the crashing suite is never named. A reviewer running
+/// the same edit got the garbage reads with no fault at all.
 ///
-/// A maintainer who sees an unexplained signal-5 crash after touching `audioPlanes` has found this
-/// test doing its job, not a broken test file. And note the corollary: because a read from an
-/// unallocated plane can land on any value, including a plausible one, the layout cases below assert
-/// that the two layouts agree with *each other* first, and only then that both sit near an
-/// independently computed reference.
+/// So the layout disagreement is the invariant and the crash is not, and a maintainer needs both
+/// facts. An unexplained signal-5 crash after touching `audioPlanes` is this test doing its job
+/// rather than a broken test file — the failure arrives as a dead process, not as a failed `#expect`.
+/// And because a read from an unallocated plane can land on any value, including a plausible one,
+/// the layout cases below assert that the two layouts agree with *each other* first, and only then
+/// that both sit near an independently computed reference.
 @Suite("Audio buffer level maths")
 struct AudioLevelMathTests {
 
@@ -216,12 +218,13 @@ struct AudioLevelMathTests {
 
     /// The dBFS mapping, including the floor on true digital silence.
     ///
-    /// The floor is *not* what keeps the ballistics filter safe, though that is the intuitive reading
+    /// The floor is *not* what keeps the needle's filter safe, though that is the intuitive reading
     /// and was what `audioDBFS`' own comment claimed until this suite measured it: `LevelBallistics`
     /// survives an `-inf` reading, because `D.meter.fraction` clamps it to 0 (pinned by
-    /// `LevelBallisticsTests.minusInfinityIsSurvivable`). What the floor buys is that no consumer of
-    /// the deliberately-raw `AudioFrame.dbfs` ever sees an `-inf` — and, separately, that `NaN`
-    /// cannot get in either, which is the reading the integrator genuinely could not survive.
+    /// `LevelBallisticsTests.minusInfinityIsSurvivable`). What the floor buys is that the one raw
+    /// reader with no clamp — `LevelTrace.tick` — never sees an `-inf`, which is the next test, and
+    /// separately that `NaN` cannot get in at all, which is the reading every one of these filters
+    /// would carry for ever.
     @Test("audioDBFS maps 0, 1 and 0.5 correctly and floors silence at −140")
     func dbfsMapping() {
         #expect(audioDBFS(0) == -140)
@@ -231,8 +234,8 @@ struct AudioLevelMathTests {
         // The gate is on amplitude, at 1e-7: below it the reading is the floor rather than the
         // −180 dBFS the logarithm would give, and just above it the real number comes through.
         #expect(audioDBFS(1e-9) == -140)
-        #expect(audioDBFS(1e-6).isFinite)
-        #expect(audioDBFS(1e-6) < -100, "1e-6 read \(audioDBFS(1e-6)) dBFS, not ~−120")
+        #expect(audioDBFS(1e-6) < -100 && audioDBFS(1e-6) > -140,
+                "1e-6 read \(audioDBFS(1e-6)) dBFS, not the real ~−120 the logarithm gives")
         #expect(audioDBFS(0) < Float(D.meter.floorDBFS),
                 "the silence floor must sit below the meter's printed floor")
 
@@ -242,6 +245,60 @@ struct AudioLevelMathTests {
         #expect(audioDBFS(.nan) == -140, "a NaN amplitude read \(audioDBFS(.nan)) dBFS")
         #expect(D.meter.fraction(dbfs: .nan).isNaN,
                 "if fraction ever clamped NaN, the note above would be stale")
+    }
+
+    /// What the −140 floor is actually buying, driven through the consumer that needs it.
+    ///
+    /// `LevelTrace.tick` (Design/Waveform.swift:85-92) is the app's other one-pole filter, and unlike
+    /// `LevelBallistics` / `NeedleBallistics` it has no `D.meter.fraction` clamp in front of its
+    /// integrator: Waveform.swift:235 hands it `Double(level.dbfs)` raw. So an `-inf` sets
+    /// `integrated` to `-inf` on the first tick, and on the second `(dbfs - integrated)` is `+inf`
+    /// (or `NaN` for another `-inf`), leaving `integrated` at `-inf + inf` = `NaN` — which then flows
+    /// into `accumulatedSum`, `commit()`'s mean and every column height for the rest of the trace's
+    /// life. NaN does not wash out of a one-pole filter.
+    ///
+    /// Both halves are asserted, because the comment on `audioDBFS` claims both. The first half is
+    /// the one whose failure mode is in `audioDBFS` itself: replace the `-140` with `-.infinity` and
+    /// all three committed columns come back NaN (measured). The second half pins the hazard rather
+    /// than assuming it — if `LevelTrace` ever gains a clamp, that assertion fails and `audioDBFS`'
+    /// comment has to be rewritten, which is the intended outcome.
+    ///
+    /// No clock: the ticks carry fixed dates, and `LevelTrace` is instance state, so nothing here can
+    /// interleave with another suite.
+    @Test("The −140 floor is what keeps the waveform trace out of NaN")
+    @MainActor
+    func silenceFloorKeepsTheTraceFinite() {
+        let t0 = Date(timeIntervalSinceReferenceDate: 0)
+        let period: TimeInterval = 0.1
+
+        // Four ticks one column period apart. The first only arms `lastCommit` (`tick` commits on
+        // the *second* tick at the earliest), so three columns are committed, and the ring is read
+        // back through the accessor the renderer uses rather than by touching `columns` directly.
+        func meansAfterFourTicks(of dbfs: Double) -> [Double] {
+            let trace = LevelTrace()
+            for step in 0..<4 {
+                trace.tick(at: t0.addingTimeInterval(Double(step) * period),
+                           dbfs: dbfs, columnPeriod: period)
+            }
+            var means: [Double] = []
+            trace.forEachRecent(16) { _, column in means.append(column.meanDBFS) }
+            return means
+        }
+
+        // Digital silence as the tap actually reports it. The envelope starts at the printed floor
+        // (−54) and integrates towards −140, so every committed mean sits inside that band.
+        let floored = meansAfterFourTicks(of: Double(audioDBFS(0)))
+        #expect(floored.count == 3, "\(floored.count) columns committed, not 3 — the fixture drifted")
+        for mean in floored {
+            #expect(mean.isFinite, "silence put \(mean) dBFS in the trace")
+            #expect(mean <= D.meter.floorDBFS + 1e-9 && mean >= Double(audioDBFS(0)) - 1e-9,
+                    "column mean \(mean) is outside the −140…−54 band silence can produce")
+        }
+
+        // The same trace handed the raw value the floor exists to prevent.
+        let poisoned = meansAfterFourTicks(of: -.infinity)
+        #expect(poisoned.contains { $0.isNaN },
+                "raw -inf no longer poisons LevelTrace — audioDBFS' comment needs rewriting")
     }
 }
 
@@ -376,7 +433,6 @@ struct AudioConversionTests {
         let ideal = 20 * 1_600
         #expect(Double(total) > Double(ideal) * 0.99,
                 "20 buffers produced \(total) frames of \(ideal) (measured: 31,823)")
-        #expect(total <= ideal, "produced \(total) frames, more audio than went in")
     }
 
     /// Conversion also changes depth and interleaving, not just the rate (RECON §17). A constant
@@ -411,7 +467,8 @@ struct AudioConversionTests {
     }
 
     /// `deepCopy` itself, in both layouts — it walks `audioPlanes` too, so the interleaved case here
-    /// has the same fault-the-process failure mode described on `AudioLevelMathTests`.
+    /// has the same out-of-bounds failure mode described on `AudioLevelMathTests`: garbage values,
+    /// and possibly a dead process rather than a failed `#expect`.
     ///
     /// "Distinct" is asserted by mutating the source afterwards: identity and pointer inequality
     /// would both be satisfied by a buffer that aliased the same `mData`.

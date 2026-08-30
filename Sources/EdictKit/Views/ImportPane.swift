@@ -32,14 +32,33 @@ private enum M {
     /// to need the disambiguated form — the row that needs it is the row being checked, and a grid
     /// that jumps at exactly that moment is a grid that hides the answer.
     static let colLocale: CGFloat = 84
-    /// Three three-letter export keys side by side, which is the widest the trailing bank gets.
-    static let colKeys = D.size.buttonHeight * 3 + D.space.sm            // 98
+    /// The trailing key bank. Three three-letter export keys side by side is still the widest bank
+    /// the tray puts here, but the number is now **measured** rather than derived from the button
+    /// height, because the derivation was wrong: a cap is not as wide as it is tall.
+    ///
+    /// Measured with CoreText in `D.type.buttonCap` (10.5pt bold condensed, tracking 1.3,
+    /// uppercased): `TXT` is 21.9pt of glyph, `TapeCap` adds `D.space.md` on each side and a 1pt
+    /// seat all round, so an export key lays out at 47.9pt and three of them with two `D.space.xs`
+    /// gaps at 151.6pt. `TapeCap` never wraps and never scales (Components.swift:790-792), so this
+    /// is a floor and not a preference: at the old 98 (`buttonHeight * 3 + space.sm`) the bank drew
+    /// 53.6pt leftwards over the progress readout of every finished row. `ExportKeyWidthTests` holds
+    /// the arithmetic to the font, and `TranscriptExportKeys` records why no report is printed on
+    /// these caps.
+    static let colKeys: CGFloat = 154
+    /// One key told to fill the whole bank — CANCEL and RETRY. Two points less than `colKeys`
+    /// because `minWidth` sizes the *cap* and `TapeCap` pads a 1pt seat around it
+    /// (`capSeatOutset`, Components.swift:31 and :772), so a cap given `colKeys` lays out 2pt wider
+    /// than the column it sits in.
+    static let bankKeyWidth = colKeys - 2                               // 152
     /// The language tray inside a row's popover. Shorter than Settings' seven rows: a popover hanging
     /// off a table row must not cover the rows it is there to be compared against.
     static let popoverTrayRows: CGFloat = 6
     /// The tray key inside a popover, and so the popover's own working width.
     static let popoverTrayKeyWidth: CGFloat = 236
-    /// A three-letter moulded legend (`TXT`) needs far less than a transport key's default width.
+    /// Passed to the export keys so they do **not** inherit `M.transportMinWidth` (78). It is a
+    /// floor and a slack one: measured, `TXT` plus the cap's own `D.space.md` padding is 45.9pt, so
+    /// the natural cap is already wider than this and the number never actually binds. Kept as the
+    /// explicit statement that a three-letter key is not a transport key.
     static let keyWidth = D.size.buttonHeight                            // 30
     /// The creeping rule under a state channel. `StatusReadout` uses 1.5 for the same job, but
     /// its channel is wider and its use is rare; at this width the render showed 1.5 losing the
@@ -193,9 +212,16 @@ public struct ImportQueueRow: Identifiable, Hashable, Sendable {
     /// always in the secondary ink, and printed above `warning` so a real problem is never displaced
     /// by a progress note.
     public var note: String?
-    /// Set when the transcript is real but the read stopped early. Printed under the row in the
-    /// secondary ink, not the alert ink: nine minutes of a ten-minute transcript is a result worth
-    /// keeping, and the user has to be told which it is.
+    /// Set when audio is known to be missing from this transcript — the read stopped early, buffers
+    /// were refused by the converter, or a transcription pass could not run. The text that is here
+    /// is genuine; the sentence says what is not.
+    ///
+    /// Printed in the **secondary** ink under a row that has a transcript: nine minutes of a
+    /// ten-minute transcript is a result worth keeping, and the user has to be told which it is.
+    /// Printed in the **alert** ink when there is no transcript at all — `AppModel.rowState` hands a
+    /// `.done` item with nothing in history to `.failed(item.warning ?? …)`, so this same sentence
+    /// becomes the row's failure reason, and "no speech was found" is only allowed to stand when the
+    /// pipeline came through clean.
     public var warning: String?
 
     public init(
@@ -342,6 +368,14 @@ struct ImportPane: View {
         self.onClearFinished = onClearFinished
         self.unbounded = unbounded
     }
+
+    /// What the last export press on each row did, by row id.
+    ///
+    /// Held by the pane, not by the row: the rows are in a `LazyVStack`, so a row scrolled out of
+    /// the tray is torn down and would lose the sentence it had just printed. Same reasoning as
+    /// `HistoryPane.teachOutcome`. Not persisted anywhere — it is the outcome of a press, and a
+    /// relaunch has nothing to say about it.
+    @State private var exportOutcomes: [UUID: TranscriptExportOutcome] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: D.space.md) {
@@ -540,10 +574,12 @@ struct ImportPane: View {
                                     secondLocaleIsAmbiguous: row.secondPassLocaleIdentifier
                                         .map(localeIsAmbiguous) ?? false,
                                     locales: locales,
+                                    exportOutcome: exportOutcomes[row.id],
                                     onCancel: { onCancel(row.id) },
                                     onRetry: { onRetry(row.id) },
                                     onSetLocale: { onSetRowLocale(row.id, $0) },
-                                    onRerun: { onRerun(row.id, $0) }
+                                    onRerun: { onRerun(row.id, $0) },
+                                    onExport: { exportOutcomes[row.id] = $0 }
                                 )
                             }
                         }
@@ -605,10 +641,17 @@ private struct ImportRow: View {
     let localeIsAmbiguous: Bool
     let secondLocaleIsAmbiguous: Bool
     let locales: [String]
+    /// What the last export press on this row did, or `nil` if it has not been pressed.
+    ///
+    /// Owned by the pane rather than by this view, and for the same reason `HistoryPane` owns
+    /// `teachOutcome`: the rows live in a `LazyVStack`, so a row scrolled out of the tray loses its
+    /// `@State` and would come back with the failure it just reported forgotten.
+    let exportOutcome: TranscriptExportOutcome?
     let onCancel: () -> Void
     let onRetry: () -> Void
     let onSetLocale: (String) -> Void
     let onRerun: (String) -> Void
+    let onExport: (TranscriptExportOutcome) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: D.space.xxs) {
@@ -678,6 +721,21 @@ private struct ImportRow: View {
                     .padding(.trailing, M.colKeys + D.space.sm)
             }
 
+            // The export keys' own channel, and a line of its own rather than a share of the one
+            // above: a finished row can carry a `warning` at the same time, and the two sentences
+            // are about different things — that one is about the transcript, this one is about the
+            // file the user just asked for. See `TranscriptExportKeys` for why this is not printed
+            // on the key cap.
+            if let exportOutcome {
+                Text(exportOutcome.sentence)
+                    .typeStyle(D.type.caption)
+                    .foregroundStyle(exportOutcome.isFault ? D.color.alert : D.color.textSecondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, M.colKind + D.space.sm)
+                    .padding(.trailing, M.colKeys + D.space.sm)
+            }
+
             // Directly under the sentence that reports the problem, because that sentence is what
             // sends the user looking for a remedy. The language cell above offers the same action on
             // every finished row; this is the one case where it must not have to be found.
@@ -726,15 +784,15 @@ private struct ImportRow: View {
     private var keys: some View {
         switch row.state {
         case .waiting, .reading, .transcribing:
-            TapeButton("Cancel", role: .stop, minWidth: M.colKeys, action: onCancel)
+            TapeButton("Cancel", role: .stop, minWidth: M.bankKeyWidth, action: onCancel)
                 .accessibilityLabel("Cancel \(row.filename)")
         case .finished(let transcript):
-            TranscriptExportKeys(transcript)
+            TranscriptExportKeys(transcript, onOutcome: onExport)
         case .failed:
-            TapeButton("Retry", minWidth: M.colKeys, action: onRetry)
+            TapeButton("Retry", minWidth: M.bankKeyWidth, action: onRetry)
                 .accessibilityLabel("Try \(row.filename) again")
         case .cancelled:
-            TapeButton("Retry", minWidth: M.colKeys, action: onRetry)
+            TapeButton("Retry", minWidth: M.bankKeyWidth, action: onRetry)
                 .accessibilityLabel("Transcribe \(row.filename) after all")
         }
     }
@@ -1047,24 +1105,63 @@ private struct ImportStateChannel: View {
 /// technicality: a live dictation has no timeline to cut cues against, so only an imported file
 /// can be exported as subtitles. The keys stay visible, greyed, with a tooltip that says why —
 /// hiding them would leave the user wondering whether Edict does subtitles at all.
+///
+/// ## Why the outcome is not printed on the cap
+///
+/// A write really can fail — a read-only volume, a full disk, an iCloud folder that has not
+/// materialised — and a key that springs back silently makes every one of those look like success,
+/// which is the whole reason `ActionReport` exists. But the cap is not where that can be said.
+/// `ReportingButton` reserves its `template`'s width on **every** key in the bank, resting and
+/// reported alike, and `TapeCap` neither wraps nor scales (Components.swift:790-792), so an
+/// unaffordable legend is not clipped — it draws over the row.
+///
+/// Measured with CoreText in the real cap font (`D.type.buttonCap`: 10.5pt bold condensed, tracking
+/// 1.3, uppercased) and checked against the 900pt minimum window, which `EdictApp` pins as the
+/// window's floor:
+///
+///     bank of three keys                        width   import tray (154pt)   history header (679pt)
+///     TapeButton, TXT/SRT/VTT                   151.6   fits                  fits
+///     ReportingButton, template "couldn't write" 410.9   over by 256.9         over by 273.1
+///
+/// The history header figure is the whole `TranscriptDetail` header measured item by item — four
+/// seated counters, the FROM FILE label, `Spacer(minLength: D.space.sm)`, the seam, COPY and DELETE
+/// at 90pt each — so *neither* container affords the templated bank; the import tray is simply the
+/// worse of the two. Shortening the vocabulary does not rescue it either: `template: "failed"` still
+/// measures 234.7pt, and no reason a user can act on fits three keys in the 30pt each the tray's
+/// column would allow.
+///
+/// So the keys stay at their three-letter width and the **container** prints the outcome, in a
+/// channel with room for the reason: `ImportRow`'s caption line, indented to the filename column,
+/// and `TranscriptDetail`'s own line under the header. `onOutcome` is how it gets there.
+/// `ExportKeyWidthTests` holds every number above to the font.
 public struct TranscriptExportKeys: View {
 
     private let transcript: Transcript
+    private let onOutcome: (TranscriptExportOutcome) -> Void
 
-    public init(_ transcript: Transcript) {
+    /// - Parameters:
+    ///   - onOutcome: called with what the write did, for the container to print. Not optional and
+    ///     not defaulted: a caller that dropped it would ship the silent key this component exists
+    ///     to remove, and nothing in the bank prints the outcome itself.
+    public init(_ transcript: Transcript, onOutcome: @escaping (TranscriptExportOutcome) -> Void) {
         self.transcript = transcript
+        self.onOutcome = onOutcome
     }
 
     public var body: some View {
         HStack(spacing: D.space.xs) {
             ForEach(TranscriptExportFormat.allCases, id: \.self) { format in
                 let isAvailable = available.contains(format)
-                // `ReportingButton`, not `TapeButton`: the write can fail on a read-only volume, a
-                // full disk or an iCloud path that has not materialised, and a bare key made every
-                // one of those look identical to success. The template is the longest legend the cap
-                // can ever show, so a report never resizes the key or nudges its two neighbours.
-                ReportingButton(format.fileExtension, template: "couldn't write", minWidth: M.keyWidth) {
-                    TranscriptFileExport.save(transcript, as: format)
+                TapeButton(format.fileExtension, minWidth: M.keyWidth) {
+                    guard let outcome = TranscriptFileExport.save(transcript, as: format) else { return }
+                    onOutcome(outcome)
+                    // The visible sentence is in the container, which VoiceOver has no reason to
+                    // visit after a key press, so the same words are announced from here. The
+                    // component `ReportingButton` would have done this for us is the one whose cap
+                    // this bank cannot afford.
+                    var message = AttributedString(outcome.sentence)
+                    message.accessibilitySpeechAnnouncementPriority = .high
+                    AccessibilityNotification.Announcement(message).post()
                 }
                 .disabled(!isAvailable)
                 .accessibilityLabel("Export as \(format.displayName)")
@@ -1079,6 +1176,46 @@ public struct TranscriptExportKeys: View {
 
     private var available: [TranscriptExportFormat] {
         TranscriptExport.availableFormats(for: transcript)
+    }
+}
+
+// MARK: - ExportKeyMetrics
+
+/// The two numbers `ExportKeyWidthTests` measures the export bank against.
+///
+/// `M` above is `private`, and deliberately so: it is a large file-local namespace and widening it
+/// for a test would invite the rest of it to be depended on from outside. These two are the only
+/// ones a layout test has to see, because they are what the bank must fit inside — and the test
+/// exists because a legend the bank could not afford shipped once and the suite stayed green, since
+/// nothing in this package can see a layout.
+enum ExportKeyMetrics {
+    /// `M.colKeys` — the trailing column an import row's key bank is pinned to.
+    static var columnWidth: CGFloat { M.colKeys }
+    /// `M.keyWidth` — the floor `minWidth` puts under each cap.
+    static var keyWidth: CGFloat { M.keyWidth }
+    /// `TapeCap`'s seat, mirroring `M.capSeatOutset` in Components.swift, which is private to that
+    /// file. One point, on each side, outside the cap's own padding.
+    static let capSeatOutset: CGFloat = 1
+}
+
+// MARK: - TranscriptExportOutcome
+
+/// What one export press did: whether a file was written, and the sentence the surface prints.
+///
+/// Deliberately not an `ActionReport`. That type's contract is "keep it to one or two words: it is
+/// printed on a key cap" (Components.swift), and it is the right type for a key that reports on
+/// itself — which, per `TranscriptExportKeys`, this bank measurably cannot. Nothing prints this on a
+/// cap, so the text is a whole sentence and `isFault` is what picks the ink.
+public struct TranscriptExportOutcome: Equatable, Sendable {
+    /// True when no file was written. Drives the ink, never the wording.
+    public var isFault: Bool
+    /// One sentence for a caption channel: which file was written, or what refused it and what
+    /// would change that.
+    public var sentence: String
+
+    public init(isFault: Bool, sentence: String) {
+        self.isFault = isFault
+        self.sentence = sentence
     }
 }
 
@@ -1124,10 +1261,10 @@ enum TranscriptFileExport {
 
     /// Run the panel and write the file.
     ///
-    /// - Returns: what to print on the key that was pressed, or `nil` when the user cancelled the
-    ///   panel — the one outcome a key must stay quiet about, because the user caused it.
+    /// - Returns: what to say about the write, or `nil` when the user cancelled the panel — the one
+    ///   outcome nothing must report, because the user caused it.
     ///
-    /// It returns a report rather than nothing because a failed write is *invisible* otherwise. The
+    /// It returns an outcome rather than nothing because a failed write is *invisible* otherwise. The
     /// panel dismisses itself, the key springs back, and there is no file: a read-only volume, a full
     /// disk and an iCloud folder that has not materialised all look exactly like success. Nothing is
     /// lost — the transcript is still in HISTORY — but the app claimed an outcome it never verified,
@@ -1135,7 +1272,10 @@ enum TranscriptFileExport {
     ///
     /// `NSSavePanel` runs its own replace confirmation, so overwriting is the panel's business.
     @MainActor
-    static func save(_ transcript: Transcript, as format: TranscriptExportFormat) -> ActionReport? {
+    static func save(
+        _ transcript: Transcript,
+        as format: TranscriptExportFormat
+    ) -> TranscriptExportOutcome? {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [format.contentType]
         panel.nameFieldStringValue = TranscriptExport.suggestedFilename(for: transcript, format: format)
@@ -1149,45 +1289,71 @@ enum TranscriptFileExport {
 
     /// The write on its own, split out from the panel so it can be tested.
     ///
-    /// `NSSavePanel.runModal` is system UI and cannot be driven from a test, but "what does this key
-    /// say when the destination refuses the file" is exactly the question worth pinning down, and it
-    /// is answerable without a panel.
+    /// `NSSavePanel.runModal` is system UI and cannot be driven from a test, but "what does the
+    /// surface say when the destination refuses the file" is exactly the question worth pinning
+    /// down, and it is answerable without a panel.
     static func write(
         _ transcript: Transcript,
         as format: TranscriptExportFormat,
         to url: URL
-    ) -> ActionReport {
+    ) -> TranscriptExportOutcome {
         do {
             try TranscriptExport.data(for: transcript, format: format)
                 .write(to: url, options: .atomic)
             Log.data.info("Exported a transcript as \(format.rawValue, privacy: .public).")
-            return .done("written")
+            // Named, because "written" on its own does not answer the question the user actually
+            // has after a save panel: *where*. The name is the one the panel returned, so this is
+            // reporting the file that exists rather than the one that was asked for.
+            return TranscriptExportOutcome(
+                isFault: false,
+                sentence: "Written to \(url.lastPathComponent)."
+            )
         } catch {
-            // The whole sentence goes to the log, where there is room for it; the cap gets the few
-            // words it can hold. Both, not either — see `shortReason`.
+            // The system's whole sentence goes to the log; the surface gets ours, which names a
+            // remedy. Both, not either — see `failureSentence`.
             Log.data.error("Could not write the export: \(error.localizedDescription, privacy: .public)")
-            return .failed(shortReason(for: error))
+            return TranscriptExportOutcome(isFault: true, sentence: failureSentence(for: error))
         }
     }
 
-    /// A write failure in as many words as fit on a key cap.
+    /// A write failure as one sentence, naming what would change it.
     ///
-    /// `localizedDescription` is a whole sentence ("You don't have permission to save the file …"),
-    /// and `ReportingButton` prints its report *on the cap*, whose width is reserved for `template`.
-    /// So the cap gets the distinction that changes what the user does next — a full disk, a
-    /// read-only volume, a folder that is not there and a permission problem need four different
-    /// remedies — and the log keeps the sentence. Anything unrecognised falls back to the honest
-    /// "couldn't write", which claims only what we know: it did not work.
-    static func shortReason(for error: Error) -> String {
+    /// `localizedDescription` is the system's own sentence ("You don't have permission to save the
+    /// file …"), which is fine prose but is written about a document-based app: it offers no remedy
+    /// and it says "the file" where the user is holding a transcript. So the four failures a user
+    /// can act on *differently* get four different sentences — a full disk, a read-only volume, a
+    /// folder that is not there and a permission problem need four different next moves — and the
+    /// log keeps the system's own words for whoever reads it afterwards.
+    ///
+    /// Anything unrecognised falls back to claiming only what we know: it did not work, and the
+    /// reason is in the log. That is deliberately not a guess dressed up as a diagnosis.
+    ///
+    /// Every sentence ends by saying the transcript is still in HISTORY, because it is: the write is
+    /// a copy, nothing was consumed, and a user who thinks a failed export lost their transcript
+    /// will go looking for a recovery that is not needed.
+    static func failureSentence(for error: Error) -> String {
         let nsError = error as NSError
-        guard nsError.domain == NSCocoaErrorDomain else { return "couldn't write" }
+        let kept = " The transcript is still in HISTORY."
+        guard nsError.domain == NSCocoaErrorDomain else {
+            return "Edict could not write the file. The reason is in Console under the Edict "
+                + "subsystem." + kept
+        }
         switch CocoaError.Code(rawValue: nsError.code) {
-        case .fileWriteOutOfSpace: return "disk full"
-        case .fileWriteVolumeReadOnly: return "read-only"
-        case .fileWriteNoPermission: return "no permission"
-        // A missing parent directory, and an unmaterialised iCloud path, both land here.
-        case .fileNoSuchFile, .fileWriteInvalidFileName: return "bad path"
-        default: return "couldn't write"
+        case .fileWriteOutOfSpace:
+            return "There is no room on that disk for the file." + kept
+        case .fileWriteVolumeReadOnly:
+            return "That volume is read-only, so nothing can be written to it. Choose somewhere "
+                + "else." + kept
+        case .fileWriteNoPermission:
+            return "Edict is not allowed to write there. Choose another folder, or grant Edict "
+                + "access to that one in System Settings." + kept
+        // A missing parent directory, and an iCloud path that has not materialised, both land here.
+        case .fileNoSuchFile, .fileWriteInvalidFileName:
+            return "That folder is not there. If it is in iCloud Drive it may not have downloaded "
+                + "yet — open it in Finder first, then try again." + kept
+        default:
+            return "Edict could not write the file. The reason is in Console under the Edict "
+                + "subsystem." + kept
         }
     }
 }
@@ -1589,12 +1755,20 @@ public enum ImportPreviewFixtures {
             // and there is no narrower case to check. Anything smaller is a render-harness artefact,
             // not a state the window can be dragged into (`EdictApp` pins the window's minimum to
             // the content's).
+            // Framed at exactly `M.colKeys` plus the sheet's own padding, so the sheet answers the
+            // one question about this bank that a picture can answer: does it fit its column. A
+            // bank wider than the column would run off the right edge of the image rather than
+            // hiding inside a wider frame.
             sheet("export-keys",
                   CGSize(width: M.colKeys + D.space.xl, height: D.size.buttonHeight + D.space.xl),
-                  TranscriptExportKeys(finishedTranscript).padding(D.space.md)),
+                  TranscriptExportKeys(finishedTranscript) { _ in }
+                      .frame(width: M.colKeys, alignment: .trailing)
+                      .padding(D.space.md)),
             sheet("export-keys-dictated",
                   CGSize(width: M.colKeys + D.space.xl, height: D.size.buttonHeight + D.space.xl),
-                  TranscriptExportKeys(dictatedTranscript).padding(D.space.md)),
+                  TranscriptExportKeys(dictatedTranscript) { _ in }
+                      .frame(width: M.colKeys, alignment: .trailing)
+                      .padding(D.space.md)),
         ]
     }
 }

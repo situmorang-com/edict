@@ -41,8 +41,8 @@ public enum AppPaths {
     }()
 
     /// `~/Library/Application Support/Edict` — the path, and nothing else. It composes a URL and
-    /// returns it: no directory is created, and the override is deliberately not consulted, so this is
-    /// the *documented literal* path even in a redirected process.
+    /// hands it back: no directory is created, and the override is deliberately not consulted, so this
+    /// is the *documented literal* path even in a redirected process.
     ///
     /// It exists because `supportDirectory` cannot be read without a side effect, which made the suite
     /// that guards the real support directory a test that *created* it:
@@ -52,16 +52,29 @@ public enum AppPaths {
     /// — but an absent directory is the only signal that says a test run never strayed towards the live
     /// store, and creating it removed that signal.
     ///
+    /// Stored, and initialised by a single expression, so that there is no statement position inside it
+    /// for a `try? ensureDirectory(...)` to be added to later. That is the whole reason it is a `let`:
+    /// re-adding the creation *here* is the likely form of this regression — it is what a reader would
+    /// "fix" after seeing a caller get a path that does not exist — and no test could catch it on any
+    /// machine that has run Edict once, because `~/Library/Application Support/Edict` already exists
+    /// there and `ensureDirectory` early-returns. Only the seam below can be driven at a path that has
+    /// never existed, so only the seam can be *proved* to create nothing.
+    ///
+    /// Asked once, at first access. Nothing in Edict changes the process's home directory, so there is
+    /// no run in which a later read would answer differently.
+    ///
     /// Anything that wants to *know* the path, rather than write to it, wants this property.
-    public static var defaultSupportDirectoryURL: URL {
+    public static let defaultSupportDirectoryURL: URL =
         defaultSupportDirectory(under: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
-    }
 
     /// The composition on its own, with the search-path answer passed in.
     ///
-    /// Split out for the `nil` branch: `urls(for:in:)` returning empty is unreachable on a healthy
-    /// machine, so a test cannot provoke the fallback any other way, and the fallback is the half that
-    /// would do real damage if it regressed.
+    /// Split out twice over. For the `nil` branch: `urls(for:in:)` returning empty is unreachable on a
+    /// healthy machine, so a test cannot provoke the fallback any other way, and the fallback is the
+    /// half that would do real damage if it regressed. And for purity: this is the only form of the
+    /// composition a test can point at a directory that has never existed, which is what makes
+    /// "reading the path creates nothing" an assertion rather than an assurance
+    /// (`AppPathsGuardTests.defaultPathCreatesNothing`).
     static func defaultSupportDirectory(under applicationSupport: URL?) -> URL {
         let base = applicationSupport
             // Fall back to an explicit path rather than the CWD: a nil here would otherwise scatter
@@ -91,12 +104,31 @@ public enum AppPaths {
     }
 
     // Both of these still hang off the *creating* property, so reading either one creates the
-    // directory. That is what the two production callers want — each is a store about to read or write
-    // its file — but it means anything that only wants the *name* must set `EDICT_SUPPORT_DIR` first or
-    // compose from `defaultSupportDirectoryURL`, or it becomes the leak that property exists to fix.
-    public static var dictionaryFile: URL { supportDirectory.appendingPathComponent("dictionary.json") }
+    // directory. That is what the two production callers want — `DictionaryStore.shared`
+    // (DictionaryStore.swift:213) and `HistoryStore.shared` (HistoryStore.swift:424) are each a store
+    // about to read or write its file — but it means anything that only wants the *name* must set
+    // `EDICT_SUPPORT_DIR` first, or compose from `defaultSupportDirectoryURL` or the two `in:` seams
+    // below, or it becomes the leak that property exists to fix.
+    public static var dictionaryFile: URL { dictionaryFile(in: supportDirectory) }
 
-    public static var historyFile: URL { supportDirectory.appendingPathComponent("history.json") }
+    public static var historyFile: URL { historyFile(in: supportDirectory) }
+
+    /// The two documented file names, composed against a directory the caller supplies.
+    ///
+    /// Split out for the same reason as `defaultSupportDirectory(under:)`. The properties above cannot
+    /// be read from a test without creating a directory, so the assertion that these names are the
+    /// documented ones had to be gated on `EDICT_SUPPORT_DIR` — and nothing in scripts/, Package.swift
+    /// or .github exports that variable, so it ran only when a caller set it by hand. Taking the
+    /// directory as an argument makes the names checkable in every run. The names matter because
+    /// `dictionary.json` is a documented user interface: a rename would silently leave the user's
+    /// hand-edited file behind.
+    static func dictionaryFile(in directory: URL) -> URL {
+        directory.appendingPathComponent("dictionary.json")
+    }
+
+    static func historyFile(in directory: URL) -> URL {
+        directory.appendingPathComponent("history.json")
+    }
 
     public static func ensureSupportDirectory() throws {
         try ensureDirectory(supportDirectory)

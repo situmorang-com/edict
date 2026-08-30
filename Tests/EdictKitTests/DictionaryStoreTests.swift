@@ -605,8 +605,9 @@ struct TestHygieneTests {
     // *creates* the directory as a side effect of being read, and the guard test read it three times.
     // `AppPaths.defaultSupportDirectoryURL` now composes the same path and creates nothing, so the
     // path can be asserted without touching the real `~/Library/Application Support/Edict`. Reading
-    // `historyFile` or `dictionaryFile` still creates it, which is why the assertion about their
-    // names runs only under `EDICT_SUPPORT_DIR`.
+    // the `historyFile` and `dictionaryFile` *properties* still creates it — the two documented file
+    // names are asserted against `AppPaths.historyFile(in:)` / `dictionaryFile(in:)` instead, which
+    // compose against a directory the caller supplies and so need no override and no directory.
     //
     // The store fixtures above all pass an explicit `fileURL:` under `NSTemporaryDirectory()`, which
     // is what keeps the real directory out of the test run in the first place.

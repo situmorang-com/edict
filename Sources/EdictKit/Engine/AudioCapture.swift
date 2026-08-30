@@ -213,15 +213,25 @@ func audioRMSPeak(_ buffer: AVAudioPCMBuffer) -> (rms: Float, peak: Float) {
 
 /// Amplitude → dBFS, floored at −140 rather than allowed to reach `-inf` on true digital silence.
 ///
-/// The floor is **not** protecting the ballistics filter, which is what this comment used to claim.
+/// The floor is not protecting the *needle's* filter, which is what this comment used to claim.
 /// Measured while writing AudioBufferMathTests: `D.meter.fraction(dbfs: -.infinity)` clamps to 0 and
-/// `LevelBallistics.advance` then steps normally, so an `-inf` reading is survivable there (a `NaN`
-/// would not be — `fraction` propagates it — but `log10f(0)` is `-inf`, not `NaN`).
+/// `LevelBallistics.advance` then steps normally, so an `-inf` reading is survivable there — pinned
+/// by `LevelBallisticsTests.minusInfinityIsSurvivable`. `NeedleBallistics.advance` (VUMeter.swift:175)
+/// takes its target through the same `fraction` and survives it for the same reason.
 ///
-/// What the floor protects is everything that reads `AudioFrame.dbfs`, which `LevelMeter` leaves
-/// deliberately **raw** and unsmoothed so a meter can run its own ballistics off it: an `-inf` there
-/// is an `-inf` in a numeric readout and in whatever a view multiplies it by. −140 also sits below
-/// `D.meter.floorDBFS` (−54), so silence still reads as the bottom of the printed scale.
+/// The consumer that does **not** survive it is the third one-pole filter, `LevelTrace.tick`
+/// (Design/Waveform.swift:85-92). `LevelMeter` leaves `AudioFrame.dbfs` deliberately raw and
+/// unsmoothed so a meter can run its own ballistics off it; Waveform.swift:235 hands that raw value
+/// straight to `tick`, which integrates it with no `fraction` clamp anywhere in front of it. One
+/// `-inf` sets `integrated` to `-inf`, and on the next tick `(dbfs - integrated)` is `+inf` for any
+/// finite reading (or `NaN` for a second `-inf`), so `integrated` becomes `NaN` — which then
+/// propagates through `accumulatedSum`, `commit()`'s mean and every column height for the life of
+/// the trace. Both halves are pinned by `AudioLevelMathTests.silenceFloorKeepsTheTraceFinite`.
+///
+/// `NaN` cannot get in here at all, which matters because `fraction` propagates it: the gate is
+/// `amplitude > 1e-7`, false for `NaN`, so a buffer of `NaN` samples reads as the floor like any
+/// other silence (`AudioLevelMathTests.dbfsMapping`). −140 also sits below `D.meter.floorDBFS` (−54),
+/// so silence still reads as the bottom of the printed scale.
 @inline(__always)
 func audioDBFS(_ amplitude: Float) -> Float {
     amplitude > 1e-7 ? 20 * log10f(amplitude) : -140
