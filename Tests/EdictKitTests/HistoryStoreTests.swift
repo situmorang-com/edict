@@ -284,6 +284,95 @@ struct HistoryStoreTests {
         #expect(abs(store.totalAudioDuration - 5.0) < 0.0001)
     }
 
+    /// A guard, not evidence of a fix: `totalWords` used to be a reduce, so this held trivially
+    /// before the cache existed. What it is here to catch is the cache going *stale*, which no test
+    /// of behaviour elsewhere can see — the number is correct or it is not, and nothing else in the
+    /// suite reads it after a trim, a partial removal, or a load.
+    ///
+    /// It has teeth, both checked: deleting the subtraction inside `append`'s trim fails this test
+    /// with "cached 8 against 5 after a trim", and dropping `wordTotal -= removedWords` from
+    /// `remove(ids:)` fails it with "cached 5 against 4 after a removal".
+    @Test("The cached word total tracks every mutation")
+    func wordTotalTracksEveryMutation() throws {
+        let (store, dir) = try makeStore(limit: 3)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        /// The sum the cache is replacing, computed the slow way.
+        func reduced() -> Int { store.transcripts.reduce(0) { $0 + $1.wordCount } }
+
+        #expect(store.totalWords == reduced())
+
+        store.append(transcript("one two three", at: 100))
+        store.append(transcript("four five", at: 200))
+        #expect(store.totalWords == reduced())
+
+        // The trim: a fourth entry at a limit of three drops the oldest, and its words go with it.
+        store.append(transcript("six", at: 300))
+        store.append(transcript("seven eight", at: 400))
+        #expect(store.transcripts.count == 3)
+        #expect(store.totalWords == reduced(), "cached \(store.totalWords) against \(reduced()) after a trim")
+
+        // A removal that matches nothing must not move the total either.
+        store.remove(ids: [UUID()])
+        #expect(store.totalWords == reduced())
+
+        let victim = try #require(store.transcripts.first { $0.text == "six" })
+        store.remove(ids: [victim.id])
+        #expect(store.totalWords == reduced(), "cached \(store.totalWords) against \(reduced()) after a removal")
+
+        store.removeAll()
+        #expect(store.totalWords == 0)
+        #expect(store.totalWords == reduced())
+    }
+
+    @Test("The cached word total is re-derived by a load, and cleared by a load that finds nothing")
+    func wordTotalAfterLoad() throws {
+        let (store, dir) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        store.append(transcript("one two three", at: 100))
+        store.append(transcript("four five six seven", at: 200))
+        try store.save()
+
+        let reloaded = HistoryStore(fileURL: store.fileURL, limit: { 5000 })
+        #expect(reloaded.totalWords == 0)
+        try reloaded.load()
+        #expect(reloaded.totalWords == 7)
+        #expect(reloaded.totalWords == reloaded.transcripts.reduce(0) { $0 + $1.wordCount })
+
+        // A load that finds nothing must clear the total, not keep the previous one: `load()` is
+        // public, and an empty store reporting the old number would be the cache describing
+        // transcripts that are no longer there.
+        try FileManager.default.removeItem(at: store.fileURL)
+        // `try?`: `writeAtomically` only keeps a previous version when there was one to keep, so
+        // after a single save there is no `.bak` on disk and its absence is not the failure here.
+        try? FileManager.default.removeItem(at: store.fileURL.appendingPathExtension("bak"))
+        try reloaded.load()
+        #expect(reloaded.transcripts.isEmpty)
+        #expect(reloaded.totalWords == 0)
+    }
+
+    @Test("A recovery from the backup re-derives the cached word total too")
+    func wordTotalAfterRecovery() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("history.json")
+
+        // The shape finding #2's recovery exists for: an unreadable store with a good backup beside
+        // it. `adopt` is what keeps the total honest on this path, and it is the path that would
+        // otherwise leave the rail printing the words of a history the app could not read.
+        let kept = [transcript("one two three four", at: 200), transcript("five six", at: 100)]
+        try Data("{ not json".utf8).write(to: fileURL)
+        try JSONEncoder.iso8601.encode(kept).write(to: fileURL.appendingPathExtension("bak"))
+
+        let store = HistoryStore(fileURL: fileURL, limit: { 5000 })
+        try store.load()
+
+        #expect(store.recoveredEntryCount == 2)
+        #expect(store.totalWords == 6)
+        #expect(store.totalWords == store.transcripts.reduce(0) { $0 + $1.wordCount })
+    }
+
     // MARK: Persistence behaviour
 
     @Test("The debounced write eventually lands without an explicit save", .timeLimit(.minutes(1)))

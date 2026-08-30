@@ -18,19 +18,58 @@ final class HUDPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+// MARK: - Metrics
+
+/// The HUD's geometry, written as relationships to tokens rather than as numbers, so a token change
+/// moves the panel with it. The same shape `RefinePopupMetrics` takes, and for the same reason: this
+/// panel is a fixed size and nothing in it scrolls or scales, so anything put inside it has to be
+/// measured against it, and that arithmetic has to be somewhere a reader can check.
+enum HUDMetrics {
+
+    /// The panel window. Width from the token; height is the token height plus one waveform strip,
+    /// because the HUD carries a live-text line that `D.size.hudSize` does not account for. Composed
+    /// from tokens rather than measured by eye.
+    static var panelSize: CGSize {
+        CGSize(width: D.size.hudSize.width,
+               height: D.size.hudSize.height + D.size.waveformHeight)          // 360 x 140
+    }
+
+    /// The width available to content: the panel, less `HUDContent`'s shadow padding and
+    /// `PanelSurface`'s inset.
+    static var contentWidth: CGFloat {
+        panelSize.width - (D.space.xs + D.space.panelInset) * 2                // 328
+    }
+
+    /// The width a notice sentence actually wraps at, inside its well.
+    static var noticeTextWidth: CGFloat { contentWidth - D.space.wellInset * 2 }   // 312
+
+    /// How many lines a notice sentence is allowed before it truncates.
+    ///
+    /// Measured, not chosen. The panel is a fixed 140 pt and nothing in it scrolls, so the budget is
+    /// arithmetic: 140 − 2×`D.space.xs` − 2×`D.space.panelInset` leaves 108 pt of content, and after
+    /// an 11 pt `silkscreenTiny` label, `D.space.sm`, and 2×`D.space.wellInset` there are 73 pt of
+    /// text. `D.type.explain` measures 14 pt a line with 3 pt of `lineSpacing` between, so four lines
+    /// is 65 pt and five would be 82. Measured with CoreText at `noticeTextWidth`: every sentence
+    /// `AppModel.notice(for:appName:keptInHistory:)` can produce takes two lines at any real
+    /// application name — "Microsoft Visual Studio Code — Insiders" included. The margin past that is
+    /// wide: an unbroken 60-character run of capital Ws still lands inside four lines (65 is where it
+    /// tips into five), and a name with spaces in it holds to four up to about 85 characters. So an
+    /// `NSRunningApplication.localizedName` truncates the tail of this sentence only if it is longer
+    /// than any this project has seen. `NoticeLayoutTests` re-measures all of it.
+    ///
+    /// The one string that can exceed four lines is an `.error` sentence, several of which end in an
+    /// unbounded framework message. It truncates here. The phase stays `.error` until CLEAR, so the
+    /// same message is still in the status channel, which offers the whole of it as a tooltip
+    /// wherever there is a pointer — which is not here, because this panel ignores mouse events.
+    static let noticeLines = 4
+}
+
 // MARK: - HUDWindowController
 
-/// Shows and hides the recording HUD in step with `AppModel.phase`, honouring `Settings.showHUD`.
+/// Shows and hides the recording HUD in step with `AppModel.phase` and `AppModel.notice`, honouring
+/// `Settings.showHUD`.
 @MainActor
 public final class HUDWindowController {
-
-    /// Width from the token; height is the token height plus one waveform strip, because the HUD
-    /// carries a live-text line that `D.size.hudSize` does not account for. Composed from tokens
-    /// rather than measured by eye.
-    private static var panelSize: CGSize {
-        CGSize(width: D.size.hudSize.width,
-               height: D.size.hudSize.height + D.size.waveformHeight)
-    }
 
     /// Distance from the bottom of the screen's visible frame. `xxl` puts it clear of the Dock in
     /// its default position without floating in the middle of the user's work.
@@ -46,7 +85,7 @@ public final class HUDWindowController {
 
     // MARK: Lifecycle
 
-    /// Begin tracking `phase` and `showHUD`. Called once from the app delegate.
+    /// Begin tracking `phase`, `notice` and `showHUD`. Called once from the app delegate.
     public func start() {
         guard !isObserving else { return }
         isObserving = true
@@ -64,6 +103,7 @@ public final class HUDWindowController {
     private func observe() {
         withObservationTracking {
             _ = model.phase
+            _ = model.notice
             _ = model.settings.showHUD
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
@@ -75,7 +115,11 @@ public final class HUDWindowController {
     }
 
     private func synchronise() {
-        let wanted = model.settings.showHUD && Self.shouldShow(model.phase)
+        // Still gated on `showHUD`, notice or no notice: a user who switched the HUD off has asked
+        // for no panel over their work, and a dictation that did not land is not a licence to put one
+        // there anyway. That user is told in the menu-bar popover instead, which prints
+        // `AppModel.lastNotice` and stays until the next dictation.
+        let wanted = model.settings.showHUD && Self.shouldShow(phase: model.phase, notice: model.notice)
         if wanted {
             present()
         } else {
@@ -84,8 +128,21 @@ public final class HUDWindowController {
     }
 
     /// Visible for the whole utterance, including the finalize and inject tail — those are the
-    /// seconds when the user most wants to know something is still happening.
-    private static func shouldShow(_ phase: DictationPhase) -> Bool {
+    /// seconds when the user most wants to know something is still happening — and then for as long
+    /// as a terminal notice is up.
+    ///
+    /// The notice is checked first because it is raised at exactly the moment the phase stops
+    /// justifying a panel: `DictationController.complete` calls `AppModel.finished(transcript:)`, which
+    /// raises it, one statement before it sets `.idle`. Without it the panel is taken away in the same
+    /// frame the app has something to say, which is the whole of the failure this answers. `.idle` and
+    /// `.error` therefore keep the `false` they always had — the notice, not the phase, is what holds
+    /// the panel open past the end of an utterance.
+    ///
+    /// `internal` and taking both values rather than reading the model, so the rule is testable: a
+    /// panel needs a window server, but which state deserves one is arithmetic. `NoticeSurfaceTests`
+    /// drives it.
+    static func shouldShow(phase: DictationPhase, notice: DictationNotice?) -> Bool {
+        if notice != nil { return true }
         switch phase {
         case .arming, .listening, .transcribing, .refining, .injecting: return true
         case .idle, .error: return false
@@ -109,7 +166,7 @@ public final class HUDWindowController {
 
     private func makePanel() -> HUDPanel {
         let panel = HUDPanel(
-            contentRect: NSRect(origin: .zero, size: Self.panelSize),
+            contentRect: NSRect(origin: .zero, size: HUDMetrics.panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -133,7 +190,7 @@ public final class HUDWindowController {
         panel.setAccessibilityLabel("Edict recording status")
 
         let host = NSHostingView(rootView: HUDContent(model: model, meter: model.levelMeter))
-        host.frame = NSRect(origin: .zero, size: Self.panelSize)
+        host.frame = NSRect(origin: .zero, size: HUDMetrics.panelSize)
         host.autoresizingMask = [.width, .height]
         panel.contentView = host
         return panel
@@ -148,7 +205,7 @@ public final class HUDWindowController {
             ?? NSScreen.screens.first
         guard let visible = screen?.visibleFrame else { return }
 
-        let size = Self.panelSize
+        let size = HUDMetrics.panelSize
         let origin = NSPoint(
             x: visible.midX - size.width / 2,
             y: visible.minY + Self.bottomInset
@@ -209,7 +266,8 @@ extension AppModel {
 // MARK: - HUDContent
 
 /// The HUD's contents: record lamp, status, elapsed counter, live level, and the live text with a
-/// visually distinct volatile tail.
+/// visually distinct volatile tail — or, once the utterance is over, one sentence saying it did not
+/// land.
 struct HUDContent: View {
 
     let model: AppModel
@@ -221,16 +279,59 @@ struct HUDContent: View {
 
     var body: some View {
         PanelSurface(material: .plastic, radius: D.radius.bezel, inset: D.space.panelInset) {
-            VStack(alignment: .leading, spacing: D.space.sm) {
-                instrumentRow
-                levelStrip
-                liveTextWell
+            // A notice takes the whole panel rather than being squeezed in as a fourth row. There is
+            // no room for it under the other three — the panel is a fixed 140 pt and the sentence
+            // needs 73 of them, which is the arithmetic in `HUDMetrics.noticeLines` — and the rows it
+            // would sit under are all describing an utterance that has ended anyway: a frozen
+            // waveform over a counter reset to zero.
+            if let notice = model.notice {
+                noticeContent(notice)
+            } else {
+                VStack(alignment: .leading, spacing: D.space.sm) {
+                    instrumentRow
+                    levelStrip
+                    liveTextWell
+                }
             }
         }
         .shadow(D.shadow.hud)
         .padding(D.space.xs)
         .transition(.opacity)
         .animation(D.motion.hud, value: model.phase)
+        .animation(D.motion.hud, value: model.notice)
+    }
+
+    // MARK: The notice
+
+    /// A finished utterance that did not end up where it was aimed.
+    ///
+    /// The sentence sits in a `.list` well rather than straight on the plastic, and that is
+    /// legibility rather than decoration: `RefinePopupView.failure` records the measurement —
+    /// `D.color.alert` is `#76400C` in the light appearance and was unreadable on matte black
+    /// plastic, which is what `.plastic` is in *both* appearances — and a `.list` well is the one
+    /// ground in the system that tracks the appearance. This panel is the same material, so it takes
+    /// the same fix.
+    ///
+    /// A fixed `width:` rather than `maxWidth: .infinity`, so the sentence wraps at the width
+    /// `HUDMetrics.noticeLines` was measured at instead of at whatever the panel happens to offer.
+    private func noticeContent(_ notice: DictationNotice) -> some View {
+        VStack(alignment: .leading, spacing: D.space.sm) {
+            SilkscreenLabel(notice.label, weight: .tiny)
+                .silkscreenDecorative()
+            RecessedWell(fill: .list, radius: D.radius.well, inset: D.space.wellInset) {
+                Text(notice.sentence)
+                    .typeStyle(D.type.explain)
+                    .foregroundStyle(D.color.alert)
+                    .lineLimit(HUDMetrics.noticeLines)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(width: HUDMetrics.contentWidth, alignment: .leading)
+        // One utterance, one thing said about it: the printed label is hidden above and the sentence
+        // carries the whole meaning.
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(notice.sentence)
     }
 
     // MARK: rows

@@ -50,10 +50,17 @@ struct EdictMenuBarContent: View {
     private static let recentCount = 3
 
     var body: some View {
-        VStack(alignment: .leading, spacing: D.space.sm) {
+        // Bound once. `lastNotice` scans history for the one outcome whose sentence names it, and a
+        // property read twice in a view body is a scan run twice.
+        let notice = model.lastNotice
+        return VStack(alignment: .leading, spacing: D.space.sm) {
             header
             SeamDivider()
             transport
+            if let notice {
+                SeamDivider()
+                noticeBlock(notice)
+            }
             if !recent.isEmpty {
                 SeamDivider()
                 recentList
@@ -96,6 +103,32 @@ struct EdictMenuBarContent: View {
                 SilkscreenLabel("\(chord.glyph(dictationKey: model.settings.hotkey)) refines a selection")
             }
         }
+    }
+
+    /// What became of the last dictation, when it did not end up at the cursor.
+    ///
+    /// Fed by `AppModel.lastNotice` and not `AppModel.notice`: the HUD's copy of this removes itself
+    /// after `RefinePopupTimeouts.failureDwell`, and by the time a user has noticed nothing appeared
+    /// in their document and reached the menu bar, it is gone. This one stays until the next
+    /// dictation reports an outcome of its own, which makes the status item the surface that still
+    /// answers "what happened?" — including for a user who has switched the HUD off entirely.
+    ///
+    /// Text, not keys. The recovery controls — insert again, teach Edict to paste only in this app —
+    /// need the app the text was meant for to still be in front, and clicking anything in this
+    /// popover activates Edict. They live on the transcript's own row in the history pane, and
+    /// WINDOW below is what opens the window that holds it.
+    private func noticeBlock(_ notice: DictationNotice) -> some View {
+        VStack(alignment: .leading, spacing: D.space.xxs) {
+            SilkscreenLabel(notice.label, weight: .tiny)
+                .silkscreenDecorative()
+            Text(notice.sentence)
+                .typeStyle(D.type.explain)
+                .foregroundStyle(D.color.alert)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(notice.sentence)
     }
 
     private var recentList: some View {

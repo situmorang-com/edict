@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import ServiceManagement
 import SwiftUI
 
@@ -64,10 +65,25 @@ struct HistoryPane: View {
     private static let clearArmWindow: Duration = .seconds(4)
 
     var body: some View {
-        VStack(alignment: .leading, spacing: D.space.md) {
-            controls
+        // Both derived collections are bound ONCE, here, and threaded down into the row builder.
+        //
+        // `rows` used to be a computed property and the badge set another one that re-ran the same
+        // `search`, and the badge set was read from *inside* the `ForEach` content closure — so
+        // SwiftUI evaluated it per materialised row, and each evaluation re-filtered the whole store
+        // and allocated a `contributingLocales` array per transcript. That is O(rows²) over the
+        // store on every render of the pane, not "twice per body".
+        //
+        // Bound here rather than cached in `@State` with an `onChange`, which is what the shape
+        // suggests: the only invalidation signal that shape has is `transcripts.count`, and
+        // `HistoryStore.load()` replacing the array with a different one of equal length — a
+        // recovery from the backup, at launch — would leave the previous rows on screen.
+        let rows = model.history.search(query)
+        let ambiguousBadges = Self.ambiguousBadges(in: rows)
+
+        return VStack(alignment: .leading, spacing: D.space.md) {
+            controls(resultCount: rows.count)
             loadNotice
-            table
+            table(rows: rows, ambiguousBadges: ambiguousBadges)
             if let transcript = selected {
                 detail(for: transcript)
             }
@@ -126,9 +142,9 @@ struct HistoryPane: View {
 
     // MARK: Controls
 
-    private var controls: some View {
+    private func controls(resultCount: Int) -> some View {
         HStack(spacing: D.space.md) {
-            EquipmentSearchField(legend: "Find", text: $query, resultCount: rows.count)
+            EquipmentSearchField(legend: "Find", text: $query, resultCount: resultCount)
                 // `TextField` has no maximum height, so the channel would otherwise absorb the
                 // slack the log tray is supposed to get.
                 .frame(height: D.size.rowHeight)
@@ -210,49 +226,126 @@ struct HistoryPane: View {
 
     // MARK: Table
 
-    private var table: some View {
-        PanelSurface("Log", inset: D.space.wellInset) {
+    private func table(rows: [Transcript], ambiguousBadges: Set<String>) -> some View {
+        let content = LogTrayContent(
+            rowCount: rows.count,
+            storeCount: model.history.transcripts.count,
+            query: query
+        )
+        return PanelSurface("Log", inset: D.space.wellInset) {
             RecessedWell(fill: .list, inset: 0) {
-                MaybeScroll(scrolls: !unbounded) {
-                    LazyVStack(spacing: 0) {
-                        ForEach(rows) { transcript in
-                            TranscriptRow(
-                                transcript,
-                                isSelected: selection == transcript.id,
-                                onCopy: { ViewClipboard.put(transcript.text) },
-                                outcome: model.displayOutcome(for: transcript),
-                                isRetrying: model.retryingTranscriptID == transcript.id,
-                                localeIsAmbiguous: ambiguousLocales.contains(
-                                    LanguageCode.badge(transcript.localeIdentifier)
-                                ),
-                                onRetry: { Task { await model.retryInjection(transcript) } }
-                            )
-                            // Not a `Button` wrapper: the row already contains one (the copy key),
-                            // and nesting buttons swallows the inner key's hits.
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                selection = (selection == transcript.id) ? nil : transcript.id
-                            }
-                            .contextMenu {
-                                Button("Copy") { ViewClipboard.put(transcript.text) }
-                                if model.displayOutcome(for: transcript).needsRecovery {
-                                    Button("Insert again") {
-                                        Task { await model.retryInjection(transcript) }
-                                    }
-                                }
-                                Button("Delete") { delete(transcript.id) }
+                switch content {
+                case .rows: rowList(rows, ambiguousBadges: ambiguousBadges)
+                case .emptyLog: emptyLog
+                case .noMatch(let query): noMatch(query)
+                }
+            }
+        }
+        // An empty tray is capped rather than stretched, exactly as `ImportPane.queue` caps its
+        // own: 700 points of void with one sentence in it "reads as a broken layout", in that
+        // pane's words, where a tray sized to a handful of rows reads as an empty tray.
+        .frame(
+            minHeight: D.size.rowHeight * 4,
+            maxHeight: content == .rows ? .infinity : D.size.rowHeight * HistoryPaneMetrics.emptyTrayRows
+        )
+    }
+
+    private func rowList(_ rows: [Transcript], ambiguousBadges: Set<String>) -> some View {
+        MaybeScroll(scrolls: !unbounded) {
+            LazyVStack(spacing: 0) {
+                ForEach(rows) { transcript in
+                    TranscriptRow(
+                        transcript,
+                        isSelected: selection == transcript.id,
+                        onCopy: { ViewClipboard.put(transcript.text) },
+                        outcome: model.displayOutcome(for: transcript),
+                        isRetrying: model.retryingTranscriptID == transcript.id,
+                        localeIsAmbiguous: ambiguousBadges.contains(
+                            LanguageCode.badge(transcript.localeIdentifier)
+                        ),
+                        onRetry: { Task { await model.retryInjection(transcript) } }
+                    )
+                    // Not a `Button` wrapper: the row already contains one (the copy key),
+                    // and nesting buttons swallows the inner key's hits.
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        selection = (selection == transcript.id) ? nil : transcript.id
+                    }
+                    .contextMenu {
+                        Button("Copy") { ViewClipboard.put(transcript.text) }
+                        if model.displayOutcome(for: transcript).needsRecovery {
+                            Button("Insert again") {
+                                Task { await model.retryInjection(transcript) }
                             }
                         }
+                        Button("Delete") { delete(transcript.id) }
                     }
                 }
             }
         }
-        .frame(minHeight: D.size.rowHeight * 4, maxHeight: .infinity)
+    }
+
+    // MARK: The empty tray
+
+    /// First run, and the pane the app opens on.
+    ///
+    /// The tray used to be a recessed well wrapping a `ForEach` over nothing: no text, no next step.
+    /// It is also the only moment the gestures are learnable — `AppModel.statusLine` names the
+    /// language modifier but the main window prints `StatusReadout(.ready)`, i.e. the single word
+    /// "Ready", and the refine chord is named only in the menu-bar popover and in Settings.
+    ///
+    /// The sentences come from `GestureCopy.lines`, off the *live* settings, so a rebound key or a
+    /// switched-off feature cannot leave this teaching a gesture the user does not have.
+    private var emptyLog: some View {
+        VStack(spacing: D.space.sm) {
+            SilkscreenLabel("Nothing recorded yet", weight: .heading, alignment: .center)
+            VStack(alignment: .leading, spacing: D.space.xs) {
+                ForEach(
+                    GestureCopy.lines(
+                        settings: model.settings,
+                        secondaryLocaleReady: model.secondaryLocaleReady
+                    ),
+                    id: \.self
+                ) { line in
+                    Text(line)
+                        .typeStyle(D.type.explain)
+                        .foregroundStyle(D.color.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            // Left-aligned inside a centred block: four gestures are a list, and a centred list
+            // has no edge for the eye to run down. The width is what the height cap above was
+            // measured against — see `HistoryPaneMetrics.emptyCopyWidth`.
+            .frame(maxWidth: HistoryPaneMetrics.emptyCopyWidth)
+        }
+        .padding(D.space.lg)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// A query that filtered everything out. Distinct from an empty log, because the remedy is
+    /// different: there was no branch for this at all, so a search with no hits looked exactly like
+    /// a log with nothing in it.
+    private func noMatch(_ query: String) -> some View {
+        VStack(spacing: D.space.sm) {
+            SilkscreenLabel("No match", weight: .heading, alignment: .center)
+            Text("No transcript matches \u{201C}\(query)\u{201D}.")
+                .typeStyle(D.type.explain)
+                .foregroundStyle(D.color.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                // The query is already legible in the field above, so a pasted paragraph is
+                // truncated here rather than allowed to grow the tray past its cap.
+                .lineLimit(2)
+                .frame(maxWidth: HistoryPaneMetrics.emptyCopyWidth)
+        }
+        .padding(D.space.lg)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: Data
-
-    private var rows: [Transcript] { model.history.search(query) }
 
     /// Two-letter badges that more than one language in this log would print.
     ///
@@ -261,7 +354,10 @@ struct HistoryPane: View {
     /// nothing while looking like it works, which is the same class of failure the column was added to
     /// prevent. Computed over the *filtered* rows, because that is what is on screen: a badge is only
     /// ambiguous against something the reader can also see.
-    private var ambiguousLocales: Set<String> {
+    ///
+    /// A `static` function of the rows rather than a computed property over `model`, so that
+    /// `body` can call it once instead of the `ForEach` calling it per row.
+    static func ambiguousBadges(in rows: [Transcript]) -> Set<String> {
         var byBadge: [String: Set<String>] = [:]
         for transcript in rows {
             for identifier in transcript.contributingLocales {
@@ -285,6 +381,130 @@ struct HistoryPane: View {
         // but the app would still be holding the user's deleted speech.
         model.refinement.forget(id)
         if selection == id { selection = nil }
+    }
+}
+
+// MARK: - HistoryPaneMetrics
+
+/// The widths and heights this pane's own arithmetic is checked against.
+///
+/// A named enum rather than private constants for the same reason `ExportKeyMetrics` is one: the app
+/// cannot be photographed from an automated run (RECON §40), so the only thing that can catch a
+/// legend the container cannot afford is a test doing the arithmetic — and a test can only do it
+/// against numbers it can read. `HistoryPaneLayoutTests` holds these to the font.
+enum HistoryPaneMetrics {
+    /// The ceiling on the log tray when it has no rows, in `D.size.rowHeight` units.
+    ///
+    /// Ten rather than `ImportPane`'s eight, and the two points of difference are the point: that
+    /// tray holds one centred sentence, this one holds a heading and four gestures. Eight rows was
+    /// tried first and `HistoryPaneLayoutTests.theEmptyTrayFitsItsCap` refused it — 208pt against a
+    /// worst case of 219.6pt, which would have clipped the drop hint. Nothing else could have caught
+    /// that: RECON §40 means the tray cannot be photographed from an automated run.
+    static let emptyTrayRows: CGFloat = 10
+    /// The measure the empty tray's sentences are set to. Prose, so it is set for line length rather
+    /// than filled to the tray: at the tray's full width a gesture line would be one long line and
+    /// the four of them would not read as a list.
+    static let emptyCopyWidth: CGFloat = 460
+
+    /// How many lines of a transcript the well shows before the user asks for the rest.
+    static let collapsedLineLimit = 4
+    /// Words per block in an expanded well. See `TranscriptWell` for the measurement that chose it;
+    /// anything shorter than this is one block, i.e. one `Text`, i.e. unchanged.
+    static let chunkTargetWords = 300
+
+    /// The narrowest the transcript panel's content can be: the minimum window width, less the
+    /// rail, the machined channel beside it, the pane's own padding and the panel's inset.
+    ///
+    /// `railSeam` mirrors `SeamDivider(.vertical, depth: .channel)`, whose width is assembled from
+    /// constants private to `Components.swift`; its own documentation states the total.
+    static let railSeam: CGFloat = 2.5
+    static var narrowestPanelWidth: CGFloat {
+        D.size.windowMin.width - D.size.railWidth - railSeam - 2 * D.space.md - 2 * D.space.panelInset
+    }
+    /// `TapeCap`'s seat, one point on each side outside the cap's own padding — mirroring
+    /// `M.capSeatOutset`, which is private to `Components.swift`.
+    static let capSeatOutset: CGFloat = 1
+}
+
+// MARK: - LogTrayContent
+
+/// What the log tray draws: rows, an empty log, or a query that matched nothing.
+///
+/// A type rather than two `if`s in the view body, because the distinction is the finding: a tray
+/// with no rows had one branch — the `ForEach` over nothing — so a filtered-out search and a log
+/// with nothing in it produced the same blank well. View bodies cannot be tested; this can.
+enum LogTrayContent: Equatable {
+    case rows
+    case emptyLog
+    case noMatch(query: String)
+
+    /// - Parameters:
+    ///   - rowCount: rows after the search filter.
+    ///   - storeCount: transcripts in the store, unfiltered.
+    ///   - query: the search field's text, as typed.
+    init(rowCount: Int, storeCount: Int, query: String) {
+        let trimmed = query.trimmed
+        if rowCount > 0 {
+            self = .rows
+        } else if storeCount > 0, !trimmed.isEmpty {
+            self = .noMatch(query: trimmed)
+        } else {
+            // Also the unreachable case — a non-empty store with an empty query — since
+            // `HistoryStore.search` returns everything for an empty query. Teaching the gestures is
+            // the safer thing to do if that ever stops being true.
+            self = .emptyLog
+        }
+    }
+}
+
+// MARK: - GestureCopy
+
+/// The gestures the empty log teaches, in the words of the settings actually in force.
+///
+/// Read from live settings rather than written out, because every one of them is reconfigurable and
+/// two of them can be switched off: a first-run panel that named a chord the user does not have
+/// would be teaching a gesture that does nothing. Pure, and returned as strings, so the wording and
+/// the conditions are testable without a view.
+enum GestureCopy {
+
+    /// - Parameter secondaryLocaleReady: whether the second language's speech assets are installed.
+    ///   The line is withheld until they are, matching `AppModel.statusLine`, which gates the same
+    ///   sentence the same way — naming the modifier before the model is on disk would teach a
+    ///   gesture whose first use is an error message.
+    @MainActor
+    static func lines(settings: Settings, secondaryLocaleReady: Bool) -> [String] {
+        var lines: [String] = []
+
+        let hold = settings.pushToTalk
+            ? "Hold \(settings.hotkey.displayName) and speak."
+            : "Press \(settings.hotkey.displayName) to start, and press it again to stop."
+        // Never "the words appear at your cursor": with `autoInject` off nothing is inserted at all,
+        // and the ladder can still end on the clipboard even when it is on — which the transcript's
+        // own row says, in its own words, when it happens.
+        let destination = settings.autoInject
+            ? " Edict puts the text at your cursor."
+            : " Edict leaves the text on your clipboard."
+        lines.append(hold + destination)
+
+        if secondaryLocaleReady, let secondary = settings.effectiveSecondaryLocaleIdentifier {
+            lines.append(
+                "Add \(settings.secondaryLocaleModifier.glyph) while you hold it to dictate in "
+                    + "\(LocaleNames.display(secondary))."
+            )
+        }
+
+        if let chord = settings.effectiveRefineChord {
+            lines.append(
+                "\(chord.glyph(dictationKey: settings.hotkey)) cleans up, bullets or summarises "
+                    + "text you have selected in any app."
+            )
+        }
+
+        lines.append(
+            "Drop \(ImportableMedia.plainDescription) anywhere on this window to transcribe it — "
+                + "the transcript arrives here."
+        )
+        return lines
     }
 }
 
@@ -350,12 +570,17 @@ private struct TranscriptDetail: View {
     @State private var exportOutcome: TranscriptExportOutcome?
 
     var body: some View {
-        PanelSurface("Transcript") {
+        // Counted once, here, and handed to both the header readout and the transcript well's key.
+        // `Transcript.wordCount` splits the whole text on whitespace — measured on this machine at
+        // 4.6-6.1 ms for a 10,200-word import — and the two of them would otherwise pay for it
+        // twice on every render of this block.
+        let words = transcript.wordCount
+        return PanelSurface("Transcript") {
             // A *definite* height: given only a maximum a `ScrollView` is greedy and eats the log
             // tray, and given an ideal proposal it measures as zero and disappears entirely.
             MaybeScroll(scrolls: !unbounded) {
                 VStack(alignment: .leading, spacing: D.space.md) {
-                    header
+                    header(words: words)
                     // Directly under the keys that produced it, and full width, because the reason a
                     // write failed is a sentence with a remedy in it. `TranscriptExportKeys` records
                     // why this cannot go on the key cap.
@@ -370,7 +595,15 @@ private struct TranscriptDetail: View {
                     // is trusted. Renders to nothing when the recognition rate was plausible.
                     QualityNotice(transcript.quality)
                     if outcome.needsRecovery { recovery }
-                    textBlock(label: transcriptLabel, body: transcript.text)
+                    TranscriptWell(
+                        label: transcriptLabel,
+                        text: transcript.text,
+                        wordCount: words,
+                        // An import opens expanded: for a file the transcript IS the deliverable,
+                        // and the four-line cap was justified for a dictation the user had just
+                        // spoken and already read.
+                        startsExpanded: transcript.isImported
+                    )
                     // What the on-device model did to this dictation *before* it was inserted, for a
                     // transcript recorded while `Settings.refineBeforeInsert` was on. Directly under
                     // the transcript, because the pair is the point: this is the record of speech,
@@ -389,7 +622,15 @@ private struct TranscriptDetail: View {
                         unbounded: unbounded
                     )
                     if transcript.didCorrect {
-                        textBlock(label: "As heard", body: transcript.rawText)
+                        // Collapsed even for an import, deliberately: this well is the evidence
+                        // that the dictionary fired, read when something looks wrong, and two
+                        // expanded copies of a 70-minute transcript would bury everything under it.
+                        TranscriptWell(
+                            label: "As heard",
+                            text: transcript.rawText,
+                            wordCount: Transcript.wordCount(of: transcript.rawText),
+                            startsExpanded: false
+                        )
                         corrections
                     }
                     if !suggestions.isEmpty { lowConfidence }
@@ -418,10 +659,10 @@ private struct TranscriptDetail: View {
 
     // MARK: Header
 
-    private var header: some View {
+    private func header(words: Int) -> some View {
         HStack(alignment: .center, spacing: D.space.md) {
             readout("Length", .duration(transcript.audioDuration))
-            readout("Words", .count(transcript.wordCount, unit: "w"))
+            readout("Words", .count(words, unit: "w"))
             if transcript.isImported {
                 // For a file this is the whole job, not an end-of-speech latency, so it is reported
                 // as a speed: "62x" reads as "an hour of audio in a minute", which is the number a
@@ -655,25 +896,6 @@ private struct TranscriptDetail: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func textBlock(label: String, body text: String) -> some View {
-        VStack(alignment: .leading, spacing: D.space.labelGap) {
-            SilkscreenLabel(label, weight: .tiny)
-                .silkscreenDecorative()
-            RecessedWell(fill: .list) {
-                Text(text.isEmpty ? "—" : text)
-                    .typeStyle(D.type.body)
-                    .foregroundStyle(D.color.textPrimary)
-                    .textSelection(.enabled)
-                    .lineLimit(4)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-            }
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(label)
-        .accessibilityValue(text)
-    }
-
     /// The evidence. One line per hit, in the form the contracts fix:
     /// `"cloud code" → "Claude Code"`.
     private var corrections: some View {
@@ -769,6 +991,259 @@ private struct TranscriptDetail: View {
     }
 }
 
+// MARK: - TranscriptWell
+
+/// A transcript in a recessed well: the first `collapsedLineLimit` lines by default, all of it on
+/// request.
+///
+/// **Why the limit is state and not a constant.** The four-line cap was justified by
+/// `RefinementPane`'s note that this well "is a reminder of text the user has already read". That is
+/// true of a dictation and false of every import: an imported transcript is a result the user waited
+/// minutes for and has never seen, the README sells nine-minute recordings and 70-minute meetings,
+/// and refinement is no way round it either (`TextRefiner` throws `tooLong` rather than truncating).
+/// The cap also sat *outside* the `textSelection`, so the hidden text could not even be selected.
+/// So an import opens expanded, a dictation opens capped, and either can be toggled.
+///
+/// **Why the expanded text is drawn in blocks rather than as one `Text`.** Measured with CoreText at
+/// this well's width on this machine, 664pt, `D.type.body` rebuilt through AppKit: framesetting a
+/// 10,500-word transcript (64,359 characters — 70 minutes of speech at 150 wpm) as one string takes
+/// 146 ms and produces 610 lines. The cost is superlinear, so cutting the *same* text into 35 blocks
+/// lays all of them out in 12.4 ms, and inside a `LazyVStack` only the blocks in the viewport lay out
+/// at all, at 0.36 ms each. One `Text` would therefore stall the pane for about nine frames every
+/// time the block is laid out again, which includes every step of a window resize. Anything under
+/// `HistoryPaneMetrics.chunkTargetWords` words is returned whole, so every dictation and every short
+/// import is exactly one `Text` with the exact stored string in it.
+///
+/// The price is real and worth stating: a selection cannot be dragged across a block boundary the way
+/// it can inside one `Text`, and the single space at each cut is drawn as a block break. COPY in the
+/// header above puts the whole transcript on the clipboard and the export keys write the whole file,
+/// so no block boundary is between the user and their text.
+///
+/// The expanded state is only ever *seen* offline through the `unbounded` hatch (RECON §40), which
+/// also removes the enclosing `ScrollView` — so in the render harness the `LazyVStack` is not lazy
+/// and every block lays out. That is the 12.4 ms case, not the 146 ms one.
+private struct TranscriptWell: View {
+
+    let label: String
+    let text: String
+    /// Words in `text`, passed in rather than recomputed here: see `TranscriptDetail.body`.
+    let wordCount: Int
+
+    @State private var isExpanded: Bool
+    /// The width the text is actually laid out at, so the truncation test measures the real line
+    /// breaks rather than an assumed column.
+    @State private var measuredWidth: CGFloat = 0
+
+    init(label: String, text: String, wordCount: Int, startsExpanded: Bool) {
+        self.label = label
+        self.text = text
+        self.wordCount = wordCount
+        self._isExpanded = State(initialValue: startsExpanded)
+    }
+
+    /// Measured 2pt narrower than the real column. The bias is deliberate: `CTTypesetter`'s line
+    /// breaking is not guaranteed to agree with SwiftUI's to the point, and of the two ways to be
+    /// wrong at the boundary — a key that reveals nothing, or a hidden fifth line with no key — only
+    /// one of them hides the user's words.
+    private static let wrapSafety: CGFloat = 2
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: D.space.labelGap) {
+            HStack(spacing: D.space.sm) {
+                SilkscreenLabel(label, weight: .tiny)
+                    .silkscreenDecorative()
+                Spacer(minLength: D.space.xs)
+                key
+            }
+            RecessedWell(fill: .list) {
+                content
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { measuredWidth = $0 }
+            }
+            // Combined on the WELL and not on the whole block, unlike the plain text block this
+            // replaced: `.combine` on the outer stack would fold the key into one element and take
+            // its action with it, so the only control that can reveal the rest of the transcript
+            // would be unreachable to VoiceOver. The value is the full text either way.
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(label)
+            .accessibilityValue(text)
+        }
+    }
+
+    @ViewBuilder private var key: some View {
+        if isExpanded {
+            TapeButton("Show less") { isExpanded = false }
+                .accessibilityLabel("Show only the first \(HistoryPaneMetrics.collapsedLineLimit) lines")
+                .help("Shows the first \(HistoryPaneMetrics.collapsedLineLimit) lines again.")
+        } else if isTruncated {
+            TapeButton("Show all (\(wordCount.formatted()) words)") { isExpanded = true }
+                .accessibilityLabel("Show the whole transcript, \(wordCount) words")
+                .help("Shows the whole transcript. It scrolls inside this panel.")
+        }
+    }
+
+    @ViewBuilder private var content: some View {
+        if text.isEmpty {
+            styled("—")
+        } else if isExpanded {
+            LazyVStack(alignment: .leading, spacing: D.space.sm) {
+                // Offset ids, not the block text: two blocks of a repetitive transcript can be
+                // byte-identical, and identical ids would collapse them into one row.
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    styled(block)
+                }
+            }
+        } else {
+            styled(text)
+                .lineLimit(HistoryPaneMetrics.collapsedLineLimit)
+        }
+    }
+
+    private func styled(_ string: String) -> some View {
+        Text(string)
+            .typeStyle(D.type.body)
+            .foregroundStyle(D.color.textPrimary)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private var blocks: [String] {
+        TranscriptWellText.blocks(text, targetWords: HistoryPaneMetrics.chunkTargetWords)
+    }
+
+    /// Whether the collapsed well is hiding anything — measured, not guessed from a character count.
+    private var isTruncated: Bool {
+        TranscriptWellText.exceeds(
+            lineLimit: HistoryPaneMetrics.collapsedLineLimit,
+            text: text,
+            width: measuredWidth - Self.wrapSafety
+        )
+    }
+}
+
+// MARK: - TranscriptWellText
+
+/// The two text measurements `TranscriptWell` needs, kept out of the view so both can be tested —
+/// a view body cannot be, and these are the parts that can be wrong.
+enum TranscriptWellText {
+
+    /// `D.type.body` rebuilt through AppKit, because a SwiftUI `Font` cannot be measured. Exactly the
+    /// trick `ExportKeyWidthTests` uses on the cap face, and it carries the same warning: if the
+    /// token's size changes and this does not, the threshold drifts by a line at the boundary. The
+    /// consequence of that drift is a key that appears slightly early or late, never text that
+    /// cannot be reached.
+    ///
+    /// Computed rather than stored because `NSFont` is not `Sendable`, and a `static let` of one
+    /// would have to be either `nonisolated(unsafe)` or main-actor-isolated — the second of which
+    /// would drag `blocks`, which needs no font at all, onto the main actor with it. `systemFont`
+    /// is itself cached by AppKit, so this is a dictionary lookup against a 0.27 ms measurement.
+    private static var bodyFont: NSFont { NSFont.systemFont(ofSize: 13, weight: .regular) }
+
+    /// True when `text` needs more than `lineLimit` lines at `width`.
+    ///
+    /// CoreText rather than SwiftUI, because SwiftUI cannot answer this without laying the text out:
+    /// the usual trick — render it twice and compare heights — costs the full 146 ms layout on
+    /// exactly the transcripts this exists for. A `CTTypesetter` is asked for at most
+    /// `lineLimit + 1` line breaks, so the cost does not grow with the text: measured at 0.27 ms for
+    /// a 64,359-character transcript and 0.10 ms for a four-word one, which is why the view calls it
+    /// straight from its body rather than caching the answer.
+    ///
+    /// No paragraph loop, because `CTTypesetterSuggestLineBreak` was measured on this machine to
+    /// break at hard newlines: five `\n`-separated words at 664pt report five lines, the same text
+    /// with spaces reports one.
+    static func exceeds(lineLimit: Int, text: String, width: CGFloat) -> Bool {
+        // A width of zero is the first frame, before `onGeometryChange` has reported anything —
+        // and at zero the typesetter breaks after roughly every character, so guessing would put a
+        // key on every four-word dictation for one frame.
+        guard lineLimit > 0, width > 1, !text.isEmpty else { return false }
+
+        let attributed = NSAttributedString(string: text, attributes: [.font: bodyFont])
+        let typesetter = CTTypesetterCreateWithAttributedString(attributed)
+        var index = 0
+        var lines = 0
+        while index < attributed.length {
+            let count = CTTypesetterSuggestLineBreak(typesetter, index, Double(width))
+            // Defensive, not expected: a zero-length suggestion would spin here for ever, and a
+            // measurement this cheap must not be able to hang the pane.
+            guard count > 0 else { return false }
+            index += count
+            lines += 1
+            if lines > lineLimit { return true }
+        }
+        return false
+    }
+
+    /// Break `text` into blocks of about `targetWords` words for the expanded well.
+    ///
+    /// Cuts only *after* a word, and preferentially after one that ends a sentence, so a block break
+    /// falls where a paragraph break would. A run with no sentence end is cut at twice the target
+    /// rather than allowed to grow without bound — an unpunctuated transcript is precisely the case
+    /// that most needs breaking up.
+    ///
+    /// Every word survives, in order. What does not survive is the whitespace at each cut, which is
+    /// consumed and drawn as the gap between two blocks. A text shorter than the target is returned
+    /// as a single block, byte for byte, which is the path every dictation takes.
+    ///
+    /// Scanned over UTF-8 rather than over `Character`s: measured 0.32-0.50 ms against 3.6 ms for the
+    /// grapheme-by-grapheme version on the same 64,359-character transcript, and this runs from a
+    /// view body. The consequence is that only ASCII space, tab, CR and LF end a word here, so a
+    /// transcript joined by non-breaking spaces would come back as one block — the slow layout, not
+    /// a wrong one. No speech model in this app has been observed to emit one.
+    static func blocks(_ text: String, targetWords: Int) -> [String] {
+        guard targetWords > 0, !text.isEmpty else { return text.isEmpty ? [] : [text] }
+
+        let bytes = text.utf8
+        var blocks: [String] = []
+        var blockStart = bytes.startIndex
+        var index = bytes.startIndex
+        var words = 0
+
+        while index < bytes.endIndex {
+            guard !isSpace(bytes[index]) else {
+                index = bytes.index(after: index)
+                continue
+            }
+            // One word, remembering its last two bytes: the terminator may sit behind a closing
+            // quote or bracket ( `…said." ` ), which is common in refined text.
+            var last: UInt8 = 0
+            var previous: UInt8 = 0
+            while index < bytes.endIndex, !isSpace(bytes[index]) {
+                previous = last
+                last = bytes[index]
+                index = bytes.index(after: index)
+            }
+            let wordEnd = index
+            words += 1
+
+            let endsSentence = sentenceEnders.contains(last)
+                || (closers.contains(last) && sentenceEnders.contains(previous))
+            let cut = (words >= targetWords && endsSentence) || words >= targetWords * 2
+            guard cut, wordEnd < bytes.endIndex else { continue }
+
+            blocks.append(String(text[blockStart..<wordEnd]))
+            var next = wordEnd
+            while next < bytes.endIndex, isSpace(bytes[next]) { next = bytes.index(after: next) }
+            blockStart = next
+            index = next
+            words = 0
+        }
+
+        if blockStart < bytes.endIndex { blocks.append(String(text[blockStart...])) }
+        return blocks
+    }
+
+    /// `.` `!` `?` `:` `;` — the last two because a transcribed list ("three things: one, two")
+    /// breaks as readably there as at a full stop.
+    private static let sentenceEnders: Set<UInt8> = [0x2E, 0x21, 0x3F, 0x3A, 0x3B]
+    /// `"` `'` `)` `]`, the closers a terminator can hide behind.
+    private static let closers: Set<UInt8> = [0x22, 0x27, 0x29, 0x5D]
+
+    private static func isSpace(_ byte: UInt8) -> Bool {
+        byte == 0x20 || byte == 0x0A || byte == 0x0D || byte == 0x09
+    }
+}
+
 // MARK: - CorrectionLine
 
 /// One fired rule. The arrow is `D.color.selectionStroke` — the amber *selection* family, not
@@ -839,6 +1314,29 @@ public enum RecoveryFixtures {
             settings: Settings(defaults: EphemeralDefaults()),
             loginItem: LoginItem(service: nil)
         )
+    }
+
+    /// First run: an empty log, which is the pane the app opens on.
+    ///
+    /// Worth a sheet of its own because the empty tray cannot be seen any other way — RECON §40
+    /// forbids photographing the running app from an automated run, and the state disappears the
+    /// moment the developer dictates anything. `EphemeralDefaults` means the settings are the shipped
+    /// defaults, so all four gesture lines print: Right Option, ⇧ for Indonesian, the refine chord
+    /// and the drop hint.
+    static func emptyLogModel() -> AppModel {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("edict-render-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let model = AppModel(
+            settings: Settings(defaults: EphemeralDefaults()),
+            history: HistoryStore(fileURL: dir.appendingPathComponent("history.json"), limit: { 100 }),
+            loginItem: LoginItem(service: nil)
+        )
+        // Nothing installs speech assets in a render run, and the second-language line is gated on
+        // them the same way `AppModel.statusLine` gates its own — so without this the sheet would
+        // prove a three-line panel that a real first run shows with four.
+        model.apply(secondaryLocaleReady: true)
+        return model
     }
 
     /// A history holding the real failure from the brief: four words that Ghostty provably did not
@@ -921,6 +1419,7 @@ public enum RecoveryFixtures {
             sheet("history-failed", pane, historyPane(failed, selecting: failedID)),
             sheet("history-retried", pane, historyPane(retried, selecting: retriedID)),
             sheet("history-collapsed", pane, historyPane(failedInjectionModel(), selecting: nil)),
+            sheet("history-empty", pane, historyPane(emptyLogModel(), selecting: nil)),
             sheet("reports", keys, reportBank()),
         ]
     }

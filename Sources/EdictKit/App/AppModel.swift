@@ -55,6 +55,36 @@ public enum DictationPhase: Sendable, Hashable {
     }
 }
 
+// MARK: - DictationNotice
+
+/// One short report the app owes the user when an utterance did not end up where it was aimed.
+///
+/// This exists because the HUD is the only surface a user is looking at when they dictate, and it
+/// used to vanish the instant the utterance ended. On a `.clipboardOnly` outcome — a per-app policy,
+/// a closed permission gate, or a paste that provably did not land — the words were on the clipboard
+/// and nothing anywhere said so: `lastOutcome` was recorded and read by nothing, and the one
+/// remaining channel, `DictationController`'s `.fault` feedback, is gated on `Settings.playSounds`,
+/// which defaults to false.
+///
+/// Two strings rather than one, for the same reason `RefinementStore` has both `cap(for:)` and
+/// `sentence(for:)`: `StatusReadout` reserves the width of "Transcribing" and truncates anything
+/// longer, so the status channel needs two words while a well needs the whole sentence.
+///
+/// **Nothing built here may claim the text was inserted.** That is the whole point of the type: a
+/// report that says "Done" when the ladder ended at the clipboard is worse than no report, because
+/// it is the one thing that stops the user looking for their words.
+public struct DictationNotice: Sendable, Hashable {
+    /// Two or three words, for `StatusReadout`'s reserved width.
+    public let label: String
+    /// The whole sentence, for a surface with room for it — the HUD's well, the menu-bar popover.
+    public let sentence: String
+
+    public init(label: String, sentence: String) {
+        self.label = label
+        self.sentence = sentence
+    }
+}
+
 // MARK: - LoginItem
 
 /// "Open at login", wired to `SMAppService` and reporting **what macOS actually did**.
@@ -304,7 +334,21 @@ public final class AppModel {
     /// silently does nothing in that state, so the UI has to be able to say so.
     public private(set) var secondaryLocaleReady: Bool = false
 
+    /// Which rung of the injection ladder the last dictation ended on, or `nil` before the first.
+    ///
+    /// Read by `lastNotice`, which is the only reader — and for a long time there was none at all,
+    /// which is why a dictation that landed on the clipboard told the user nothing.
     public private(set) var lastOutcome: InjectionOutcome?
+
+    /// The report the HUD is currently showing, or `nil`.
+    ///
+    /// Read by the HUD and by the status channel (`statusLine`, `statusCondition`) — the two surfaces
+    /// that describe what is happening *now*. It goes away on its own, and it has to: the HUD is a
+    /// non-activating panel that `HUDWindowController.makePanel` gives `ignoresMouseEvents = true`, so
+    /// there is no gesture that can dismiss it, and a notice that stayed would be a panel parked over
+    /// the user's work with no way to get rid of it. `lastNotice` is the copy for a surface the user
+    /// goes looking at, and that one has no deadline.
+    public private(set) var notice: DictationNotice?
 
     /// The transcript just produced, so a view can flash it without re-querying history.
     public private(set) var lastTranscript: Transcript?
@@ -378,7 +422,17 @@ public final class AppModel {
     /// `SegmentCounter(.elapsed:)` renders tenths, so ten publishes a second is exactly enough.
     private static let elapsedHz: Double = 10
 
+    /// How long a notice stays on the HUD.
+    ///
+    /// The refine popup's failure dwell, reused rather than re-chosen: it is the same job — one
+    /// sentence, read once, gone again without a gesture — and two different dwells for two failure
+    /// sentences in one app would be noise. `RefinePopupTimeouts.failureDwell` carries the reasoning
+    /// for the number itself.
+    private static var noticeDwell: Duration { RefinePopupTimeouts.standard.failureDwell }
+
     private var tickers: Task<Void, Never>?
+    /// The dwell behind `notice`. See `show(notice:)`.
+    private var noticeDwellTask: Task<Void, Never>?
     /// See `startRefineTicker()`.
     private var refineTicker: Task<Void, Never>?
     private var didBootstrap = false
@@ -440,6 +494,11 @@ public final class AppModel {
         if !hotkeyLive { return "Hotkey inactive" }
         switch phase {
         case .idle:
+            // A report on the dictation that just ended outranks the invitation to make another one.
+            // This line is the menu-bar glyph's accessibility label, so for a VoiceOver user it is
+            // the *only* channel: printing "Hold ⌥ to dictate" over it would be the app changing the
+            // subject away from words that did not land.
+            if let notice { return notice.sentence }
             // The secondary language is discoverable only from here. A modifier nobody is told about
             // is a feature nobody uses, and there is no other surface — the app has no menu of modes.
             let base = "Hold \(settings.hotkey.displayName) to dictate"
@@ -476,6 +535,25 @@ public final class AppModel {
             return .needsPermission(missing.title)
         }
         if !hotkeyLive { return .needsPermission(PermissionKind.inputMonitoring.title) }
+        return Self.condition(for: phase, notice: notice)
+    }
+
+    /// The condition a phase-and-notice pair earns, once everything that outranks both has passed.
+    ///
+    /// Split out of `statusCondition` because it is the half a test can reach: the checks above it
+    /// read `Permissions`, which has no injection seam, so a test of the whole property can only
+    /// assert whichever branch the machine running it happens to be in. This is where the notice's
+    /// precedence over the phase actually lives, and `NoticeSurfaceTests` asserts it here.
+    nonisolated static func condition(
+        for phase: DictationPhase,
+        notice: DictationNotice?
+    ) -> StatusReadout.Condition {
+        // The notice outranks the phase: a report on the utterance that just ended is news, and
+        // `.idle`'s "Ready" over the top of it would be the channel saying nothing happened. The
+        // label rather than the sentence, because this channel truncates to the width of
+        // "Transcribing" — and `StatusReadout` announces every `.fault` to VoiceOver, which is the
+        // second reason the notice is routed through here rather than left to the HUD alone.
+        if let notice { return .fault(notice.label) }
         switch phase {
         case .idle: return .ready
         case .arming: return .armed
@@ -522,6 +600,7 @@ public final class AppModel {
             self.foregroundObserver = nil
         }
         stopTickers()
+        show(notice: nil)
         controller.shutdown()
         history.flushPendingSave()
         dictionary.flushPendingSave()
@@ -681,7 +760,12 @@ public final class AppModel {
 
     /// Clear a terminal error so the transport is usable again without relaunching.
     public func clearError() {
-        if case .error = phase { apply(phase: .idle) }
+        if case .error = phase {
+            apply(phase: .idle)
+            // CLEAR is the user saying they have read it. The dwell would take the notice away by
+            // itself, but not before the user had watched a panel they just dismissed sit there.
+            show(notice: nil)
+        }
     }
 
     public func retryHotkey() {
@@ -718,6 +802,20 @@ public final class AppModel {
         if !newPhase.isActive {
             activeLocaleIdentifier = nil
             activeLocaleIsSecondary = false
+        }
+        // A new utterance takes any standing notice away, whatever is left of its dwell: the report
+        // describes the dictation that just ended, and leaving it up would have the HUD talking about
+        // the wrong one. `.idle` deliberately does **not** clear it — that is the phase a finished
+        // dictation lands in, and `DictationController.complete` raises the notice through
+        // `finished(transcript:)` one statement before it gets here.
+        if newPhase.isActive { show(notice: nil) }
+        if case .error(let message) = newPhase {
+            // The error path never reaches `finished(transcript:)`, so this is its only report — and
+            // the HUD's `shouldShow` returns false for `.error`, so without it the panel vanishes at
+            // the moment the app has the most to say. Printed verbatim rather than paraphrased:
+            // `DictationController.failUtterance` has already put whatever it heard in history, and
+            // its sentence is the one that says so.
+            show(notice: DictationNotice(label: "Dictation failed", sentence: message))
         }
     }
 
@@ -769,6 +867,108 @@ public final class AppModel {
         lastTranscript = transcript
         lastOutcome = transcript.injection
         lastCaptureSuspect = transcript.mayBeIncomplete
+        // The one place a notice is raised for a *completed* utterance. Raised here rather than from
+        // the views, because this is the only moment the whole outcome is known, and it has to happen
+        // before the phase reaches `.idle` and the HUD would otherwise be taken away.
+        show(notice: lastNotice)
+    }
+
+    // MARK: Notices
+
+    /// The same report as `notice`, with no deadline, for the menu-bar popover — a surface the user
+    /// opens deliberately rather than one that appears in front of them.
+    ///
+    /// Computed rather than stored, so it cannot disagree with what was recorded, and so it outlives
+    /// the dwell that `notice` is on: a user who realises ten seconds later that nothing appeared in
+    /// their document can still click the status item and be told where their words are.
+    ///
+    /// It describes the last dictation that *reached an outcome*. An utterance that was cancelled, or
+    /// that failed before it produced one, never calls `finished(transcript:)` at all, so this can
+    /// outlive the dictation after it — which is right, because it is still the last outcome Edict
+    /// has to report.
+    public var lastNotice: DictationNotice? {
+        guard let outcome = lastOutcome, let transcript = lastTranscript else { return nil }
+        // The history scan runs for `.failed` alone: it is the only outcome whose sentence names
+        // history, and the rarest — it means the clipboard write itself failed. Every other outcome
+        // ignores the flag, so passing `false` there changes nothing any of them says. Written this
+        // way round because a view body reads this property, and an unconditional scan of up to
+        // `Settings.historyLimit` (5000 by default) entries does not belong in one.
+        let kept = outcome == .failed
+            && history.transcripts.contains { $0.id == transcript.id }
+        return Self.notice(for: outcome, appName: transcript.targetAppName, keptInHistory: kept)
+    }
+
+    /// The report an injection outcome earns, or `nil` when there is nothing to report.
+    ///
+    /// `nil` for the three rungs that landed, and for `.notAttempted` — which is not a failure but
+    /// one of three deliberate no-ops: a dictation started from Edict's own window, `autoInject`
+    /// switched off, or an empty transcript. In none of them is the user waiting for text to appear
+    /// somewhere else, and a panel telling them so would be the app inventing a problem.
+    ///
+    /// Pure, and `internal` rather than `private`, because it is the whole rule: which outcomes owe
+    /// the user a sentence, and what that sentence is allowed to claim. `DictationNoticeRuleTests`
+    /// pins it. `nonisolated` for the same reason `RefinePopupSession.action(forDigit:)` is: it is a
+    /// function of its arguments, and nothing should have to hop an actor to read a table.
+    ///
+    /// - Parameters:
+    ///   - appName: the app the text was aimed at, as recorded on the transcript.
+    ///   - keptInHistory: whether the words are actually in the log. Read by `.failed` only.
+    nonisolated static func notice(
+        for outcome: InjectionOutcome,
+        appName: String?,
+        keptInHistory: Bool
+    ) -> DictationNotice? {
+        switch outcome {
+        case .accessibility, .paste, .keystrokes, .notAttempted:
+            return nil
+        case .clipboardOnly:
+            // "Could not put the text into", not "refused it": from here the reason is genuinely
+            // unknown — a learned per-app policy, a closed permission gate and a paste that provably
+            // did not land all arrive as this one outcome — so naming a culprit would be a guess.
+            // The wording follows the history pane's own "did not land" sentence and the refine
+            // gesture's clipboard sentence, the two other places Edict states this same fact.
+            return DictationNotice(
+                label: Self.notInsertedLabel,
+                sentence: "Edict could not put the text into \(appName ?? "the app you were in"). "
+                    + "It is on your clipboard — press ⌘V."
+            )
+        case .failed:
+            // The clipboard write itself failed, so there is no ⌘V to offer and the sentence must not
+            // imply one.
+            let sentence = "Edict could not insert the text or put it on your clipboard."
+            return DictationNotice(
+                label: Self.notInsertedLabel,
+                sentence: keptInHistory ? sentence + " The words are in Edict's history." : sentence
+            )
+        }
+    }
+
+    /// Short enough for the status channel, measured rather than assumed.
+    ///
+    /// `StatusReadout` reserves the rendered width of "Transcribing" and truncates anything wider
+    /// (`M.statusTemplate`). Measured with CoreText: uppercased, "NOT INSERTED" is 81.0 pt against
+    /// "TRANSCRIBING"'s 83.6 pt at `D.type.silkscreen`, and 69.6 against 71.8 at `silkscreenTiny`,
+    /// which is the compact weight the HUD and the menu-bar popover use. `NoticeLayoutTests` keeps it
+    /// that way.
+    nonisolated static let notInsertedLabel = "Not inserted"
+
+    /// Put a notice up and start its dwell; `nil` takes any standing one away.
+    ///
+    /// The dwell is a timer and not a gesture because the HUD cannot receive one: the panel sets
+    /// `ignoresMouseEvents = true` so a click meant for the editor underneath is never intercepted,
+    /// and it can never become key, so it sees no keystrokes either. Anything shown there has to
+    /// remove itself.
+    private func show(notice newNotice: DictationNotice?) {
+        noticeDwellTask?.cancel()
+        noticeDwellTask = nil
+        notice = newNotice
+        guard newNotice != nil else { return }
+        noticeDwellTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.noticeDwell)
+            guard !Task.isCancelled, let self else { return }
+            self.notice = nil
+            self.noticeDwellTask = nil
+        }
     }
 
     // MARK: Injection recovery
