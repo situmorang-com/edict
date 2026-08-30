@@ -1,5 +1,6 @@
 import Foundation
 import ServiceManagement
+import Synchronization
 import Testing
 @testable import EdictKit
 
@@ -497,10 +498,15 @@ struct InjectNormalisationTests {
     func textEditIsUntouched() {
         // TextEdit takes a pasted newline as a newline, which is what the user dictated. Collapsing
         // here would be a silent content edit with nothing to justify it.
-        let dictated = "First line\nsecond line\r\nthird\rfourth\twith a tab"
+        let dictated = "cafe\u{301} au lait\nsecond line\r\nthird\rfourth\twith a tab"
         let out = TextInjector.normalise(dictated, for: "com.apple.TextEdit")
         #expect(out == dictated)
-        #expect(Array(out.utf8) == Array(dictated.utf8))
+        // NOT redundant with the line above, and it took a decomposed "e\u{301}" in the fixture to
+        // make that true. Swift's `==` compares canonical equivalence, so on an ASCII-only fixture
+        // byte equality was the same predicate — and a pass-through that quietly folded the user's
+        // words with `precomposedStringWithCanonicalMapping` was invisible to both.
+        #expect(Array(out.utf8) == Array(dictated.utf8),
+                "the pass-through path recomposed the user's text instead of leaving it alone")
     }
 
     @Test("A nil bundle id gets the user's text byte for byte")
@@ -508,9 +514,109 @@ struct InjectNormalisationTests {
         // An unbundled or helper process cannot be keyed in the policy map, so it cannot be known to
         // be a terminal. `strategy(for: nil)` already refuses to trust it with an AX insert; that is
         // a reason to be careful about *how* the text is delivered, not a licence to rewrite it.
-        let dictated = "one\ntwo\r\nthree\rfour\tfive"
+        let dictated = "one nai\u{308}ve\ntwo\r\nthree\rfour\tfive"
         let out = TextInjector.normalise(dictated, for: nil)
         #expect(out == dictated)
-        #expect(Array(out.utf8) == Array(dictated.utf8))
+        // Decomposed "i\u{308}" for the same reason as above.
+        #expect(Array(out.utf8) == Array(dictated.utf8),
+                "the pass-through path recomposed the user's text instead of leaving it alone")
     }
+
+    // MARK: The verdict-to-demotion mapping
+
+    /// The other half of the wiring that nothing pinned.
+    ///
+    /// Measured: replacing both `demoteToPasteOnly` call sites in `inject` with `break` left every
+    /// injection suite green, so the self-healing half of the CONTRACTS amendment was unguarded. The
+    /// ladder itself still needs an `InjectAX`/`InjectPasteboard` seam to drive, and that is scoped
+    /// separately — but the mapping from a verdict to a reason is pure, and it is where the decision
+    /// actually lives.
+    @Test("Only a verdict that failed or could not be verified demotes an app")
+    func demotionMapping() {
+        #expect(TextInjector.demotionReason(for: .confirmedInserted) == nil,
+                "a verified insert demoted the app, so one good app would be paste-only forever")
+
+        // Both demote, and they are deliberately different sentences: the log is where a "why is this
+        // app on the slow path" question gets answered.
+        let notInserted = TextInjector.demotionReason(for: .confirmedNotInserted)
+        let cannotVerify = TextInjector.demotionReason(for: .cannotVerify)
+        #expect(notInserted != nil)
+        #expect(cannotVerify != nil,
+                """
+                an insert nothing could verify was treated as a success, which is the one outcome this                 app must never report — the alternative is telling the user their words landed when the                 app silently dropped them
+                """)
+        #expect(notInserted != cannotVerify)
+    }
+
+    // MARK: The call site, not just the function
+
+    /// The hole the tests above do not close.
+    ///
+    /// Measured: replacing `let payload = Self.normalise(text, for: target.bundleID)` in `inject` with
+    /// `let payload = text` — Edict simply stops collapsing newlines for terminals — left every
+    /// injection suite green. `normalise` was pinned; the fact that anything CALLS it was not. And the
+    /// consequence of that regression is the one this whole area exists to prevent: a user's dictated
+    /// bullet list arriving in Ghostty as a run of shell commands.
+    ///
+    /// Reached through the rung-0 gate rather than the ladder. `payload` is computed ABOVE the gate,
+    /// so closing the gate sends the collapsed text to the clipboard without any AX write, any posted
+    /// keystroke, or any contact with the frontmost app — and the injected clipboard closure means the
+    /// user's real pasteboard is never touched either. Closing the gate has to be INJECTED rather than
+    /// read: this machine has Accessibility granted, so an ambient gate would take the AX rung and the
+    /// test would pass or fail depending on whose Mac it ran on.
+    @Test("inject collapses newlines for a terminal, not just normalise on its own")
+    func injectCollapsesForATerminal() async {
+        let captured = Captured()
+        let injector = TextInjector(
+            policies: InjectPolicyStore(defaults: EphemeralDefaults()),
+            gate: { .closed },
+            writeClipboard: { text in
+                captured.append(text)
+                return 1
+            }
+        )
+
+        let outcome = await injector.inject(
+            "line one\nline two",
+            into: InjectionTarget(bundleID: "com.mitchellh.ghostty", appName: "Ghostty")
+        )
+
+        #expect(outcome == .clipboardOnly)
+        #expect(captured.all == ["line one line two"],
+                "inject stopped collapsing newlines for a terminal, so dictated prose would arrive in Ghostty as shell commands")
+    }
+
+    @Test("inject leaves a non-terminal app's newlines alone")
+    func injectLeavesNonTerminalsAlone() async {
+        let captured = Captured()
+        let injector = TextInjector(
+            policies: InjectPolicyStore(defaults: EphemeralDefaults()),
+            gate: { .closed },
+            writeClipboard: { text in
+                captured.append(text)
+                return 1
+            }
+        )
+
+        _ = await injector.inject(
+            "line one\nline two",
+            into: InjectionTarget(bundleID: "com.apple.TextEdit", appName: "TextEdit")
+        )
+
+        // The other direction, so a mutation that collapses unconditionally fails too. Without this,
+        // "always collapse" would satisfy the test above.
+        #expect(captured.all == ["line one\nline two"])
+    }
+}
+
+/// A `@Sendable` collector for what the injected clipboard closure was handed.
+///
+/// The closure is `@Sendable` because `TextInjector` is, so a captured `var` is a compile error under
+/// strict concurrency. `Mutex` rather than an unchecked box: the repo already uses it in
+/// `HotkeyMonitor` for the same reason, and an `@unchecked Sendable` here would be a claim nobody
+/// checked.
+private final class Captured: Sendable {
+    private let items = Mutex<[String]>([])
+    func append(_ text: String) { items.withLock { $0.append(text) } }
+    var all: [String] { items.withLock { $0 } }
 }

@@ -93,8 +93,72 @@ public actor TextInjector {
     ///   keeps two injectors — the dictation controller's and the history pane's retry path — from
     ///   holding divergent snapshots of the same on-disk map. Tests pass their own so they never touch
     ///   `UserDefaults.standard`.
-    public init(policies: InjectPolicyStore = .standard) {
+    /// - Parameters:
+    ///   - gate: the three rung-0 permission checks, as one value. Injected so a test can force the
+    ///     gate CLOSED and reach `leaveOnClipboard` without any of the ladder running. Reading them
+    ///     ambiently instead would make such a test machine-dependent, because a dev machine has
+    ///     Accessibility granted and would take the AX rung.
+    ///   - writeClipboard: the transient pasteboard write, returning its change count. Injected for
+    ///     the same test, and so that a test never touches the user's real clipboard — an agent
+    ///     destroyed the contents of it once.
+    ///
+    /// These two exist because of a measured hole rather than a design preference. With `normalise`
+    /// tested directly and nothing testing the CALL to it, deleting the call — so Edict stops
+    /// collapsing newlines for terminals altogether — left every injection suite green. The
+    /// consequence of that regression is a user's dictated prose arriving in Ghostty as a run of
+    /// shell commands, which is the exact failure the collapse exists to prevent.
+    /// Both closures default to `nil` rather than to the real implementations, because
+    /// `InjectPasteboard` is private to this file and a public default argument cannot name it.
+    /// Resolving inside keeps that type private, which is the right way round: nothing outside needs
+    /// to know how the clipboard write is done.
+    public init(
+        policies: InjectPolicyStore = .standard,
+        gate: (@Sendable () -> InjectionGate)? = nil,
+        writeClipboard: (@Sendable (String) -> Int?)? = nil
+    ) {
         self.policies = policies
+        self.gate = gate ?? { InjectionGate.current() }
+        self.writeClipboard = writeClipboard ?? { InjectPasteboard.writeTransient($0) }
+    }
+
+    private let gate: @Sendable () -> InjectionGate
+    private let writeClipboard: @Sendable (String) -> Int?
+
+    // MARK: The rung-0 gate
+
+    /// The three permission checks rung 0 makes, as one value.
+    ///
+    /// RECON is explicit that all three are checked UP FRONT and never inferred from an `AXError`: an
+    /// untrusted system-wide element returns `.cannotComplete`, not `.apiDisabled`, which is
+    /// indistinguishable from a hung app. Grouping them means a test can close the gate without
+    /// pretending to know which of the three the system would have refused.
+    public struct InjectionGate: Sendable, Hashable {
+        public var axTrusted: Bool
+        public var canPostEvents: Bool
+        public var secureInputEnabled: Bool
+
+        public init(axTrusted: Bool, canPostEvents: Bool, secureInputEnabled: Bool) {
+            self.axTrusted = axTrusted
+            self.canPostEvents = canPostEvents
+            self.secureInputEnabled = secureInputEnabled
+        }
+
+        /// What the system says right now.
+        public static func current() -> InjectionGate {
+            InjectionGate(
+                axTrusted: AXIsProcessTrusted(),
+                canPostEvents: CGPreflightPostEventAccess(),
+                secureInputEnabled: IsSecureEventInputEnabled()
+            )
+        }
+
+        /// Every gate closed. A password field has focus, or the permissions were never granted —
+        /// either way the ladder cannot run and the text goes to the clipboard.
+        public static let closed = InjectionGate(
+            axTrusted: false,
+            canPostEvents: false,
+            secureInputEnabled: true
+        )
     }
 
     // MARK: Target
@@ -205,6 +269,23 @@ public actor TextInjector {
     /// on every dictation does not rewrite `edict.injectPolicies` each time. A *seeded* paste-only app
     /// never reaches here at all — its strategy skips rung 1 — and if it were demoted by hand the guard
     /// would not catch it, because `learned(for:)` is nil for a seed.
+    /// Why a verdict demotes an app to paste-only, or `nil` when it does not.
+    ///
+    /// Extracted from the switch in `inject` because it is the one part of the demotion wiring that is
+    /// pure. `cannotVerify` demotes deliberately, and that is the decision worth pinning: an insert
+    /// nothing could verify must never be treated as a success, because the alternative is telling the
+    /// user their words landed when the app silently dropped them.
+    static func demotionReason(for verdict: InjectInsertVerdict) -> String? {
+        switch verdict {
+        case .confirmedInserted:
+            return nil
+        case .confirmedNotInserted:
+            return "AX write returned success but nothing changed"
+        case .cannotVerify:
+            return "AX insert is unverifiable on this element"
+        }
+    }
+
     func demoteToPasteOnly(_ bundleID: String?, why: String) {
         guard let bundleID else { return }
         guard policies.learned(for: bundleID) != .pasteOnly else { return }
@@ -227,9 +308,10 @@ public actor TextInjector {
         // Rung 0. RECON is explicit that all three gates are checked up front and never inferred from an
         // AXError: an untrusted system-wide element returns `.cannotComplete`, not `.apiDisabled`, which
         // is indistinguishable from a hung app.
-        let trusted = AXIsProcessTrusted()
-        let canPost = CGPreflightPostEventAccess()
-        let secureInput = IsSecureEventInputEnabled()
+        let checked = gate()
+        let trusted = checked.axTrusted
+        let canPost = checked.canPostEvents
+        let secureInput = checked.secureInputEnabled
         if !trusted || !canPost || secureInput {
             Log.inject.error("""
                 injection gate closed: axTrusted=\(trusted, privacy: .public) \
@@ -269,10 +351,12 @@ public actor TextInjector {
                     case .confirmedInserted:
                         Log.inject.info("AX insert verified in \(target.appName ?? "?", privacy: .public)")
                         return .accessibility
-                    case .confirmedNotInserted:
-                        demoteToPasteOnly(target.bundleID, why: "AX write returned success but nothing changed")
-                    case .cannotVerify:
-                        demoteToPasteOnly(target.bundleID, why: "AX insert is unverifiable on this element")
+                    case .confirmedNotInserted, .cannotVerify:
+                        // One arm, because `demotionReason` is what decides — the two verdicts differ
+                        // in why, not in what happens next.
+                        if let why = Self.demotionReason(for: verdict) {
+                            demoteToPasteOnly(target.bundleID, why: why)
+                        }
                     }
                 } else {
                     // Not a demotion: the *element* was wrong (a button, a web area), not necessarily
@@ -318,7 +402,7 @@ public actor TextInjector {
     }
 
     private func leaveOnClipboard(_ text: String) -> InjectionOutcome {
-        guard InjectPasteboard.writeTransient(text) != nil else {
+        guard writeClipboard(text) != nil else {
             Log.inject.error("could not even write the clipboard")
             return .failed
         }
@@ -577,6 +661,23 @@ private struct InjectFingerprint: Equatable {
     var isUsable: Bool { valueUTF16 != nil || numberOfCharacters != nil || caret != nil }
 }
 
+/// What an Accessibility insert actually did.
+///
+/// At file scope and internal, rather than nested inside the private `InjectAX`, for one reason: the
+/// mapping from a verdict to a policy demotion is pure and needs pinning. Replacing both
+/// `demoteToPasteOnly` call sites with `break` used to leave every injection suite green — the whole
+/// self-healing half of the CONTRACTS amendment was unguarded — and closing that needed a nameable
+/// verdict and nothing else. `InjectAX` itself stays private: the rest of it talks to the
+/// Accessibility API and returns private types.
+enum InjectInsertVerdict {
+    case confirmedInserted
+    /// The write returned success and provably changed nothing. Classic Electron silent failure.
+    case confirmedNotInserted
+    /// The element exposes nothing that can settle the question. Treated as failure for policy
+    /// purposes, because an unverifiable insert must never be reported to the user as a success.
+    case cannotVerify
+}
+
 private enum InjectAX {
 
     /// Bounds every AX round trip. The framework default is 6 s, so a single unresponsive app would
@@ -687,16 +788,8 @@ private enum InjectAX {
             || names.contains(kAXSelectedTextRangeAttribute as String)
     }
 
-    enum InsertVerdict {
-        case confirmedInserted
-        /// The write returned success and provably changed nothing. Classic Electron silent failure.
-        case confirmedNotInserted
-        /// The element exposes nothing that can settle the question. Treated as failure for policy
-        /// purposes, because an unverifiable insert must never be reported to the user as a success.
-        case cannotVerify
-    }
 
-    static func insert(_ text: String, into focus: InjectFocus) -> InsertVerdict {
+    static func insert(_ text: String, into focus: InjectFocus) -> InjectInsertVerdict {
         let element = focus.element
         let valueBefore = copyString(element, kAXValueAttribute as String)
         let rangeBefore = copyRange(element, kAXSelectedTextRangeAttribute as String)

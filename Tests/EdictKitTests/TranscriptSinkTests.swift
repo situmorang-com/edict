@@ -246,11 +246,35 @@ struct TranscriptSinkTests {
         #expect(sink.committed == "ONE two")
     }
 
-    // NOTE — there is deliberately no test here for a zero-duration final, or for one range enclosing
-    // another. Both would sharpen the "predicate too loose" direction, but neither shape has been
-    // observed coming out of either module, and a test that pins a shape the engine never emits is a
-    // test that will one day be defended for the wrong reason. `nonContiguousFinalsAllSurvive` covers
-    // the loose direction with ranges RECON actually recorded.
+    /// The dedupe's GRANULARITY, which is a design decision rather than an engine shape.
+    ///
+    /// Two finals that share a start and differ in end are two different spans of audio, so both are
+    /// kept: `CMTimeRangeEqual` compares the whole range, and that is the point of choosing it.
+    ///
+    /// This is here because the note below used to claim `nonContiguousFinalsAllSurvive` covered the
+    /// loose direction, and it does not cover this part of it. Every range RECON recorded has a
+    /// distinct start, so that fixture cannot tell exact-range equality from start-only equality —
+    /// and narrowing the predicate to `CMTimeCompare($0.range.start, range.start) == 0` was measured
+    /// to pass all fifteen other tests in this file while silently deleting committed text whenever
+    /// two finals begin together. Start-only is the natural next tidy after the contiguity tidy the
+    /// note was already worried about, which is exactly why it needs a test rather than a comment.
+    @Test("Two finals that share a start but not an end are both kept")
+    func finalsSharingAStartAreNotDeduped() {
+        let (sink, _) = makeSink()
+
+        sink.ingest(isFinal: true, range: span(0, 3.300), text: plain(" Hold the right option key,"))
+        sink.ingest(isFinal: true, range: span(0, 7.800), text: plain(" speak, and release,"))
+
+        #expect(sink.finalCount == 2,
+                "a final was deduped on its start alone, so a span of the user's speech was dropped")
+        #expect(sink.committed == " Hold the right option key, speak, and release,")
+    }
+
+    // NOTE — there is deliberately no test here for a ZERO-DURATION final. It would sharpen the
+    // "predicate too loose" direction further, but that shape has not been observed coming out of
+    // either module, and a test pinning a shape the engine never emits is one that will eventually be
+    // defended for the wrong reason. The enclosing-range case above is a different matter: it pins
+    // what the dedupe compares, which is ours to decide and ours to keep.
 
     // MARK: Rule 3 — the volatile tail clears on every final
 
@@ -345,7 +369,16 @@ struct TranscriptSinkTests {
     }
 
     /// The other half of the OR: a run with a confidence and no time range is collected too, with nil
-    /// seconds. `WordConfidence.startSeconds`/`.endSeconds` are optional for exactly this shape.
+    /// seconds.
+    ///
+    /// Stated as a branch of the OR being pinned, NOT as a shape the engine was observed emitting.
+    /// Both production call sites request `attributeOptions: [.transcriptionConfidence, .audioTimeRange]`,
+    /// and RECON records the converse shape — a range with no confidence, which is what emptied
+    /// `segments` for every Indonesian transcript — but never this one. The measured motive for
+    /// `WordConfidence.startSeconds`/`.endSeconds` being optional is the attribute-free run under a
+    /// named preset (`attributeOptions == []`), not confidence-without-range. The test earns its place
+    /// regardless: it is one of only two things that kill a narrowing of the guard to
+    /// `guard timeRange != nil`.
     @Test("Runs with a confidence and no time range still become words")
     func confidenceOnlyRunsAreCollected() {
         let (sink, _) = makeSink()
@@ -429,6 +462,18 @@ struct TranscriptSinkTests {
         // (0.2 + 0.4 + 0.9) / 3 — four runs collected, three of them scored.
         #expect(closeEnough(log.last?.confidence, 0.5))
         #expect(sink.allWords.count == 4)
+
+        // And the CUMULATIVE mean, on the same fixture, because it has the only mix in this file:
+        // four words collected, three scored. Without this line `meanConfidence`'s divisor is
+        // unpinned — `scored.reduce(0, +) / Double(scored.count)` becoming `/ Double(words.count)`
+        // passes every other test here, since every other fixture scores every word it collects and
+        // the two expressions are then indistinguishable. The mutant reports 1.5/4 = 0.375: a
+        // confidence dragged toward the floor by words that were never scored, which is the same
+        // "unscored runs must not be averaged in as zero" rule this file argues for above, applied
+        // to the per-result mean and previously not to this one. It bites hardest on exactly the
+        // transcripts that motivated the OR in the collection guard.
+        #expect(closeEnough(sink.meanConfidence, 0.5),
+                "the whole-utterance mean divided by the words collected rather than the words scored")
     }
 
     @Test("An update's confidence is nil when no run in that result carried one")
