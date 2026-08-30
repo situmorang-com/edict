@@ -481,9 +481,21 @@ Built, signed, installed and LAUNCHED a real SwiftUI .app from a bare SwiftPM ex
 
 > Irrelevant for a locally built app: `xattr -l` showed no com.apple.quarantine, so Gatekeeper is never consulted and `open` works. It only bites if the .app is zipped/AirDropped/downloaded; then the recipient needs right-click > Open once, or `xattr -dr com.apple.quarantine Edict.app`. The build script already runs `xattr -cr` before signing.
 
-**`iconutil -c icns` fails with the unhelpful "Edict.iconset:Failed to generate ICNS." if any of the ten expected filenames is wrong or missing (I hit it when a shell quoting bug produced a single file literally named ".png").**
+**`iconutil -c icns` fails with the unhelpful "Edict.iconset:Failed to generate ICNS." when NOTHING in the directory lands in a slot (I hit it when a shell quoting bug produced a single file literally named ".png").**
 
-> Emit exactly icon_16x16, icon_16x16@2x, icon_32x32, icon_32x32@2x, icon_128x128, icon_128x128@2x, icon_256x256, icon_256x256@2x, icon_512x512, icon_512x512@2x. Avoid `set -- $spec` inside the loop under zsh; the make-icon.sh here uses a `while read name px` heredoc instead.
+> **Corrected.** The original entry read this as "if any of the ten expected filenames is wrong or
+> missing" and recommended emitting exactly ten names. That was wrong, and it was reproduced wrong
+> twice — once by the incident, once by a later reader who designed around it. Measured: a SUBSET
+> converts fine (a one-file iconset produced a valid 621,571-byte icns); the digits in the filename are
+> IGNORED, because `iconutil` picks the slot from the file's real pixel dimensions plus the `@2x`
+> suffix; and files it cannot place are dropped SILENTLY. So the failure means "no file landed
+> anywhere", not "one name was wrong".
+>
+> The ten canonical names are still what to emit — they cover every slot the OS asks for, and naming
+> them makes the script readable. Just do not believe the rule is enforced.
+>
+> Still true and still worth the line: avoid `set -- $spec` inside the loop under zsh; make-icon.sh
+> uses a `while read name px` heredoc instead.
 
 **SwiftPM emits `warning: 'edict': found 1 file(s) which are unhandled; explicitly declare them as resources or exclude from the target` for any non-source file left under Sources/.**
 
@@ -503,7 +515,18 @@ Built, signed, installed and LAUNCHED a real SwiftUI .app from a bare SwiftPM ex
 
 ### Recommendations
 
-- Deliver via a hand-assembled .app + a stable SELF-SIGNED certificate, not ad-hoc. This is the single highest-value decision: it makes the TCC designated requirement `identifier "com.edict.app" and certificate root = H"..."`, so the Accessibility and Input Monitoring grants survive every rebuild, and it means you do not need reproducible builds at all (keep your debug symbols).
+- Deliver via a hand-assembled .app + a stable SELF-SIGNED certificate, not ad-hoc. This is the single highest-value decision: it makes the TCC designated requirement `identifier "com.edict.app" and certificate root = H"..."`, so the Accessibility and Input Monitoring grants survive every rebuild, and it means you do not need reproducible builds at all.
+
+  **Amended on the symbols.** This used to end "(keep your debug symbols)", and build-app.sh now strips
+  them, so the authoritative document was recommending the opposite of what the build does. Measured:
+  `strip -S -x` removes ~4.6 MB of `__LINKEDIT` (84,969 symbols down to 6,612; `__LINKEDIT` 5,311,640
+  to 729,160) with `__TEXT,__text` and all eleven `__swift5_*` sections BYTE-IDENTICAL, and `LC_UUID`
+  unchanged — so symbolication against the unstripped copy still works. The strip must run BEFORE
+  codesign: run after, it prints "warning: changes being made to the file will invalidate the code
+  signature", **exits 0** so `set -e` catches nothing, and `codesign --verify --strict` then reports
+  "plist or signature have been modified" while the process is SIGKILLed on first page-in. The grants
+  themselves are not at risk from this — the DR is cert-root plus bundle id, not a cdhash — so the cost
+  of getting the order wrong is an app that cannot launch until re-signed, not a re-grant.
 - Provision the identity into a DEDICATED keychain (~/Library/Keychains/edict-signing.keychain-db) with a password baked into the script, and always follow `security import` with `security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <pw> <keychain>`. Pass `--keychain <path>` to codesign so the user's keychain search list is never modified (verified working with the keychain absent from the search list). Zero sudo, zero GUI prompts, verified from a completely clean state.
 - Back up (or commit, encrypted) the .p12 of that certificate — or at least document that deleting the keychain forces a new cert and therefore a one-time re-grant of Accessibility/Input Monitoring. This is now the only thing that can break the dev loop.
 - Never declare `resources:` on the app target. Put assets in a top-level Resources/ dir, copy them into Contents/Resources in build-app.sh, and read them with Bundle.main. Add a startup assertion that Bundle.main.bundleIdentifier != nil and that a known seed resource resolves, so a broken bundle fails loudly instead of at first use.
@@ -977,3 +1000,100 @@ And one assertion was measuring the wrong thing: `LateLocaleTests` bounded the l
 now the release. A timer that only settles at the end of the hold still fails it.
 
 After both fixes: **ten consecutive full-suite runs, all green.**
+
+## A test that cannot fail, and a test that cannot run
+
+Two failure modes cost more than any bug found in this audit, and neither shows up as a red test.
+
+**A gated suite is not coverage.** `EngineReservationRecoveryTests` is behind
+`EDICT_SPEECH_TESTS=1` and cannot run on this machine at all: it resolves `en-GB`/`en-AU`/`en-CA`,
+whose general-module assets are absent here, so `resolveImportPass` falls through to the dictation
+branch and calls `startDownload` — a real network model download, kicked off in a detached `Task`
+*before* the `try #require` fires. Three production stubs shipped past 580 green tests while the suite
+that asserted against two of them sat there unrunnable: `let isSecondary = true` hardcoded, an
+`if false,` dead-coding a whole eviction branch (swiftc accepts that silently), and a `keepSet()` whose
+one-line body contradicted its own ten-line doc comment. Prefer a test that runs on every machine over
+a more faithful one that needs assets, hardware, or a network; if the faithful one must be gated, write
+an ungated one that reaches the same defect through a public property as well.
+
+**An assertion can be structurally incapable of failing.** `#expect(reserved.count <= 5)` cannot fail,
+because the framework throws at six and `reserve` catches and evicts — a state where Edict has
+permanently leaked all five slots satisfies it. Same shape:
+`#expect(Array(out.utf8) == Array(dictated.utf8))` on an ASCII-only fixture, where byte equality and
+Swift's canonical-equivalence `==` are the same predicate, so a pass-through that silently folded the
+user's text with `precomposedStringWithCanonicalMapping` was invisible to both. One decomposed
+character in the fixture fixed it.
+
+The check that works: apply the one-line mutation the test claims to catch, watch it fail, restore.
+Everything asserted in this audit was verified that way. Two mutations survived all fifteen tests of
+the most consequential function in the app — `meanConfidence` dividing by the words *collected* rather
+than the words *scored*, and deduping finals on their range *start* rather than the whole range.
+
+## Testing the function is not testing the call site
+
+Measured, and it is the more general form of the finding above: replacing
+`let payload = Self.normalise(text, for: target.bundleID)` in `TextInjector.inject` with
+`let payload = text` — so Edict stops collapsing newlines for terminals entirely — left every injection
+suite green. `normalise` was thoroughly tested; nothing tested that anything *called* it. The
+consequence of that regression is a user's dictated bullet list arriving in Ghostty as a run of shell
+commands. The same was true of `demoteToPasteOnly`: replacing both call sites with `break` was green.
+
+Closing it needed two injected closures (the rung-0 gate, and the clipboard write), not the protocol
+pair it looked like — `payload` is computed *above* the gate, so a closed gate reaches the collapse
+with no AX write, no posted keystroke, and no contact with the frontmost app. **Inject the gate rather
+than reading it:** a dev machine has Accessibility granted, so an ambient gate takes the AX rung and
+the test passes or fails depending on whose Mac ran it.
+
+## swift-testing parallelises across suites; `.serialized` only orders within one
+
+Measured with two `.serialized` suites in this target: `peak=2`, interleaved as
+`+A1 +B1 -B1 -A1 +A2 +B2 -A2 -B2` — the two suites ran concurrently with each other while each kept
+its own tests in order. So process-global state is not protected by `.serialized`. This matters for
+anything touching `AssetInventory`: a `pruneReservations()` call inside one suite releases every
+reservation outside *that engine's* keep set, process-wide, and can pull a slot out from under a
+concurrently running suite mid-test.
+
+## AVAudioPCMBuffer aborts the process on a zero-channel format
+
+Not a throw, not a nil — an uncatchable ObjC exception that takes the test process with it. So a
+"zero channels" case cannot be written as a test at all. `AVAudioFormat` traps on channels > 0
+similarly. A zero-`frameLength` buffer is fine and returns (0, 0).
+
+## The interleaved-buffer test fails by faulting, not by failing
+
+Worth knowing before reading `AudioBufferMathTests`: `audioPlanes` exists because the tap is installed
+with `format: nil` (§18), so the buffer layout genuinely changes under the app. Walking
+`0..<channelCount` on an interleaved buffer reads past the end of `channelData` — which means the
+plane-bound regression does not produce a failed `#expect`, it **faults the test process** on an
+unallocated `channelData[1]` read. A green run there is load-bearing in an unusual way.
+
+## The signing keychain relocks every login session
+
+`security set-keychain-settings` disables idle and sleep locking, **not** locking at the start of a
+login session. So a keychain provisioned yesterday is locked today, and every branch of
+build-app.sh's `ensure_identity()` used to touch the keychain *before* unlocking it, with both streams
+sent to `/dev/null` — which suppresses the message, not the GUI panel. `securityd` attributes that
+panel to the caller, which is why the dialog said "security" rather than "codesign".
+
+The dangerous part is what a dismissal did: `find-certificate` exits non-zero, the `if` reads that as
+"no certificate yet", and the script falls into the provisioning path — which skips `create-keychain`
+because the file exists, writes settings on a still-locked keychain (prompting again), and then
+`security import`s a **second identity with the same CN**. `codesign --sign` then fails as ambiguous,
+and if the duplicate is ever used the certificate root changes — which *does* cost the TCC grants,
+since the measured DR is `identifier "com.edict.app" and certificate root = H"..."`.
+
+> Unlock first, then verify the unlock took, then touch. `security show-keychain-info` exits 0 only on
+> an unlocked keychain, so it is the positive check. Never silence a keychain call's stderr while GUI
+> interaction is still possible, and never read a non-zero `find-certificate` as "absent".
+
+## AssetInventory: two more traps
+
+**Asking whether a model is installed costs a reservation.**
+`assetInstallationRequest(supporting:)` reserves as a side effect, so the sixth distinct locale in a
+process throws `Code=11, 5 maximum`. An availability check is not free, and any seam built for testing
+reservations has to wrap this call too — a reserve/release-only protocol leaves the primary exhaustion
+route untestable.
+
+**Installed-state depends on `attributeOptions`.** `fr-FR` reads *installed* with `[]` and *missing*
+with the confidence + time-range options this app actually requests. Only a module built with the real
+options can answer "is this installed"; a cheap probe will tell you yes and then the import fails.

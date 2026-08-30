@@ -4,14 +4,13 @@
 
 **Push-to-talk dictation for macOS. Hold a key, talk, and the words land where your cursor already is.**
 
-Runs entirely on your machine. Nothing you say leaves the computer, there is no API to call,
+Runs on your machine. Nothing you say or import leaves the computer, there is no account,
 and there is nothing to pay for.
 
 [![macOS 26+](https://img.shields.io/badge/macOS-26%2B-1d1d1f?style=flat-square)](https://www.apple.com/macos/)
 [![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?style=flat-square&logo=swift&logoColor=white)](https://swift.org)
 [![Zero dependencies](https://img.shields.io/badge/dependencies-0-4C8A3A?style=flat-square)](Package.swift)
-[![7 MB](https://img.shields.io/badge/app%20size-7%20MB-4C8A3A?style=flat-square)](#how-it-stays-small)
-[![351 tests](https://img.shields.io/badge/tests-351-4C8A3A?style=flat-square)](Tests)
+[![763 tests](https://img.shields.io/badge/tests-763-4C8A3A?style=flat-square)](Tests)
 [![MIT](https://img.shields.io/badge/licence-MIT-blue?style=flat-square)](LICENSE)
 
 ![Edict's main window](docs/images/history.png)
@@ -25,8 +24,13 @@ and there is nothing to pay for.
 Hold **⌥** (Right Option), say something, let go. The text is inserted at your cursor in whatever
 app has focus — editor, terminal, browser, chat.
 
-Transcription is Apple's on-device `DictationTranscriber`, so there is no model to download, no
-network round trip, and no subscription. **7 MB, zero third-party dependencies.**
+Transcription is Apple's on-device `DictationTranscriber`. Your audio is never uploaded, there is no
+account and no subscription, and zero third-party dependencies ship in the app.
+
+The one thing that does touch the network: macOS downloads each language's speech model from Apple
+once, the first time you choose that language. Edict shows the progress in Settings and tells you if it
+fails. After that the language works offline forever. Nothing you say is part of that exchange — this
+README used to claim "no network round trip", which was simply wrong.
 
 | | |
 |---|---|
@@ -35,7 +39,7 @@ network round trip, and no subscription. **7 MB, zero third-party dependencies.*
 | **A dictionary you teach** | Two mechanisms at once: the engine is biased toward your terms, and a guaranteed correction pass runs afterwards |
 | **File transcription** | Drop in audio or video — m4a, mp3, wav, aiff, caf, **mp4, mov**. Batch queue, per-word timestamps, TXT/SRT/VTT export |
 | **Searchable history** | With the raw-versus-corrected diff, so you can see what the dictionary actually did |
-| **54 languages** | Including Indonesian and Malay |
+| **33 languages, 54 locales** | Including Indonesian and Malay |
 | **A real app** | Dock icon, app menu, resizable window, Settings on ⌘, and a menu-bar extra |
 
 ## Transcribing files
@@ -47,9 +51,30 @@ container, so a video costs nothing extra.
 
 *A nine-minute recording, transcribed in about eight seconds.*
 
-Measured on an M5 Pro: **9–27× realtime** warm, **75×** on a six-minute file, with **4.1% word error**
-against the source script. Imports land in history with timestamps and never touch your cursor —
-that is the line between dictating and transcribing.
+Each queued file carries **its own language**, editable while it waits and re-runnable afterwards in
+another one — and the acoustic model is resolved per item, so an English file and an Indonesian file in
+the same batch run on different modules. A missing model downloads or says so; it never quietly borrows
+another language.
+
+Measured on an M5 Pro: **11.5–31.9× realtime** (11.5 is the cold first file; 27.4 is a video track;
+31.9 is Indonesian), **75×** on a six-minute file, with **4.1% word error** against the source script.
+Imports land in history with timestamps and never touch your cursor — that is the line between
+dictating and transcribing.
+
+### What this does not do
+
+**Far-field, multi-speaker recordings come back nearly empty.** A 70-minute meeting recorded across a
+room produced about 16 words per minute where the same voice close to the mic produces ~130. Apple's
+models are conservative rather than wrong: given audio they cannot resolve, they emit nothing instead of
+guessing. No setting in Edict recovers that, and none of them claims to — Edict measures the
+words-per-minute it achieved and flags the transcript when it looks like this, so you find out from the
+app rather than from reading the result. For that class of audio, use a tool built around a model
+trained for it.
+
+**There is no automatic language detection**, because the framework has no language-identification
+head. Live dictation uses ⇧⌥ to pick the second language per utterance. Imports can opt into a
+two-transcript scorer, off by default, which transcribes twice and keeps the better-scoring result — it
+helps when the *language* was wrong, and it does not help the far-field case above.
 
 ## Clean it up afterwards, on-device
 
@@ -70,6 +95,24 @@ quietly disabled.
 The refined text always sits **beside** the transcript, never over it: the raw dictation is the record
 of what was actually said. Refining before insertion is available as a setting, off by default, because
 it adds a second or so to every dictation.
+
+## Refine text you already have
+
+Select text in any app, press **🌐/** (Globe and slash), and a small panel offers the same three
+actions — clean up, bullets, summarise. Pick one and the selection is replaced in place. It never
+activates Edict, so you stay where you were typing.
+
+The Globe shape is the one keystroke Edict swallows, and only while the panel is up. That costs nothing
+in practice: 🌐/ produces no character on any layout Edict measured, so there is nothing to intercept.
+
+If Globe is awkward on your keyboard, Settings offers **⌘⌥/**, **⌥⌘R** and **⌃⌥R**, none of which
+Edict swallows. One caveat worth knowing: the *Globe-then-dictation-key* option only works on Apple
+keyboards, because the Fn bit is not reported by every third-party keyboard — the picker says so rather
+than letting you discover it.
+
+**A replace it cannot verify refuses.** If Edict cannot confirm the replacement landed, it leaves the
+refined text on your clipboard and tells you, rather than pasting over your selection and hoping. The
+same rule as dictation: never claim an outcome it did not check.
 
 ## The dictionary is the interesting part
 
@@ -116,13 +159,18 @@ and the grants survive.
 
 ### Permissions
 
-Three, granted once, each explained in plain language in the app's own Permissions pane.
+Four — three of them critical — granted once, each explained in plain language in the app's own
+Permissions pane.
 
 | Permission | Why |
 |---|---|
 | **Microphone** | To hear you. Prompted on first recording |
 | **Input Monitoring** | To notice the hold-to-talk key while you are in another app |
 | **Accessibility** | To read the focused text field, so it can confirm your words actually landed |
+| **Send Keystrokes** | Lets Edict paste your words at the cursor. Granted together with Accessibility |
+
+Send Keystrokes is the one that is not critical: without it Edict still inserts through the
+Accessibility path, and falls back to leaving the text on your clipboard and telling you so.
 
 After granting Input Monitoring, press **RESTART** in the Permissions pane. This is not optional: a
 `CGEventTap` created while permission was denied comes back **non-nil but permanently dead**, and no
@@ -176,11 +224,13 @@ open, and `start()` on a finished analyzer silently no-ops, losing the utterance
 `DictationTranscriber`, `SpeechDetector` — and none separates voices. A multi-person recording
 arrives as one block of text with no names and no turn breaks. The app states this where you would
 look for it rather than letting you find out on a meeting recording. Doing it properly needs Whisper
-plus pyannote, which is gigabytes of weights against this app's 7 MB.
+plus pyannote, which is gigabytes of weights against this app's few megabytes.
 
 **Automatic language detection.** `DictationTranscriber` takes a fixed locale and has no
 language-identification head. The only multilingual entry in the framework is `mul_IN`, on the module
-that has no Indonesian. Hence the ⇧⌥ shortcut instead.
+that has no Indonesian. Hence ⇧⌥ for live dictation, a language per file on import, and the optional
+two-transcript scorer described above — which picks between two languages you nominate rather than
+identifying one.
 
 Both would fit behind the `TranscriptionEngine` seam in
 [`Engine/Transcriber.swift`](Sources/EdictKit/Engine/Transcriber.swift), which exists for exactly
@@ -190,10 +240,15 @@ that reason.
 
 | | |
 |---|---|
-| Executable | 6.0 MB |
-| Icon | 0.9 MB |
-| **Total bundle** | **7.0 MB** |
+| Executable, release, stripped | ~3.9 MB |
+| Icon | ~1.0 MB |
 | Embedded frameworks | **none** |
+
+`./scripts/build-app.sh` prints the executable, icon and bundle byte totals at the end of every build.
+Those are the numbers to trust: the figures published here were wrong in four places for several
+commits, because restating a measurement by hand is how it goes stale. The build strips ~4.6 MB of
+local symbols before signing — it has to be before, or the signature is invalidated and the process is
+killed on first page-in.
 
 Every dependency resolves to `/System` — AppKit, SwiftUI, AVFoundation, Speech, CoreGraphics, IOKit.
 The speech models are the OS's, shared by every app that asks, and managed by it.
@@ -209,11 +264,16 @@ Sources/EdictKit/
   Data/      settings, dictionary, corrector, history, export
   Design/    tokens, components, VU meter, waveform
   Views/     main window, history, dictionary, import, settings, permissions
+  Support/   the shared os.Logger
 Sources/Edict/          thin launcher; calls EdictApp.main()
-Tests/EdictKitTests/    185 tests in 17 suites
+Tests/EdictKitTests/    unit tests; `swift test list | wc -l` for the count
 docs/                   RECON.md, CONTRACTS.md, design system
-scripts/build-app.sh    swift build → signed, launchable .app
+scripts/build-app.sh    swift build → stripped, signed, launchable .app
 ```
+
+The test count is deliberately not written here. It was wrong in three mutually contradictory places
+across this file, because a number that changes every commit and is maintained by hand only ever drifts.
+The badge at the top is the one place it appears, and `swift test list | wc -l` is the source of truth.
 
 Everything real lives in the `EdictKit` library so the corrector, stores and exporters are unit
 testable; the executable only calls `EdictApp.main()`.

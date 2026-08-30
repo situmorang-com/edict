@@ -215,6 +215,7 @@
 >     this ~3B model.
 >
 > 42. **Amendment 13 ("`.listenOnly`, never suppress") has exactly two sanctioned exceptions.**
+>     *(Two-tap count amended: see the note at the end of this amendment.)*
 >     *Amended by amendment 50, which added the second and rewrote the tap inventory below.* The first
 >     is the popup: while the selection popup is on screen, `HotkeyMonitor` installs a **consuming**
 >     tap on the same thread and run loop, alive only for that window, so that `1`/`2`/`3`/`Esc` choose
@@ -225,6 +226,17 @@
 >     trigger.** Verify with `CGGetEventTapList` filtered on `getpid()` after any change here — there is
 >     a test that does exactly that (`HotkeyChordLive.tapInventory`). Suppression anywhere else, and for
 >     any other reason, is still forbidden.
+>
+>     **Two-tap count amended.** "Exactly two at idle" was true only of the shipped default. The
+>     `.listenOnly` tap is always there; the `.defaultTap` on `keyDown` exists **iff**
+>     `RefineChordBinding.needsConsumingTap` — true for the default `🌐/`, and false with the refine
+>     feature switched off, false for `⌘⌥/` / `⌥⌘R` / `⌃⌥R`, and false for `🌐/` when Globe is also the
+>     dictation key. Before this, the consuming tap was installed whenever the monitor owned a hotkey,
+>     regardless of the refine setting, so a user who turned the feature off still had a `.defaultTap`
+>     in the synchronous delivery path of every keystroke on the machine for the process lifetime. The
+>     `tapInventory` measurement below was taken under the default chord; the newer gated tests
+>     (`refineOffHoldsOnlyTheListenOnlyTap`, `nonInsertingChordHoldsOnlyTheListenOnlyTap`,
+>     `togglingTheFeatureAtRuntimeMovesTheTap`) cover the other three cases.
 >
 > 43. **`CGEventSource.flagsState` cannot be trusted to say whether a chord is still held.** Measured
 >     latched at `maskCommand` for over three seconds with no key down. The trustworthy signal is
@@ -241,7 +253,7 @@
 > These supersede the signatures below where they conflict:
 >
 > - `Settings.biasingLimit` — default **50**, clamp `0...50`; warn in the UI above 50.
-> - `Settings.engine` — remove any `SpeechTranscriber` option. `Transcript.engine` is `"apple.dictationtranscriber"`.
+> - `Settings.engine` — remove any `SpeechTranscriber` option. `Transcript.engine` is `"apple.dictationtranscriber"` **for live dictation only**. An import resolves its module per file, so an imported transcript may carry `"apple.speechtranscriber"` — both constants are held in `HistoryStore`.
 > - `PermissionKind` — cases are `microphone`, `accessibility`, `inputMonitoring`, `postEvent`.
 >   **Drop `speechRecognition`**: the probe never called `SFSpeechRecognizer.requestAuthorization` and transcription
 >   worked, so it is not required.
@@ -252,6 +264,28 @@
 > - `TextInjector` — add a persisted, **learned** per-bundle-id policy map. Any app that produces
 >   `confirmedNotInserted` or `cannotVerify` is demoted to paste-only permanently. Seed it with the known-bad list
 >   in `RECON.md`. This turns the blog post's complaint into a self-healing system instead of a hardcoded blocklist.
+>   Also: `init` takes injectable `gate` and `writeClipboard` closures (both defaulting to the real ones)
+>   so the *call* to `normalise` is testable, not only the function — deleting that call once left every
+>   injection suite green. `normalise`, `demoteToPasteOnly` and `demotionReason(for:)` are internal for
+>   the same reason, and `InjectInsertVerdict` is at file scope rather than nested in the private
+>   `InjectAX` so a test can name it.
+> - `HotkeyMonitor` — **the signature block later in this document is stale.** Code against the source.
+>   The trigger tap is now gated on `RefineChordBinding.needsConsumingTap` and reconciled at runtime, so
+>   switching the refine feature off actually removes the tap. `HotkeyError` is unchanged.
+> - `DictionaryStore.load` — gains `recoverFromBackup: Bool = true`. The file-watcher reload path passes
+>   `false`: a user hand-editing `dictionary.json` must never have the file moved out from under their
+>   editor mid-save.
+> - `HistoryStore` / `DictionaryStore` — both gain `lastFlushError`, plus `recoveredEntryCount` and
+>   `quarantinedFileURL` so a recovery can be reported as a recovery rather than as a failure.
+> - `AppPaths` — gains `quarantineUnreadableFile(at:)`, a staged `.bak.new` swap, a refusal to let a
+>   zero-length file become the backup, and `defaultSupportDirectoryURL`, which composes the path and
+>   **creates nothing** (`supportDirectory` still creates). Splitting those two is what stopped a plain
+>   `swift test` creating `~/Library/Application Support/Edict` in the developer's real home.
+> - `SpeechEngine` — asset reservations go through a `LocaleReservations` seam (`SystemReservations` in
+>   production, a fake in tests) which must also wrap `assetInstallationRequest`, because the
+>   installation *check* itself takes one of the five slots. Adds `transcribeWaitingForSlot` — the
+>   retrying variant every import pass should use — and `downloadFinished` is internal because there is
+>   no way to fake `downloadAndInstall()`.
 >
 > 45. **Sampling the language modifier at arm time is the wrong contract, and the failure is invisible.**
 >     The modifier was read once, ~120 ms after key-down, and the locale could never change afterwards
@@ -321,16 +355,11 @@
 >     `fnThenDictationKey` is **not** migrated: it was a deliberate choice, and rewriting a user's
 >     setting under them is worse than showing the caveat.
 >
-> 49. **Decide the dictation locale when the modifier window closes, not when the hold arms.**
->     Sampling the language modifier at `armDelay` (~120 ms) is too tight for a two-key gesture, and the
->     locale cannot change afterwards because the analyzer is built before audio is analysed. Observed
->     in the user's real history: Indonesian speech ran through the en-US model and came back as
->     plausible proper nouns — "Kanaya Sushma Manga Cheil Danka" — because an English lexicon is most
->     permissive around names. The microphone now opens first, audio buffers in a stream sized in
->     seconds (RECON §20), and the analyzer is built only once `.alternateSettled` fires. A hold shorter
->     than the window settles from whatever is held at release.
-
-
+> 49. **Merged into 45.** Same finding, stated twice — the settle window and "decide at window
+>     close" are one contract, and this block is the numbering left intact on purpose: `Settings.swift`,
+>     `RefineChord.swift` and `HotkeyMonitor.swift` all cite amendments by number, so renumbering would
+>     silently break live source references. Amendments 42 and 47 already use this pointer form.
+>
 > 50. **The refine trigger is `fn + /`, with `⌃⌘/` as a keyboard-independent alias, and it is the one
 >     trigger Edict swallows.** This widens amendment 42 — read that first — and it is the only
 >     widening of amendment 13 that has been allowed on a *trigger*.
@@ -372,7 +401,8 @@
 >     `matchesConsuming`, the hotkey tap answers `matchesListenOnly`, and the sets are disjoint by
 >     construction. Correctness therefore does not depend on which tap the window server serves first.
 >
->     **Measured on this machine.** `CGGetEventTapList` filtered on `getpid()` reports exactly two taps
+>     **Measured on this machine, under the default `🌐/` chord** (see the two-tap amendment on 42: the
+>     count is conditional on `needsConsumingTap`). `CGGetEventTapList` filtered on `getpid()` reports exactly two taps
 >     while the monitor runs — `consuming/mask=0x400/enabled=true` and
 >     `listenOnly/mask=0x1c00/enabled=true` — and none after `stop()`; ten start/stop cycles moved the
 >     task's Mach port count by **0**. Against a scratch app of our own (never the user's frontmost
@@ -403,45 +433,49 @@ do not silently change a shared type, because another agent is compiling against
 
 ## File ownership
 
-Each file has exactly one owner. Never edit a file you do not own; if you need a change in someone else's file,
-report it instead.
+Each file has exactly one owner. Never edit a file you do not own; if you need a change in someone
+else's file, report it as a handoff with the exact before/after instead.
 
-    Sources/EdictKit/Support/Log.swift              OWNER: data
-    Sources/EdictKit/Data/Settings.swift            OWNER: data
-    Sources/EdictKit/Data/DictionaryStore.swift     OWNER: data
-    Sources/EdictKit/Data/Corrector.swift           OWNER: data
-    Sources/EdictKit/Data/HistoryStore.swift        OWNER: data
-    Sources/EdictKit/Data/AppPaths.swift            OWNER: data
-    Tests/EdictKitTests/CorrectorTests.swift        OWNER: data
-    Tests/EdictKitTests/DictionaryStoreTests.swift  OWNER: data
-    Tests/EdictKitTests/HistoryStoreTests.swift     OWNER: data
+**Ownership is per directory, and an unlisted file inherits its directory's owner.** It used to be a
+per-file table, which named 30 files out of 84 — so the mandatory rule was inert over most of the tree,
+and the files it did not name were exactly the newer ones where two agents were most likely to collide.
 
-    Sources/EdictKit/Engine/Permissions.swift       OWNER: hotkey
-    Sources/EdictKit/Engine/HotkeyMonitor.swift     OWNER: hotkey
-    Sources/EdictKit/Engine/TextInjector.swift      OWNER: hotkey
+| Directory | Owner |
+|---|---|
+| `Sources/EdictKit/Data/` | **data** |
+| `Sources/EdictKit/Support/` | **data** |
+| `Sources/EdictKit/Engine/` | **engine** |
+| `Sources/EdictKit/App/` | **app** |
+| `Sources/EdictKit/Views/` | **views** |
+| `Sources/EdictKit/Design/` | **design** |
+| `Sources/Edict/` | **app** |
+| `scripts/` | **build** |
+| `docs/` | **whoever the change is for** — but see the rule below |
 
-    Sources/EdictKit/Engine/AudioCapture.swift      OWNER: audio
-    Sources/EdictKit/Engine/LevelMeter.swift        OWNER: audio
+Named exceptions, because the directory owner is the wrong one:
 
-    Sources/EdictKit/Engine/Transcriber.swift       OWNER: stt
-    Sources/EdictKit/Engine/SpeechEngine.swift      OWNER: stt
+| File | Owner | Why |
+|---|---|---|
+| `Engine/HotkeyMonitor.swift` | **hotkey** | Event taps and modifier bits are their own discipline; amendments 13, 31, 42 and 50 all land here |
+| `Engine/TextInjector.swift` | **hotkey** | Posts events and owns the learned per-app policy |
+| `Engine/SelectionBridge.swift` | **hotkey** | The destructive counterpart to TextInjector (amendment 44) |
+| `Engine/Permissions.swift` | **hotkey** | The gates the taps depend on |
+| `Data/RefineChord.swift` | **hotkey** | Chord shapes, and it cites amendments by number |
+| `Engine/SpeechEngine.swift` | **speech** | Locale reservations are limited to five per process and persist across launches |
+| `Engine/Transcriber.swift` | **speech** | The sink's four rules are the most consequential function in the app |
+| `Engine/DualPassImporter.swift` | **import** | |
+| `Engine/AudioFileImporter.swift` | **import** | |
+| `Engine/ImportQueue.swift` | **import** | |
 
-    Sources/EdictKit/Design/Tokens.swift            OWNER: (already written by orchestrator)
-    Sources/EdictKit/Design/Components.swift        OWNER: design
-    Sources/EdictKit/Design/VUMeter.swift           OWNER: design
-    Sources/EdictKit/Design/Waveform.swift          OWNER: design
+A test file is owned by whoever owns the source it exercises. `Tests/EdictKitTests/` has no owner of
+its own.
 
-    Sources/EdictKit/App/EdictApp.swift            OWNER: shell
-    Sources/EdictKit/App/AppModel.swift             OWNER: shell
-    Sources/EdictKit/App/DictationController.swift  OWNER: shell
-    Sources/EdictKit/App/MenuBarExtra.swift         OWNER: shell
-    Sources/EdictKit/App/HUDWindow.swift            OWNER: shell
+**Nobody edits `README.md`, `docs/RECON.md` or `docs/CONTRACTS.md` as a side effect of a code change.**
+Doc consequences are reported and applied in one deliberate pass. This exists because these three files
+are the authority a later reader is told to trust, and a half-updated amendment is worse than a stale
+one: it reads as current. RECON and this document override instinct, so an unamended entry is an
+instruction to revert whatever contradicted it.
 
-    Sources/EdictKit/Views/MainWindow.swift         OWNER: views
-    Sources/EdictKit/Views/HistoryPane.swift        OWNER: views
-    Sources/EdictKit/Views/DictionaryPane.swift     OWNER: views
-    Sources/EdictKit/Views/SettingsWindow.swift     OWNER: views
-    Sources/EdictKit/Views/PermissionsPane.swift    OWNER: views
 
 ## Shared value types  (declared in Data/, used everywhere)
 
@@ -564,11 +598,34 @@ public final class Settings {
     /// Pre-warm the audio engine so no speech is lost at key-down. Costs a lit mic indicator.
     public var prewarmMicrophone: Bool
     public var historyLimit: Int                   // default 5000
-    public var launchAtLogin: Bool
 
     public func resetToDefaults()
 }
 ```
+
+> **Amended.** `launchAtLogin` is **not** a setting and was deliberately removed. Launch-at-login is
+> `SMAppService` state owned by the system, not a preference Edict stores — mirroring it into
+> `UserDefaults` gives two sources of truth that disagree the moment the user changes it in System
+> Settings. It lives on `LoginItem`, reached through `AppModel`.
+>
+> The settings that actually ship, with their defaults — `Settings.Default` is the one authority, and
+> these are copied from it rather than remembered:
+>
+> | Setting | Default |
+> |---|---|
+> | `hotkey` | `.rightOption` |
+> | `localeIdentifier` | `en-US` |
+> | `secondaryLocaleEnabled` / `secondaryLocaleIdentifier` / `secondaryLocaleModifier` | `true` / `id-ID` / `.shift` |
+> | `pushToTalk`, `autoInject`, `showHUD` | `true` |
+> | `playSounds` | **`false`** — which is why a sound is never the only channel for a failure |
+> | `biasingEnabled` / `biasingLimit` | `true` / `50` (clamp `0...50`) |
+> | `correctionsEnabled`, `termCaseNormalisation` | `true` |
+> | `prewarmMicrophone` | `false` |
+> | `importUsesGeneralModel` | `true` |
+> | `importDualPass` | **`false`** |
+> | `refineBeforeInsert` | `false` |
+> | `refineSelectionEnabled` / `refineSelectionChord` | `true` / `RefineChord.default` (`🌐/`) |
+> | `historyLimit` | `5000` |
 
 `Settings` persists to `UserDefaults.standard` under the `edict.` key prefix, writing on `didSet`.
 
