@@ -30,7 +30,7 @@ struct ShowInLogTests {
 
     @Test("A visible row is selected and the search is left alone")
     func visibleRowKeepsTheQuery() {
-        let a = transcript("board review notes", at: 1, filename: "Pertamina.m4a")
+        let a = transcript("board review notes", at: 1, filename: "quarterly board review.m4a")
         let b = transcript("something else", at: 2)
         let rows = [a, b]
 
@@ -43,7 +43,7 @@ struct ShowInLogTests {
 
     @Test("A row the active search hides gets the search cleared")
     func hiddenRowClearsTheQuery() {
-        let target = transcript("board review notes", at: 1, filename: "Pertamina.m4a")
+        let target = transcript("board review notes", at: 1, filename: "quarterly board review.m4a")
         let other = transcript("kalimantan site visit", at: 2)
         // What `search("kalimantan")` would have returned: the target is not in it.
         let rows = [other]

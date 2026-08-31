@@ -897,7 +897,7 @@ anything deterministic in code.
 **Capitalisation:** with the instruction "Repair punctuation, capitalisation and sentence breaks…
 Preserve every fact. Add nothing. Answer in the same language as the input", sentence case *and*
 proper nouns came back correct in 6 of 6 greedy runs across two fixtures — `Thursday`, `Mark`,
-`Pertamina`, `Azure`, `Microsoft`. An agent working from slightly different wording saw output stay
+`Contoso`, `Azure`, `Microsoft`. An agent working from slightly different wording saw output stay
 lowercase and added a deterministic sentence-case-and-terminator pass in `TextRefiner.tidy`; that pass
 is a no-op on these fixtures and harmless either way. Worth re-measuring before trusting either claim
 after an OS update.

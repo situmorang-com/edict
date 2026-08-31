@@ -145,7 +145,7 @@ struct LanguageScorerTests {
     /// from them would pick a language off someone's surname.
     @Test("Proper nouns only is a refusal, not a guess")
     func properNounsOnly() {
-        let verdict = classify("Pertamina Jakarta Anthropic Edmund Situmorang")
+        let verdict = classify("Contoso Jakarta Anthropic Budi Santoso")
         #expect(!verdict.isConfident)
         #expect(verdict.margin == 0)
         #expect(verdict.scores.allSatisfy { $0.score == 0 })

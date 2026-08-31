@@ -442,10 +442,10 @@ struct StoreFileShapeTests {
 
         let seed = DictionaryStore(fileURL: file)
         try seed.load()                                    // seeds the starter set
-        seed.add(DictionaryEntry(kind: .term("Pertamina")))
+        seed.add(DictionaryEntry(kind: .term("Contoso")))
         seed.add(DictionaryEntry(kind: .correction(heard: "kanaya", write: "Kanaya")))
         try seed.save()
-        seed.add(DictionaryEntry(kind: .term("Mayapada")))
+        seed.add(DictionaryEntry(kind: .term("Northwind")))
         try seed.save()
         let starterCount = DictionaryStore(fileURL: dir.appendingPathComponent("probe.json")).entries.count
 
@@ -454,14 +454,14 @@ struct StoreFileShapeTests {
         let store = DictionaryStore(fileURL: file)
         try store.load()
 
-        // The backup holds the generation before the last save, so "Mayapada" is expected to be gone.
+        // The backup holds the generation before the last save, so "Northwind" is expected to be gone.
         // What must NOT happen is the starter set replacing the user's terms — assert that directly
         // rather than by a count that has to be kept in step with `starterEntries()`.
         let terms = store.entries.compactMap { entry -> String? in
             if case .term(let t) = entry.kind { return t }
             return nil
         }
-        #expect(terms.contains("Pertamina"),
+        #expect(terms.contains("Contoso"),
                 "the user's dictionary was replaced by starter entries while the backup held their terms")
         #expect(store.entries.count > starterCount)
         #expect(store.recoveredEntryCount == store.entries.count)
@@ -477,9 +477,9 @@ struct StoreFileShapeTests {
 
         let seed = DictionaryStore(fileURL: file)
         try seed.load()
-        seed.add(DictionaryEntry(kind: .term("Pertamina")))
+        seed.add(DictionaryEntry(kind: .term("Contoso")))
         try seed.save()
-        seed.add(DictionaryEntry(kind: .term("Mayapada")))
+        seed.add(DictionaryEntry(kind: .term("Northwind")))
         try seed.save()
         try FileManager.default.removeItem(at: file)
 

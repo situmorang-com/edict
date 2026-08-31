@@ -196,8 +196,8 @@ struct DualPassChoiceTests {
             decoded: decoded(tone(3, then: 0.4)),
             format: analyzerFormat,
             passes: [
-                scriptedPass("en-US", texts: ["Pertamina Jakarta Anthropic"]),
-                scriptedPass("id-ID", texts: ["Pertamina Jakarta Anthropic"]),
+                scriptedPass("en-US", texts: ["Contoso Jakarta Anthropic"]),
+                scriptedPass("id-ID", texts: ["Contoso Jakarta Anthropic"]),
             ]
         )
         let section = try #require(outcome.sections.first)
@@ -214,8 +214,8 @@ struct DualPassChoiceTests {
             decoded: decoded(tone(3, then: 0.4)),
             format: analyzerFormat,
             passes: [
-                scriptedPass("id-ID", texts: ["Pertamina Jakarta Anthropic"]),
-                scriptedPass("en-US", texts: ["Pertamina Jakarta Anthropic"]),
+                scriptedPass("id-ID", texts: ["Contoso Jakarta Anthropic"]),
+                scriptedPass("en-US", texts: ["Contoso Jakarta Anthropic"]),
             ]
         )
         #expect(outcome.sections.first?.chosenLocale == "id-ID")

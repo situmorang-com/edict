@@ -2,7 +2,7 @@ import Foundation
 
 /// How much of the audio the recogniser actually turned into words, and one honest sentence about it.
 ///
-/// **Why this type exists.** A real 70-minute meeting (Pertamina.m4a — stereo 48 kHz, two-plus
+/// **Why this type exists.** A real 70-minute meeting recording (stereo 48 kHz, two-plus
 /// speakers, Indonesian and English code-switched, recorded at a distance) was imported and produced
 /// 1,128 words for 4,197 seconds: about 16 words per minute against ~150 for ordinary speech. The
 /// output was largely filler and empty runs. Every number needed to say so was already in hand —
@@ -85,7 +85,7 @@ public struct RecognitionQuality: Sendable, Hashable, Codable {
 
         /// Coverage under this, combined with a plausible rate *inside* the recognised stretches, is
         /// read as dropouts rather than as uniformly weak recognition. Continuous speech with pauses
-        /// still covers well over half a timeline; the Pertamina import covered about 8 %.
+        /// still covers well over half a timeline; that meeting import covered about 8 %.
         public static let dropoutCoverage: Double = 0.5
 
         /// Mean word confidence at or below this is worth mentioning. RECON: under ~0.5 is strongly
@@ -182,7 +182,7 @@ public struct RecognitionQuality: Sendable, Hashable, Codable {
             )
         }
 
-        // Coverage is the second signal, and it separates two different faults. The Pertamina import
+        // Coverage is the second signal, and it separates two different faults. That meeting import
         // had segments spanning 131 s to 4,117 s — the whole file was read — but only ~1,130 of them
         // over 70 minutes, so the recognised stretches ran at a normal rate and the gaps between
         // them were enormous. That is recognition dropping out, not recognition degrading evenly,
@@ -291,7 +291,7 @@ public struct RecognitionQuality: Sendable, Hashable, Codable {
     // Rules these sentences obey, all of them earned:
     //  * Name the measured rate and its basis. "Quality may be poor" is not information.
     //  * Describe the acoustics — distance, overlapping voices, reverberation — not the user. The
-    //    Pertamina recording was a competently captured meeting; nothing was done wrong.
+    //    recording behind these numbers was a competently captured meeting; nothing was done wrong.
     //  * Never promise that a setting recovers it. Conditioning moved 61 words to 75, and the
     //    id-ID pass produced 18 fluent words where en-US produced 0. Dual-language selection helps
     //    *clean* bilingual audio and does nothing for this, so it must not be offered as a remedy.

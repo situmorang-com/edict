@@ -216,7 +216,7 @@ struct RecognitionQualityTests {
         #expect(abs(quality.coverage - 0.5) < 0.001)
     }
 
-    /// The Pertamina shape: segments spanning 131 s to 4,117 s, so the whole file was read, but only
+    /// The long-meeting shape: segments spanning 131 s to 4,117 s, so the whole file was read, but only
     /// ~1,130 of them across 70 minutes. The recognised stretches run at a normal rate; the gaps
     /// between them are enormous. That is a different fault from recognition weakening evenly, and
     /// the wording has to say so — while the verdict stays with the overall rate.
@@ -434,7 +434,7 @@ struct RecognitionQualityTests {
         }
     }
 
-    /// The Pertamina recording was a competently captured meeting. Nothing was done wrong, and the
+    /// That recording was a competently captured meeting. Nothing was done wrong, and the
     /// sentence must describe the acoustics rather than the person holding the phone.
     @Test("No explanation blames the user or waves at bad quality")
     func noExplanationBlamesTheUser() {

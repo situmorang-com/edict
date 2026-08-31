@@ -280,11 +280,11 @@ struct HistoryStoreTests {
             transcribeDuration: 6,
             targetAppName: "Obsidian",
             injection: .notAttempted,
-            source: .imported(filename: "Pertamina board review.m4a")
+            source: .imported(filename: "quarterly board review.m4a")
         )
         store.append(imported)
 
-        #expect(store.search("pertamina").count == 1, "an imported transcript could not be found by its filename")
+        #expect(store.search("quarterly").count == 1, "an imported transcript could not be found by its filename")
         #expect(store.search("board review").count == 1)
         #expect(store.search("m4a").count == 1)
         #expect(store.search("obsidian").count == 1, "a transcript could not be found by the app it was dictated into")
