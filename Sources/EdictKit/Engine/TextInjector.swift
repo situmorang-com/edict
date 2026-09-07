@@ -433,6 +433,37 @@ public actor TextInjector {
 
     // MARK: Paste
 
+    /// The floor before the verify poll starts. RECON measured no app reading the pasteboard faster
+    /// than this, so polling earlier just burns a cycle. It is a lower bound on when a read can
+    /// *start* — never a bound on when one finishes.
+    static let settleFloorMs = 35
+
+    /// How long the restore must wait when nothing could verify the paste.
+    ///
+    /// Matches `InjectAX.waitForChange`'s own timeout, deliberately: on the verifiable path that poll
+    /// IS the settle delay, so the two paths should give the target the same amount of time.
+    static let settleBudgetMs = 400
+
+    /// How much longer to wait before restoring the user's clipboard, given what verification proved.
+    ///
+    /// **This is the fix for "it pasted my last clipboard item instead of the dictation."** The paste
+    /// rung's design is that the verify poll's duration doubles as the settle delay before the restore
+    /// — which holds only when there is something to poll. In a terminal, an Electron app, or anything
+    /// else that exposes no readable AX text, the verify closure hits
+    /// `guard let focus, let fingerprint else { return nil }` and returns INSTANTLY, so the restore
+    /// used to land `settleFloorMs` after Cmd-V. The target reads the pasteboard lazily on its own run
+    /// loop (RECON §16), so any app slower than 35 ms pasted the snapshot we had just put back: the
+    /// user's previous clipboard, reported as a success because an unverifiable paste is assumed to
+    /// have worked.
+    ///
+    /// - `true`  — proved landed, the target has read the pasteboard, restore immediately.
+    /// - `false` — provably did not land, so there is nothing to protect; restore immediately.
+    /// - `nil`   — no evidence either way. Wait out the same budget the polling path would have spent.
+    static func settleWaitMs(verdict: Bool?, elapsedMs: Int, budgetMs: Int = settleBudgetMs) -> Int {
+        guard verdict == nil else { return 0 }
+        return max(0, budgetMs - elapsedMs)
+    }
+
     /// Snapshot → write → wait for clean modifiers → Cmd-V → verify-poll → restore.
     ///
     /// The verify poll deliberately sits *between* the post and the restore, so the time it spends
@@ -459,8 +490,23 @@ public actor TextInjector {
 
         // A floor before the poll starts: RECON measured no app reading the pasteboard faster than this,
         // and polling immediately just burns a cycle.
-        usleep(35_000)
+        let postedAt = DispatchTime.now()
+        usleep(UInt32(Self.settleFloorMs) * 1000)
         let proved = verify()
+
+        // The restore is what makes an unverifiable paste dangerous, so it waits for the budget the
+        // poll would have spent. See `settleWaitMs`.
+        let elapsedMs = Int(
+            (DispatchTime.now().uptimeNanoseconds - postedAt.uptimeNanoseconds) / 1_000_000
+        )
+        let remainingMs = Self.settleWaitMs(verdict: proved, elapsedMs: elapsedMs)
+        if remainingMs > 0 {
+            Log.inject.debug("""
+                paste unverifiable; holding the clipboard \(remainingMs, privacy: .public) ms longer \
+                before restoring
+                """)
+            try? await Task.sleep(for: .milliseconds(remainingMs))
+        }
 
         let now = NSPasteboard.general.changeCount
         if now != ourChangeCount {
