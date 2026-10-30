@@ -302,6 +302,59 @@ public enum RefineChord: String, Codable, CaseIterable, Sendable, Identifiable {
         }
     }
 
+    /// The gesture as the hands actually perform it, right now, on this Mac: one row per shape that
+    /// can fire, the keys first and the condition beside them when a shape has one.
+    ///
+    /// This is the answer to "so what do I press?", and it exists because the picker could not give
+    /// it. Five rows of key caps, one of them latched, reads as a *menu* — every row looks equally
+    /// like the answer, and the live one is distinguished by a lit edge and a three-letter tag that
+    /// sits in the same breath as the row's own caveat. The user who asked was looking straight at
+    /// the panel.
+    ///
+    /// Two things make this different from ``displayName(dictationKey:)``, and both are the reason it
+    /// is a separate list rather than a prettier label:
+    ///
+    /// * **It splits ``fnSlash`` into its two shapes.** One row cannot say "🌐/ or ⌃⌘/ depending on
+    ///   your keyboard" without becoming the run-on the panel already had.
+    /// * **It prints only what can fire.** With Globe *as the dictation key*, `fn + /` is dropped by
+    ///   `RefineChordBinding` and the alias is the whole gesture, so the alias is the only row. A
+    ///   refused chord has no rows at all: the refusal below the picker is the message then, and a
+    ///   readout that printed keys anyway would be contradicting it.
+    public func presses(dictationKey: HotkeyChoice) -> [Press] {
+        switch self {
+        case .fnSlash:
+            // Globe dictating is not a caveat on this row, it is the absence of the row: see
+            // `RefineChordBinding`, which drops the `fn + /` shape for exactly this configuration.
+            dictationKey == .fn
+                ? [Press(keys: "⌃⌘/", note: "on any keyboard")]
+                : [Press(keys: "🌐/", note: "on an Apple keyboard"),
+                   Press(keys: "⌃⌘/", note: "on any keyboard")]
+        case .commandOptionSlash: [Press(keys: "⌘⌥/", note: nil)]
+        case .optionCommandR: [Press(keys: "⌥⌘R", note: nil)]
+        case .controlOptionR: [Press(keys: "⌃⌥R", note: nil)]
+        case .fnThenDictationKey:
+            refusal(dictationKey: dictationKey) == nil
+                ? [Press(keys: "🌐 then \(dictationKey.glyph)",
+                         note: "hold 🌐 first, Apple keyboards only")]
+                : []
+        }
+    }
+
+    /// One row of the readout: what the hands do, and when it applies.
+    public struct Press: Sendable, Hashable, Identifiable {
+
+        /// The keys, in key-cap spelling — the same glyphs ``glyph(dictationKey:)`` prints, because
+        /// a readout that renamed the keys would be a second vocabulary to learn.
+        public let keys: String
+
+        /// The condition, lower case and without a full stop: it is printed *beside* the keys, as
+        /// the rest of the sentence they start, not as a sentence of its own. `nil` when the shape
+        /// applies everywhere, which is most of them.
+        public let note: String?
+
+        public var id: String { keys }
+    }
+
     /// One sentence saying what the gesture costs, so the choice between them is informed rather than
     /// a coin toss.
     public var explanation: String {

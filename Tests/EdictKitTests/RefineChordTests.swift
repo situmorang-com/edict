@@ -297,6 +297,43 @@ struct CommandOptionSlashTests {
             .contains(HotkeyChoice.rightOption.displayName))
     }
 
+    // MARK: The readout
+
+    /// The panel has to answer "what do I press?" without the user decoding a picker. These are the
+    /// rows it prints, and the rule is that every one of them can actually fire.
+    @Test("the readout prints the live gesture, and only shapes that can fire")
+    func pressReadout() throws {
+        // The default is two shapes behind one setting, and the readout is the one surface that
+        // gets to say so as two rows rather than as a run-on.
+        let both = RefineChord.fnSlash.presses(dictationKey: .rightOption)
+        #expect(both.map(\.keys) == ["🌐/", "⌃⌘/"])
+        #expect(try #require(both[0].note).localizedCaseInsensitiveContains("Apple"))
+        #expect(try #require(both[1].note).localizedCaseInsensitiveContains("any"))
+
+        // Globe dictating does not caveat the Fn row, it deletes it: `RefineChordBinding` drops that
+        // shape, so printing it would be printing a gesture that cannot fire.
+        let globeDictates = RefineChord.fnSlash.presses(dictationKey: .fn)
+        #expect(globeDictates.map(\.keys) == ["⌃⌘/"])
+
+        // A chord that works everywhere needs no condition beside it.
+        for chord in [RefineChord.commandOptionSlash, .optionCommandR, .controlOptionR] {
+            let rows = chord.presses(dictationKey: .rightOption)
+            #expect(rows.map(\.keys) == [chord.glyph(dictationKey: .rightOption)])
+            #expect(rows[0].note == nil)
+        }
+
+        // The qualified chord names the key it qualifies, and carries its keyboard warning here too
+        // — the readout is read by people who never reach the picker row that also says it.
+        let qualified = RefineChord.fnThenDictationKey.presses(dictationKey: .rightOption)
+        #expect(qualified.count == 1)
+        #expect(qualified[0].keys.contains(HotkeyChoice.rightOption.glyph))
+        #expect(try #require(qualified[0].note).localizedCaseInsensitiveContains("Apple"))
+
+        // Refused: the refusal below the picker is the message, and keys printed anyway would
+        // contradict it.
+        #expect(RefineChord.fnThenDictationKey.presses(dictationKey: .fn).isEmpty)
+    }
+
     /// The default has to be reachable first: a picker whose recommended row is fourth reads as a
     /// list of alternatives to something else.
     @Test("the picker offers the default first and the Apple-only gesture last")

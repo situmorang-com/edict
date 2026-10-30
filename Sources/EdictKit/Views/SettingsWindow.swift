@@ -821,11 +821,17 @@ private struct RefineSelectionSection: View {
                         get: { settings.refineSelectionEnabled },
                         set: { settings.refineSelectionEnabled = $0 }
                     ),
-                    caption: "Select text in any app, press the chord below, and pick CLEAN UP, "
-                           + "BULLETS or SUMMARY. The selection is replaced in place."
+                    caption: "Select text in any app, press the keys shown below, and pick "
+                           + "CLEAN UP, BULLETS or SUMMARY. The selection is replaced in place."
                 )
 
+                gesture
+                    .disabled(!settings.refineSelectionEnabled)
+                    .opacity(settings.refineSelectionEnabled ? 1 : D.opacity.disabled)
+
                 VStack(alignment: .leading, spacing: D.space.sm) {
+                    SilkscreenLabel("Choose the keys", weight: .tiny)
+                        .silkscreenDecorative()
                     ForEach(RefineChord.allCases) { chord in
                         key(chord)
                     }
@@ -849,6 +855,52 @@ private struct RefineSelectionSection: View {
                     .typeStyle(D.type.explain)
                     .foregroundStyle(D.color.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// The live gesture, printed before the picker that sets it: the one thing on this panel that
+    /// has to be answerable at a glance.
+    ///
+    /// It is the same readout the second-language panel uses, for the same reason — keys in a lit
+    /// window are the machine's state, and the words beside them are the label for it. The picker
+    /// below could not do this job: five latched-or-not rows of key caps read as a menu of five
+    /// shortcuts, and the one tell that says which is in force (``TapeButton``'s latch, plus a
+    /// three-letter tag) lands in the same glance as the row's own caveat. A user looking straight
+    /// at the panel asked what the real shortcut was.
+    ///
+    /// Empty for a refused chord, which is not a gap: `refusal` is printed below the picker and the
+    /// honest readout of a gesture that cannot fire is no keys at all.
+    @ViewBuilder private var gesture: some View {
+        let presses = settings.refineSelectionChord.presses(dictationKey: settings.hotkey)
+        if !presses.isEmpty {
+            VStack(alignment: .leading, spacing: D.space.xs) {
+                SilkscreenLabel("Press", weight: .tiny)
+                    .silkscreenDecorative()
+                ForEach(presses) { press in
+                    HStack(spacing: D.space.sm) {
+                        RecessedWell(fill: .display, radius: D.radius.tight, inset: D.space.xs) {
+                            Text(press.keys)
+                                .typeStyle(D.type.silkscreen)
+                                .foregroundStyle(D.color.displayInk)
+                                .lineLimit(1)
+                                .fixedSize()
+                                // Widened inside the opening, as in `SecondLanguageSection`: a
+                                // `minWidth` on the well sizes the frame without sizing the cut.
+                                .frame(minWidth: S.chordWidth)
+                        }
+                        if let note = press.note {
+                            Text(note)
+                                .typeStyle(D.type.body)
+                                .foregroundStyle(D.color.textPrimary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Press \(press.keys)")
+                    .accessibilityValue(press.note ?? "")
+                }
             }
         }
     }
@@ -1164,8 +1216,9 @@ public enum DualLocaleFixtures {
         // Panel width plus the deck gutter the settings column pads with, so the sheet frames the
         // panel the way the window does.
         let panel = CGSize(width: S.column, height: 640)
-        // The refine panel is the tallest of these: five chord rows plus two paragraphs, and the
-        // default's paragraph is now the longest of the five because it has two chords to explain.
+        // The refine panel is the tallest of these: the live-gesture readout, five chord rows and
+        // two paragraphs, and the default's paragraph is the longest of the five because it has two
+        // chords to explain. The readout is up to two lit rows under their own legend.
         let refinePanel = CGSize(width: S.column, height: 960)
         let hud = CGSize(width: D.size.hudSize.width + D.space.lg,
                          height: D.size.hudSize.height + D.size.waveformHeight + D.space.lg)
