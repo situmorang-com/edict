@@ -10,7 +10,7 @@ and there is nothing to pay for.
 [![macOS 26+](https://img.shields.io/badge/macOS-26%2B-1d1d1f?style=flat-square)](https://www.apple.com/macos/)
 [![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?style=flat-square&logo=swift&logoColor=white)](https://swift.org)
 [![Zero dependencies](https://img.shields.io/badge/dependencies-0-4C8A3A?style=flat-square)](Package.swift)
-[![763 tests](https://img.shields.io/badge/tests-763-4C8A3A?style=flat-square)](Tests)
+[![tests passing](https://img.shields.io/badge/tests-passing-4C8A3A?style=flat-square)](Tests)
 [![MIT](https://img.shields.io/badge/licence-MIT-blue?style=flat-square)](LICENSE)
 
 ![Edict's main window](docs/images/history.png)
